@@ -951,6 +951,7 @@ fn detached_shell_command_for(
     command: &str,
     exit_path: &Path,
     paths: &TaskPaths,
+    creation_flags: u32,
 ) -> Result<Command, String> {
     use crate::windows_shell::WindowsShell;
     // Write the wrapper to a temp file alongside the other task files,
@@ -1009,11 +1010,10 @@ fn detached_shell_command_for(
         }
     }
 
-    // Win32 process creation flags:
-    // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB
-    // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
-    const DETACHED_BG_FLAGS: u32 = 0x0000_0200 | 0x0000_0008 | 0x0100_0000;
-    cmd.creation_flags(DETACHED_BG_FLAGS);
+    // Win32 process creation flags. Caller selects whether to include
+    // CREATE_BREAKAWAY_FROM_JOB — see `detached_shell_command_for` callers
+    // for the breakaway-fallback strategy.
+    cmd.creation_flags(creation_flags);
     Ok(cmd)
 }
 
@@ -1082,45 +1082,85 @@ fn spawn_detached_child(
                 candidates.push(*shell);
             }
         }
+        // Win32 process creation flags. We try with CREATE_BREAKAWAY_FROM_JOB
+        // first (so the bg child outlives the AFT process when AFT is killed),
+        // then fall back without it for environments where the parent is in a
+        // Job Object that doesn't grant `JOB_OBJECT_LIMIT_BREAKAWAY_OK`. CI
+        // runners (GitHub Actions windows-2022) and some MDM-managed corp
+        // environments hit this — `CreateProcess` returns Access Denied (5).
+        // Without breakaway, the child still runs detached but will be torn
+        // down with the parent if the parent process group is signaled.
+        const FLAG_DETACHED_PROCESS: u32 = 0x0000_0008;
+        const FLAG_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const FLAG_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let with_breakaway =
+            FLAG_DETACHED_PROCESS | FLAG_CREATE_NEW_PROCESS_GROUP | FLAG_CREATE_BREAKAWAY_FROM_JOB;
+        let without_breakaway = FLAG_DETACHED_PROCESS | FLAG_CREATE_NEW_PROCESS_GROUP;
         let mut last_error: Option<String> = None;
         for (idx, shell) in candidates.iter().enumerate() {
-            // Re-open capture handles per attempt; spawn() consumes them.
-            let stdout = create_capture_file(&paths.stdout)
-                .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
-            let stderr = create_capture_file(&paths.stderr)
-                .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
-            let mut cmd = detached_shell_command_for(*shell, command, &paths.exit, paths)?;
-            cmd.current_dir(workdir)
-                .envs(env)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr));
-            match cmd.spawn() {
-                Ok(child) => {
-                    if idx > 0 {
-                        log::warn!(
-                            "[aft] background bash spawn fell back to {} after {} earlier candidate(s) failed; \
-                             the cached PATH probe disagreed with runtime spawn — likely PATH \
-                             inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.",
-                            shell.binary(),
-                            idx
-                        );
+            // Per-shell, try with breakaway first. If the process is in a
+            // restrictive job, the breakaway flag triggers Access Denied
+            // (os error 5). Retry once without breakaway.
+            for &flags in &[with_breakaway, without_breakaway] {
+                // Re-open capture handles per attempt; spawn() consumes them.
+                let stdout = create_capture_file(&paths.stdout)
+                    .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
+                let stderr = create_capture_file(&paths.stderr)
+                    .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
+                let mut cmd =
+                    detached_shell_command_for(*shell, command, &paths.exit, paths, flags)?;
+                cmd.current_dir(workdir)
+                    .envs(env)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(stdout))
+                    .stderr(Stdio::from(stderr));
+                match cmd.spawn() {
+                    Ok(child) => {
+                        if idx > 0 {
+                            log::warn!(
+                                "[aft] background bash spawn fell back to {} after {} earlier candidate(s) failed; \
+                                 the cached PATH probe disagreed with runtime spawn — likely PATH \
+                                 inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.",
+                                shell.binary(),
+                                idx
+                            );
+                        }
+                        if flags == without_breakaway {
+                            log::warn!(
+                                "[aft] background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected \
+                                 (likely a restrictive Job Object — CI sandbox or MDM policy). \
+                                 Spawned without breakaway; the bg task will be torn down if the \
+                                 AFT process group is killed."
+                            );
+                        }
+                        return Ok(child);
                     }
-                    return Ok(child);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    log::warn!(
-                        "[aft] background bash spawn: {} returned NotFound at runtime — trying next candidate",
-                        shell.binary()
-                    );
-                    last_error = Some(format!("{}: {e}", shell.binary()));
-                    continue;
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "failed to spawn background bash command via {}: {e}",
-                        shell.binary()
-                    ));
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        log::warn!(
+                            "[aft] background bash spawn: {} returned NotFound at runtime — trying next candidate",
+                            shell.binary()
+                        );
+                        last_error = Some(format!("{}: {e}", shell.binary()));
+                        // Skip the without-breakaway retry for NotFound — the
+                        // binary itself is missing, breakaway flag is irrelevant.
+                        break;
+                    }
+                    Err(e) if flags == with_breakaway && e.raw_os_error() == Some(5) => {
+                        // Access Denied during breakaway — retry without it.
+                        log::warn!(
+                            "[aft] background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected with \
+                             Access Denied — retrying {} without breakaway",
+                            shell.binary()
+                        );
+                        last_error = Some(format!("{}: {e}", shell.binary()));
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "failed to spawn background bash command via {}: {e}",
+                            shell.binary()
+                        ));
+                    }
                 }
             }
         }
