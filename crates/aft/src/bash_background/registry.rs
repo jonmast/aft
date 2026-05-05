@@ -512,8 +512,43 @@ impl BgTaskRegistry {
         };
         if let Some(child) = state.child.as_mut() {
             if matches!(child.try_wait(), Ok(Some(_))) {
+                // Child has exited. If the wrapper successfully wrote an
+                // exit marker, the next `poll_task()` cycle will pick it up
+                // and finalize via `finalize_from_marker`. But if the
+                // wrapper crashed before writing the marker (e.g. SIGKILL,
+                // power loss, wrapper bug), the task would forever appear
+                // Running until `timeout_ms` expired — and if no timeout
+                // was set, until the 24h `running_metadata_is_stale` cutoff
+                // hit at the next aft restart. Same condition as the replay
+                // path's "PID dead but no marker" branch (see line 338).
+                //
+                // To avoid that hidden hang, mark the task Failed
+                // immediately with the same reason string used by replay,
+                // but only if the marker is genuinely absent. If a marker
+                // appeared on disk between try_wait() returning and now
+                // (race window), prefer the marker — let the next poll
+                // cycle finalize from it.
                 state.child = None;
                 state.detached = true;
+                if state.metadata.status.is_terminal() {
+                    return;
+                }
+                if matches!(read_exit_marker(&task.paths.exit), Ok(Some(_))) {
+                    return;
+                }
+                let updated = update_task(&task.paths.json, |metadata| {
+                    metadata.mark_terminal(
+                        BgTaskStatus::Failed,
+                        None,
+                        Some("process exited without exit marker".to_string()),
+                    );
+                });
+                if let Ok(metadata) = updated {
+                    state.metadata = metadata;
+                    task.mark_terminal_now();
+                    state.buffer.enforce_terminal_cap();
+                    self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
+                }
             }
         }
     }
