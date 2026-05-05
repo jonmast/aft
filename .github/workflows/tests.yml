@@ -125,6 +125,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The E2E Dockerfile copies `packages/opencode-plugin/dist/` into the
+      # image, so we have to produce that on the runner first. The plugin
+      # depends on aft-bridge being built (workspace dependency).
+      - name: Install workspace deps + build plugin
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+          bun run --cwd packages/opencode-plugin build
+
       - name: Build Linux x64 binary in Docker
         run: |
           docker build --platform linux/amd64 \

@@ -152,10 +152,15 @@ impl AftProcess {
 
     /// Send a configure command with project_root.
     pub fn configure(&mut self, project_root: &std::path::Path) -> serde_json::Value {
-        self.send(&format!(
-            r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
-            project_root.display()
-        ))
+        // Build via serde_json so Windows paths (with backslashes) are
+        // escaped correctly in the wire format. Hand-formatted JSON would
+        // turn `C:\Users\...` into invalid escape sequences.
+        let request = serde_json::json!({
+            "id": "cfg",
+            "command": "configure",
+            "project_root": project_root.to_string_lossy(),
+        });
+        self.send(&request.to_string())
     }
 
     /// Wait for and consume a `configure_warnings` push frame, returning its

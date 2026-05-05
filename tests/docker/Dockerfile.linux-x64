@@ -22,7 +22,10 @@ RUN curl -fsSL https://opencode.ai/install | bash
 ENV PATH="/root/.opencode/bin:$PATH"
 
 # Install aimock globally
-RUN npm install -g @copilotkit/aimock
+# Pin aimock to a known-good version. 1.18.0 (published 2026-05-04) renamed
+# `mock.onTurn(...)` and broke our fixtures with `mock.onTurn is not a
+# function`. The Windows E2E harness pins the same version.
+RUN npm install -g @copilotkit/aimock@1.17.0
 
 # Git config for commits
 RUN git config --global user.email "test@test.com" && \

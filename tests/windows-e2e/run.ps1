@@ -128,7 +128,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # aimock -- the OpenAI-compatible mock LLM.
-& npm install -g `@copilotkit/aimock 2>&1 | Out-Null
+# Pin aimock to a known-good version. 1.18.0 (published 2026-05-04) renamed
+# `mock.onTurn(...)` and broke our fixtures with `mock.onTurn is not a
+# function`. The Linux Docker E2E harness pins the same version below.
+& npm install -g `@copilotkit/aimock@1.17.0 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Failed to install @copilotkit/aimock via npm" -ForegroundColor Red
     exit 2
