@@ -673,12 +673,13 @@ mod tests {
         let attempts: RefCell<Vec<WindowsShell>> = RefCell::new(Vec::new());
 
         let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |shell| {
-            attempts.borrow_mut().push(*shell);
+            attempts.borrow_mut().push(shell.clone());
             match shell {
                 WindowsShell::Pwsh | WindowsShell::Powershell => {
                     Err(Error::new(ErrorKind::NotFound, "blocked"))
                 }
                 WindowsShell::Cmd => Ok("ok-from-cmd"),
+                WindowsShell::Posix(_) => unreachable!("test fixture has no Posix shell"),
             }
         });
 
@@ -741,7 +742,7 @@ mod tests {
         let attempts: RefCell<Vec<WindowsShell>> = RefCell::new(Vec::new());
 
         let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |shell| {
-            attempts.borrow_mut().push(*shell);
+            attempts.borrow_mut().push(shell.clone());
             Err(Error::new(ErrorKind::PermissionDenied, "denied by ACL"))
         });
 

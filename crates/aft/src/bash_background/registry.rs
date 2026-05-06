@@ -1500,12 +1500,20 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_spawn_uses_pwsh_when_available() {
-        let shell = crate::windows_shell::resolve_windows_shell_with(|binary| {
-            matches!(binary, "pwsh.exe" | "powershell.exe")
-        });
-
+        // Without $SHELL set, $SHELL probe yields None and pwsh wins.
+        // (We intentionally pass None for shell_env to keep this test
+        // independent of the runner's actual env.)
+        let candidates = crate::windows_shell::shell_candidates_with(
+            |binary| match binary {
+                "pwsh.exe" => Some(std::path::PathBuf::from(r"C:\pwsh\pwsh.exe")),
+                "powershell.exe" => Some(std::path::PathBuf::from(r"C:\ps\powershell.exe")),
+                _ => None,
+            },
+            || None,
+        );
+        let shell = candidates.first().expect("at least one candidate").clone();
         assert_eq!(shell, crate::windows_shell::WindowsShell::Pwsh);
-        assert_eq!(shell.binary(), "pwsh.exe");
+        assert_eq!(shell.binary().as_ref(), "pwsh.exe");
     }
 
     /// Issue #27 Oracle review P1: cmd wrapper MUST use `!ERRORLEVEL!` (not
