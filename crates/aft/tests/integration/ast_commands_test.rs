@@ -1084,3 +1084,203 @@ fn ast_replace_accepts_named_variadic_in_rewrite() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+// ---------------------------------------------------------------------------
+// Hint tests — verify pattern-mistake hints propagate through the bridge.
+// ---------------------------------------------------------------------------
+//
+// Today's bug: pipe-alternation patterns like
+//   `LangId::C | LangId::Cpp | LangId::Bash`
+// compile fine in ast-grep (no `invalid_pattern` error) but match zero AST
+// nodes against source that obviously contains the literal text. The agent
+// reads `total_matches: 0` as "no work to do" and silently misses every hit.
+//
+// These tests lock in the hint behavior so future agents see actionable
+// guidance instead of zero-result silence.
+
+#[test]
+fn ast_search_attaches_hint_for_rust_match_arm_pipe_alternation() {
+    let project = setup_project(&[(
+        "src/lib.rs",
+        "fn classify(v: u8) {\n    match v {\n        LangId::C | LangId::Cpp | LangId::Bash => {}\n        _ => {}\n    }\n}\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-pipe",
+            "command": "ast_search",
+            "pattern": "LangId::C | LangId::Cpp | LangId::Bash",
+            "lang": "rust",
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "search must succeed (zero-match, not error): {search:?}"
+    );
+    assert_eq!(
+        search["total_matches"], 0,
+        "the bug we're documenting: pipe-alternative compiles but matches zero"
+    );
+
+    // The fix: a hint must be attached so the agent knows why.
+    let hint = search["hint"]
+        .as_str()
+        .expect("zero-match pipe pattern must include a hint");
+    assert!(
+        hint.contains("|"),
+        "hint should call out the `|` operator: {hint}"
+    );
+    assert!(
+        hint.to_lowercase().contains("ast")
+            || hint.to_lowercase().contains("alternation")
+            || hint.to_lowercase().contains("alternative"),
+        "hint should explain the AST-vs-text distinction: {hint}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_attaches_hint_for_regex_alternation() {
+    let project = setup_project(&[(
+        "src/index.ts",
+        "// nothing matching here\nconst foo = 1;\nconst bar = 2;\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-regex-alt",
+            "command": "ast_search",
+            "pattern": "foo|bar|baz",
+            "lang": "typescript",
+        }),
+    );
+
+    assert_eq!(search["success"], true, "{search:?}");
+    assert_eq!(search["total_matches"], 0);
+    let hint = search["hint"]
+        .as_str()
+        .expect("regex-alternation pattern must include a hint");
+    assert!(
+        hint.contains("|")
+            && (hint.contains("ast")
+                || hint.contains("AST")
+                || hint.contains("alternation")
+                || hint.contains("alternative")),
+        "hint should explain the issue: {hint}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_no_hint_for_clean_zero_match() {
+    let project = setup_project(&[("src/index.ts", "const x = 1;\nconst y = 2;\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    // Legitimate AST pattern that simply doesn't match — no hint should
+    // be attached because there's no shape mistake to call out.
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-clean-zero",
+            "command": "ast_search",
+            "pattern": "console.log($MSG)",
+            "lang": "typescript",
+        }),
+    );
+
+    assert_eq!(search["success"], true, "{search:?}");
+    assert_eq!(search["total_matches"], 0);
+    assert!(
+        search.get("hint").is_none() || search["hint"].is_null(),
+        "clean zero-match must NOT attach a hint: {search:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_attaches_hint_for_python_def_trailing_colon() {
+    let project = setup_project(&[("module.py", "def add(a, b):\n    return a + b\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-py-colon",
+            "command": "ast_search",
+            "pattern": "def $FUNC($$$):",
+            "lang": "python",
+        }),
+    );
+
+    assert_eq!(search["success"], true, "{search:?}");
+    // The pattern doesn't match because `def $FUNC($$$):` lacks a body.
+    if search["total_matches"].as_u64().unwrap_or(99) == 0 {
+        let hint = search["hint"]
+            .as_str()
+            .expect("python def with trailing colon should include a hint");
+        assert!(
+            hint.to_lowercase().contains("body") || hint.to_lowercase().contains("colon"),
+            "hint should mention body/colon: {hint}"
+        );
+    }
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_replace_attaches_hint_when_pattern_silently_does_not_match() {
+    let project = setup_project(&[(
+        "src/lib.rs",
+        "fn classify(v: u8) {\n    match v {\n        LangId::C | LangId::Cpp => {}\n        _ => {}\n    }\n}\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-silent",
+            "command": "ast_replace",
+            "pattern": "LangId::C | LangId::Cpp",
+            "rewrite": "LangId::Other",
+            "lang": "rust",
+            "dry_run": true,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], true,
+        "replace must succeed with zero matches, not error: {replace:?}"
+    );
+    assert_eq!(
+        replace["total_replacements"], 0,
+        "documenting the bug: pipe-alternative replaces zero"
+    );
+
+    let hint = replace["hint"]
+        .as_str()
+        .expect("zero-replacement pipe pattern must include a hint");
+    assert!(
+        hint.contains("|"),
+        "hint should call out the `|` operator: {hint}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}

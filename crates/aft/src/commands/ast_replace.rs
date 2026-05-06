@@ -9,6 +9,7 @@ use ast_grep_core::matcher::Pattern as AstPattern;
 use ast_grep_core::tree_sitter::LanguageExt;
 use rayon::prelude::*;
 
+use crate::ast_grep_hints::detect_pattern_hint;
 use crate::ast_grep_lang::AstGrepLang;
 use crate::commands::ast_scope::collect_ast_files;
 use crate::context::AppContext;
@@ -147,14 +148,17 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     let compiled_pattern = match AstPattern::try_new(&pattern, lang.clone()) {
         Ok(p) => p,
         Err(e) => {
-            return Response::error(
-                &req.id,
-                "invalid_pattern",
-                format!(
-                    "ast_replace: invalid pattern '{}': {}. Patterns must be complete AST nodes.",
-                    pattern, e
-                ),
+            // Attach a hint when the pattern looks like a regex or a
+            // language-specific shape mistake. See ast_grep_hints.
+            let mut message = format!(
+                "ast_replace: invalid pattern '{}': {}. Patterns must be complete AST nodes.",
+                pattern, e
             );
+            if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
+                message.push_str("\n\n");
+                message.push_str(&hint);
+            }
+            return Response::error(&req.id, "invalid_pattern", message);
         }
     };
 
@@ -262,19 +266,28 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "files": file_results,
-            "total_replacements": total_replacements,
-            "total_files": total_files,
-            "files_with_matches": files_with_matches,
-            "files_searched": files_searched,
-            "no_files_matched_scope": scope.no_files_matched_scope,
-            "scope_warnings": scope.scope_warnings,
-            "dry_run": dry_run,
-        }),
-    )
+    let mut payload = serde_json::json!({
+        "files": file_results,
+        "total_replacements": total_replacements,
+        "total_files": total_files,
+        "files_with_matches": files_with_matches,
+        "files_searched": files_searched,
+        "no_files_matched_scope": scope.no_files_matched_scope,
+        "scope_warnings": scope.scope_warnings,
+        "dry_run": dry_run,
+    });
+
+    // Same hint surface as ast_search: if zero replacements happened across a
+    // valid scope, attach a hint when the pattern looks like a common mistake.
+    // Especially important for replace, where "0 replacements" looks like a
+    // clean no-op but may actually be silent corruption (today's `|` bug).
+    if total_replacements == 0 && !scope.no_files_matched_scope {
+        if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
+            payload["hint"] = serde_json::Value::String(hint);
+        }
+    }
+
+    Response::success(&req.id, payload)
 }
 
 fn validate_matched_file_path(

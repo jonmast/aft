@@ -60,6 +60,19 @@ export interface AstSurface {
   astReplace: boolean;
 }
 
+/**
+ * Append the server-side `hint` field if present. Rust attaches a hint to
+ * zero-match responses when the pattern looks like a common mistake (regex
+ * syntax, language-specific shape, today's Rust match-arm `|` trap).
+ * See `crates/aft/src/ast_grep_hints.rs` for the rules.
+ */
+function appendHintSection(response: Record<string, unknown>, sections: string[], theme: Theme) {
+  const hint = asString(response.hint);
+  if (hint && hint.length > 0) {
+    sections.push(theme.fg("warning", hint));
+  }
+}
+
 /** Append honest scope reporting (no_files_matched_scope + scope_warnings) when present. */
 function appendScopeSections(response: Record<string, unknown>, sections: string[], theme: Theme) {
   if (response.no_files_matched_scope === true) {
@@ -101,6 +114,7 @@ export function buildAstSearchSections(payload: unknown, theme: Theme): string[]
   if (matches.length === 0) {
     const sections = [header, theme.fg("muted", "No AST matches found.")];
     appendScopeSections(response, sections, theme);
+    appendHintSection(response, sections, theme);
     return sections;
   }
 
@@ -155,6 +169,7 @@ export function buildAstReplaceSections(payload: unknown, theme: Theme): string[
   if (files.length === 0) {
     sections.push(theme.fg("muted", "No files changed."));
     appendScopeSections(response, sections, theme);
+    appendHintSection(response, sections, theme);
     return sections;
   }
 

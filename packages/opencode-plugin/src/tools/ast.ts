@@ -26,26 +26,18 @@ function showOutputToUser(context: unknown, output: string): void {
   ctx.metadata?.({ metadata: { output } });
 }
 
-/** Provide helpful hints when a pattern returns 0 matches. */
-function getEmptyResultHint(pattern: string, lang: string): string | null {
-  const src = pattern.trim();
-
-  if (lang === "python") {
-    if (src.startsWith("class ") && src.endsWith(":")) {
-      return `Hint: Python class patterns need a body. Try: "${src.slice(0, -1)}" or "${src}\n    $$$"`;
-    }
-    if ((src.startsWith("def ") || src.startsWith("async def ")) && src.endsWith(":")) {
-      return `Hint: Python function patterns need a body. Try adding "\\n    $$$" after the colon.`;
-    }
-  }
-
-  if (["javascript", "typescript", "tsx"].includes(lang)) {
-    if (/^(export\s+)?(async\s+)?function\s+\$[A-Z_]+\s*$/i.test(src)) {
-      return `Hint: Function patterns need params and body. Try: "function $NAME($$$) { $$$ }"`;
-    }
-  }
-
-  return null;
+/**
+ * Pull the server-side `hint` field out of an ast-grep response. Rust now
+ * attaches a hint to zero-match responses when the pattern looks like a
+ * common mistake (regex syntax, language-specific shape, today's Rust
+ * match-arm `|` trap). See `crates/aft/src/ast_grep_hints.rs` for the rules.
+ *
+ * Plugin-side rendering is intentionally thin — all detection logic lives in
+ * Rust so OpenCode and Pi behave identically.
+ */
+function extractHint(response: Record<string, unknown>): string | null {
+  const hint = response.hint;
+  return typeof hint === "string" && hint.length > 0 ? hint : null;
 }
 
 const SUPPORTED_LANGS = ["typescript", "tsx", "javascript", "python", "rust", "go"] as const;
@@ -121,8 +113,10 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         if (data.scope_warnings && data.scope_warnings.length > 0) {
           output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
         }
-        // Add hints for common pattern mistakes
-        const hint = getEmptyResultHint(args.pattern as string, args.lang as string);
+        // Server-side hint for common pattern mistakes (attached by Rust
+        // when the pattern looks like regex syntax, language-specific shape
+        // mistake, or today's Rust match-arm `|` trap).
+        const hint = extractHint(response as Record<string, unknown>);
         if (hint) {
           output += `\n\n${hint}`;
         }
@@ -251,6 +245,14 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         output = `No matches found (searched ${filesSearched} files)`;
         if (data.scope_warnings && data.scope_warnings.length > 0) {
           output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
+        }
+        // Server-side hint when zero replacements happened. Especially
+        // important here: "0 replacements" looks like a clean no-op but
+        // can mean silent corruption (today's `|` bug). The hint tells
+        // the agent why the pattern matched nothing.
+        const hint = extractHint(response as Record<string, unknown>);
+        if (hint) {
+          output += `\n\n${hint}`;
         }
       } else {
         output = isDryRun

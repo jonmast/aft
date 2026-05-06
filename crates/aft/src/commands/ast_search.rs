@@ -5,6 +5,7 @@ use std::path::Path;
 
 use ast_grep_core::tree_sitter::LanguageExt;
 
+use crate::ast_grep_hints::detect_pattern_hint;
 use crate::ast_grep_lang::AstGrepLang;
 use crate::commands::ast_scope::collect_ast_files;
 use crate::context::AppContext;
@@ -91,11 +92,15 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     // but returning an explicit pattern error gives callers a better signal.
     use ast_grep_core::matcher::Pattern as AstPattern;
     if let Err(err) = AstPattern::try_new(&pattern, lang.clone()) {
-        return Response::error(
-            &req.id,
-            "invalid_pattern",
-            format!("invalid AST pattern: {}", err),
-        );
+        // Attach a hint when the pattern looks like a common mistake. The
+        // hint helps less-capable agents recover from regex-shaped patterns
+        // and language-specific shape gotchas.
+        let mut message = format!("invalid AST pattern: {}", err);
+        if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
+            message.push_str("\n\n");
+            message.push_str(&hint);
+        }
+        return Response::error(&req.id, "invalid_pattern", message);
     }
 
     let config = ctx.config();
@@ -159,17 +164,26 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let total_matches = all_matches.len();
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "matches": all_matches,
-            "total_matches": total_matches,
-            "files_with_matches": files_with_matches,
-            "files_searched": files_searched,
-            "no_files_matched_scope": scope.no_files_matched_scope,
-            "scope_warnings": scope.scope_warnings,
-        }),
-    )
+    let mut payload = serde_json::json!({
+        "matches": all_matches,
+        "total_matches": total_matches,
+        "files_with_matches": files_with_matches,
+        "files_searched": files_searched,
+        "no_files_matched_scope": scope.no_files_matched_scope,
+        "scope_warnings": scope.scope_warnings,
+    });
+
+    // When the search succeeded but matched zero AST nodes, attach a hint if
+    // the pattern looks like a common mistake (regex syntax, language-specific
+    // shape gotcha, today's Rust match-arm `|` trap, etc.). Agents reading
+    // `total_matches: 0` as "no work to do" can now see why.
+    if total_matches == 0 && !scope.no_files_matched_scope {
+        if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
+            payload["hint"] = serde_json::Value::String(hint);
+        }
+    }
+
+    Response::success(&req.id, payload)
 }
 
 fn search_file_compiled(
