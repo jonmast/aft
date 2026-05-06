@@ -893,6 +893,94 @@ for better embedding quality.
 
 Parameters: `query` (required — natural language description), `topK` (optional — default 10).
 
+#### Embedding backends
+
+`aft_search` supports three embedding backends. Set them under the `semantic` block in your
+**user-level** AFT config (`~/.config/opencode/aft.jsonc` or `~/.pi/agent/aft.jsonc`).
+
+> **Trust boundary:** `backend`, `base_url`, and `api_key_env` are user-only. Project-level
+> `aft.jsonc` files cannot inject these — a hostile repository cannot point your embeddings
+> at an attacker-controlled endpoint or steal your API keys. Project config can still tune
+> `model`, `timeout_ms`, and `max_batch_size`.
+
+**1. `fastembed` (default)** — local ONNX Runtime, no network, no API key. Uses
+`all-MiniLM-L6-v2` (384 dims, ~22MB downloaded on first use). Works fully offline.
+
+```jsonc
+{
+  "semantic_search": true
+  // No "semantic" block needed — fastembed is the default.
+}
+```
+
+**2. `openai_compatible`** — any OpenAI-compatible `/v1/embeddings` endpoint. Works with
+OpenAI, Together, Voyage, Anyscale, Fireworks, vLLM, LM Studio, etc.
+
+```jsonc
+{
+  "semantic_search": true,
+  "semantic": {
+    "backend": "openai_compatible",
+    "model": "text-embedding-3-small",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",   // env var name, not the key itself
+    "timeout_ms": 25000,                // optional, default 25000
+    "max_batch_size": 64                // optional, default 64
+  }
+}
+```
+
+The plugin reads the API key from the environment variable named in `api_key_env` at request
+time. The key itself is never stored in config or logs.
+
+**3. `ollama`** — self-hosted Ollama at its `/api/embeddings` endpoint. No API key required.
+
+```jsonc
+{
+  "semantic_search": true,
+  "semantic": {
+    "backend": "ollama",
+    "model": "nomic-embed-text",
+    "base_url": "http://127.0.0.1:11434"
+  }
+}
+```
+
+**Choosing a backend:**
+
+| backend | when |
+|---|---|
+| `fastembed` | Default. Offline, free, zero setup beyond ONNX Runtime. Lower recall than larger models but good enough for most code search. |
+| `openai_compatible` | You want higher recall (1536/3072-dim models), already pay for an embeddings API, or your repo is large enough that local CPU embedding is too slow. |
+| `ollama` | You want a local self-hosted model larger than `all-MiniLM-L6-v2` without paying per-token. |
+
+**Switching backends rebuilds the index.** AFT stores a fingerprint
+(`backend`, `model`, `base_url`, `dimension`) with every persisted index. Changing any of
+these fields deletes the cached index on the next session start and rebuilds from scratch
+in the background — necessary because different models produce different vector dimensions
+and incompatible semantic spaces. For OpenAI-compatible backends on a large repo this can
+mean hundreds of API calls and a few minutes of wall-clock time. `aft_search` returns
+`[semantic index: building]` while the rebuild runs; status is also visible via
+`/aft-status` and the OpenCode TUI sidebar.
+
+Switching API keys (rotating `OPENAI_API_KEY` without changing `api_key_env`) does **not**
+trigger a rebuild — the key isn't part of the fingerprint.
+
+**Constraints:**
+- `base_url` must be `http://` or `https://`.
+- **Loopback is allowed.** `127.0.0.1`, `localhost`, and `*.localhost` are accepted so
+  self-hosted backends like Ollama work at their default config (`http://127.0.0.1:11434`).
+  Loopback is by definition same-machine and not an SSRF target.
+- **Non-loopback private/reserved IPs are rejected** at configure time as an SSRF guard
+  against a malicious config redirecting embeddings to internal services. This includes
+  10/8, 172.16/12, 192.168/16, 169.254/16 (link-local), and 100.64/10 (CGNAT). mDNS
+  hostnames (`*.local`) are also rejected. Users running self-hosted services on a LAN IP
+  can either bind the service to loopback and use SSH/port-forward, or expose it on a
+  public-routable interface.
+- The plugin retries failed HTTP requests with exponential backoff before giving up.
+- Vector dimension is detected from the first response and validated on every subsequent
+  insert; mismatches abort the build instead of silently corrupting the index.
+
 ---
 
 ### aft_delete
@@ -1126,11 +1214,35 @@ The schema is identical across harnesses. Only file location differs.
   "search_index": false,
 
   // Semantic code search (graduated from experimental in v0.18; aft_search tool).
-  // Requires ONNX Runtime installed (brew install onnxruntime on macOS).
-  // Builds embeddings for all symbols using a local model (all-MiniLM-L6-v2, ~22MB).
-  // The model is downloaded on first use. Index persists to disk for fast cold start.
+  // Default backend is fastembed (local ONNX, no network) and requires ONNX Runtime
+  // installed (brew install onnxruntime on macOS). The model is downloaded on first
+  // use. Index persists to disk for fast cold start. To use a remote provider
+  // (OpenAI-compatible) or self-hosted Ollama instead, see the "semantic" block
+  // below and the aft_search "Embedding backends" section above.
   // Default: false
   "semantic_search": false,
+
+  // Optional embedding-backend configuration for aft_search. Omit this block to use
+  // the local fastembed default. Three backends are supported: "fastembed" (default,
+  // local ONNX), "openai_compatible" (any /v1/embeddings endpoint — OpenAI, Together,
+  // Voyage, vLLM, LM Studio, etc.), and "ollama" (self-hosted at /api/embeddings).
+  //
+  // USER-only fields: "backend", "base_url", "api_key_env" (project config cannot
+  // inject these — strict-allowlist trust boundary). Project config can still tune
+  // "model", "timeout_ms", "max_batch_size".
+  //
+  // Switching "backend", "model", or "base_url" deletes the persisted index and
+  // rebuilds from scratch on next session start (necessary because dimensions and
+  // semantic spaces differ across models). Rotating an API key without changing
+  // "api_key_env" does NOT trigger a rebuild.
+  "semantic": {
+    "backend": "fastembed",            // "fastembed" | "openai_compatible" | "ollama"
+    "model": "all-MiniLM-L6-v2",       // model id understood by the backend
+    // "base_url": "https://api.openai.com/v1",   // required for openai_compatible / ollama
+    // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
+    "timeout_ms": 25000,                // per-request timeout, kept under bridge limit
+    "max_batch_size": 64                // embeddings batched in groups of this size
+  },
 
   // Restrict all file operations to the project root directory.
   // Default: false. Matches OpenCode's and Pi's native behavior — neither host

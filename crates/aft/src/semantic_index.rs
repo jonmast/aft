@@ -164,24 +164,44 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
 /// Validate that a base URL does not point to a private/loopback address.
 /// Call this on user-supplied config (at configure time) to prevent SSRF.
 /// Not called for programmatically constructed configs (e.g. tests).
+///
+/// **Loopback is allowed.** Self-hosted embedding backends (e.g. Ollama at
+/// `http://127.0.0.1:11434`) are a primary use case for `aft_search`. Loopback
+/// addresses by definition cannot be exploited as SSRF targets — they only
+/// reach services on the same machine. Allowing loopback unblocks Ollama at its
+/// default config without opening up SSRF to LAN/intranet services, which
+/// remain rejected.
+///
+/// **mDNS `.local` is rejected.** mDNS hostnames typically resolve to LAN
+/// devices (printers, homelab servers); rejecting them before DNS lookup keeps
+/// the SSRF guard meaningful for non-loopback private networks.
 pub fn validate_base_url_no_ssrf(raw: &str) -> Result<(), String> {
     use std::net::{IpAddr, ToSocketAddrs};
 
     let parsed = Url::parse(raw).map_err(|error| format!("invalid base_url '{raw}': {error}"))?;
 
-    // Reject well-known private/loopback hostnames before DNS lookup.
     let host = parsed.host_str().unwrap_or("");
-    if host == "localhost"
-        || host == "localhost.localdomain"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-    {
+
+    // Loopback hostnames are explicitly allowed. RFC 6761 mandates that
+    // `localhost` and `*.localhost` resolve to loopback;
+    // `localhost.localdomain` is a historical alias used on some Linux
+    // distros. Self-hosted backends like Ollama use these by default.
+    let is_loopback_host =
+        host == "localhost" || host == "localhost.localdomain" || host.ends_with(".localhost");
+    if is_loopback_host {
+        return Ok(());
+    }
+
+    // mDNS hostnames are typically LAN devices, not loopback. Reject before
+    // DNS lookup so users get a clear error rather than a private-IP error.
+    if host.ends_with(".local") {
         return Err(format!(
-            "base_url host '{host}' resolves to a private/loopback address — only public endpoints are allowed"
+            "base_url host '{host}' is an mDNS name — only loopback (localhost / 127.0.0.1) and public endpoints are allowed"
         ));
     }
 
-    // Resolve the hostname and reject any private/loopback/link-local IPs.
+    // Resolve the hostname. Reject private/link-local/CGNAT IPs but NOT
+    // loopback (which is by definition same-machine and not an SSRF target).
     let port = parsed.port_or_known_default().unwrap_or(443);
     let addr_str = format!("{host}:{port}");
     let addrs: Vec<IpAddr> = addr_str
@@ -189,9 +209,9 @@ pub fn validate_base_url_no_ssrf(raw: &str) -> Result<(), String> {
         .map(|iter| iter.map(|sa| sa.ip()).collect())
         .unwrap_or_default();
     for ip in &addrs {
-        if is_private_ip(ip) {
+        if is_private_non_loopback_ip(ip) {
             return Err(format!(
-                "base_url '{raw}' resolves to a private/reserved IP address — only public endpoints are allowed"
+                "base_url '{raw}' resolves to a private/reserved IP — only loopback (127.0.0.1) and public endpoints are allowed"
             ));
         }
     }
@@ -199,31 +219,33 @@ pub fn validate_base_url_no_ssrf(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+/// Returns true for IPv4/IPv6 addresses in private/link-local/CGNAT/wildcard
+/// ranges, EXCLUDING loopback (127.0.0.0/8 and ::1). Loopback is considered
+/// safe for SSRF purposes — see [`validate_base_url_no_ssrf`] for rationale.
+fn is_private_non_loopback_ip(ip: &std::net::IpAddr) -> bool {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
+            // Note: 127.0.0.0/8 (loopback) is intentionally NOT in this set.
             // 10.0.0.0/8
             o[0] == 10
             // 172.16.0.0/12
             || (o[0] == 172 && (16..=31).contains(&o[1]))
             // 192.168.0.0/16
             || (o[0] == 192 && o[1] == 168)
-            // 127.0.0.0/8 loopback
-            || o[0] == 127
             // 169.254.0.0/16 link-local
             || (o[0] == 169 && o[1] == 254)
             // 100.64.0.0/10 CGNAT
             || (o[0] == 100 && (64..=127).contains(&o[1]))
-            // 0.0.0.0/8
+            // 0.0.0.0/8 wildcard
             || o[0] == 0
         }
         IpAddr::V6(v6) => {
-            // ::1 loopback
-            *v6 == Ipv6Addr::LOCALHOST
-            // fe80::/10 link-local
-            || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // Note: ::1 (loopback) is intentionally NOT in this set.
+            let _ = Ipv6Addr::LOCALHOST; // touch to silence unused-import lints in some builds
+                                         // fe80::/10 link-local
+            (v6.segments()[0] & 0xffc0) == 0xfe80
             // fc00::/7 unique-local
             || (v6.segments()[0] & 0xfe00) == 0xfc00
             // ::ffff:0:0/96 IPv4-mapped — check the embedded IPv4
@@ -233,7 +255,7 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 && {
                     let [a, b] = v6.segments()[6..8] else { return false; };
                     let ipv4 = Ipv4Addr::new((a >> 8) as u8, (a & 0xff) as u8, (b >> 8) as u8, (b & 0xff) as u8);
-                    is_private_ip(&IpAddr::V4(ipv4))
+                    is_private_non_loopback_ip(&IpAddr::V4(ipv4))
                 })
         }
     }
@@ -2709,33 +2731,78 @@ mod tests {
     }
 
     #[test]
-    fn validate_ssrf_rejects_loopback_hostnames() {
+    fn validate_ssrf_allows_loopback_hostnames() {
+        // Loopback hostnames are explicitly allowed so self-hosted backends
+        // (Ollama at http://localhost:11434) work at their default config.
         for host in &[
             "http://localhost",
             "http://localhost:8080",
+            "http://localhost:11434", // Ollama default
             "http://localhost.localdomain",
             "http://foo.localhost",
         ] {
             assert!(
-                validate_base_url_no_ssrf(host).is_err(),
-                "Expected {host} to be rejected"
+                validate_base_url_no_ssrf(host).is_ok(),
+                "Expected {host} to be allowed (loopback), got: {:?}",
+                validate_base_url_no_ssrf(host)
             );
         }
     }
 
     #[test]
-    fn validate_ssrf_rejects_private_ips() {
+    fn validate_ssrf_allows_loopback_ips() {
+        // 127.0.0.0/8 is loopback — by definition same-machine and not an
+        // SSRF target. Allow it so Ollama at http://127.0.0.1:11434 works.
+        for url in &[
+            "http://127.0.0.1",
+            "http://127.0.0.1:11434", // Ollama default
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+        ] {
+            let result = validate_base_url_no_ssrf(url);
+            assert!(
+                result.is_ok(),
+                "Expected {url} to be allowed (loopback), got: {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssrf_rejects_private_non_loopback_ips() {
+        // Non-loopback private/reserved IPs remain rejected — homelab/intranet
+        // services on LAN IPs are real SSRF targets even though the user
+        // configured them. Users who want this can opt in by binding the
+        // service to a public-routable address.
         for url in &[
             "http://192.168.1.1",
             "http://10.0.0.1",
             "http://172.16.0.1",
-            "http://127.0.0.1",
             "http://169.254.169.254",
+            "http://100.64.0.1",
         ] {
             let result = validate_base_url_no_ssrf(url);
             assert!(
                 result.is_err(),
-                "Expected {url} to be rejected, got: {:?}",
+                "Expected {url} to be rejected (non-loopback private), got: {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssrf_rejects_mdns_local_hostnames() {
+        // mDNS .local hostnames typically resolve to LAN devices, not
+        // loopback. Rejecting them before DNS lookup gives a clearer error.
+        for host in &[
+            "http://printer.local",
+            "http://nas.local:8080",
+            "http://homelab.local",
+        ] {
+            let result = validate_base_url_no_ssrf(host);
+            assert!(
+                result.is_err(),
+                "Expected {host} to be rejected (mDNS), got: {:?}",
                 result
             );
         }

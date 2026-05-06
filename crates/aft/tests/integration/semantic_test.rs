@@ -208,3 +208,79 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
     let status = second.shutdown();
     assert!(status.success());
 }
+
+/// Regression for the v0.19.5 fix: Ollama's default `base_url`
+/// (`http://127.0.0.1:11434`) and `http://localhost:11434` must be accepted at
+/// configure time. Earlier versions rejected all loopback as an SSRF guard,
+/// which made the Ollama backend unusable at its default config.
+#[test]
+fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
+    let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
+    let storage = tempfile::tempdir().expect("create storage dir");
+
+    for base_url in &[
+        "http://127.0.0.1:11434", // Ollama default
+        "http://localhost:11434",
+        "http://127.0.0.1:8080",
+    ] {
+        let mut aft = AftProcess::spawn();
+        let response = send(
+            &mut aft,
+            json!({
+                "id": "cfg-ollama",
+                "command": "configure",
+                "project_root": project.path().display().to_string(),
+                "storage_dir": storage.path().display().to_string(),
+                "semantic_search": true,
+                "semantic": {
+                    "backend": "ollama",
+                    "model": "nomic-embed-text",
+                    "base_url": base_url,
+                },
+            }),
+        );
+        assert_eq!(
+            response["success"], true,
+            "configure should accept loopback base_url {base_url}, got: {response:?}"
+        );
+        let _ = aft.shutdown();
+    }
+}
+
+/// Non-loopback private IPs (LAN/intranet ranges) must still be rejected at
+/// configure time. SSRF guard remains meaningful for homelab/corporate
+/// network targets even though the user is the trust boundary.
+#[test]
+fn configure_rejects_non_loopback_private_base_url() {
+    let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
+    let storage = tempfile::tempdir().expect("create storage dir");
+
+    for base_url in &[
+        "http://192.168.1.50:8080",
+        "http://10.0.0.5:11434",
+        "http://172.16.0.10:8080",
+    ] {
+        let mut aft = AftProcess::spawn();
+        let response = send(
+            &mut aft,
+            json!({
+                "id": "cfg-private",
+                "command": "configure",
+                "project_root": project.path().display().to_string(),
+                "storage_dir": storage.path().display().to_string(),
+                "semantic_search": true,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "text-embedding-3-small",
+                    "base_url": base_url,
+                    "api_key_env": "FAKE_KEY",
+                },
+            }),
+        );
+        assert_eq!(
+            response["success"], false,
+            "configure should reject non-loopback private base_url {base_url}, got: {response:?}"
+        );
+        let _ = aft.shutdown();
+    }
+}
