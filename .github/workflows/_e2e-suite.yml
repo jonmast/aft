@@ -1,0 +1,116 @@
+name: E2E Suite
+
+# Reusable workflow that runs the full E2E test matrix:
+#   - Linux Docker e2e — OpenCode + plugin + binary stack against aimock
+#   - Windows native e2e — same stack on real Windows runner (no containers)
+#
+# Called from:
+#   - tests.yml (PR + main push) — catches regressions at PR time
+#   - release.yml (tag push)     — gates build/publish on e2e success
+#
+# Single source of truth so PR-time and release-time e2e never drift.
+#
+# IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
+# locking, or platform-conditional code paths SHOULD touch the matching
+# integration test or e2e scenario here. The Linux harness has caught real
+# regressions before; the Windows e2e is here to extend that coverage to
+# issue-#26-class Windows-specific bugs (bash timeouts, lock recovery, path
+# separators).
+
+on:
+  workflow_call:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux Docker e2e — exercises the full OpenCode + plugin + binary stack
+  # against a deterministic aimock LLM.
+  # ---------------------------------------------------------------------------
+  e2e-linux:
+    name: E2E (Linux Docker)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The E2E Dockerfile copies `packages/opencode-plugin/dist/` into the
+      # image, so we have to produce that on the runner first. The plugin
+      # depends on aft-bridge being built (workspace dependency).
+      - name: Install workspace deps + build plugin
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+          bun run --cwd packages/opencode-plugin build
+
+      - name: Build Linux x64 binary in Docker
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-build-linux \
+            -f tests/docker/Dockerfile.build-linux .
+
+      - name: Extract built binary
+        run: |
+          CID=$(docker create --platform linux/amd64 aft-build-linux true)
+          docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
+          docker rm "$CID"
+
+      - name: Build E2E test image
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-e2e-linux-x64 \
+            -f tests/docker/Dockerfile.linux-x64 .
+
+      - name: Run E2E test
+        run: docker run --rm --platform linux/amd64 aft-e2e-linux-x64
+
+  # ---------------------------------------------------------------------------
+  # Windows native e2e — exercises the same OpenCode + plugin + binary stack
+  # on a real Windows runner. No containers. This is the only job that catches
+  # Windows-specific bugs at the integration level (bash spawning + timeout
+  # behavior — issue #26, ONNX install via tar.exe, file URI handling, lock
+  # recovery). Windows containers require a Windows Docker host and add no
+  # value over running natively on `windows-2022`.
+  # ---------------------------------------------------------------------------
+  e2e-windows:
+    name: E2E (Windows native)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build AFT binary (Windows x64)
+        run: cargo build --release --target x86_64-pc-windows-msvc -p agent-file-tools
+        shell: pwsh
+
+      - name: Install workspace deps + build aft-bridge
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+        shell: pwsh
+
+      - name: Build OpenCode plugin dist
+        run: bun run --cwd packages/opencode-plugin build
+        shell: pwsh
+
+      - name: Run Windows E2E suite
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
+        shell: pwsh
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\aft.exe
+          AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
