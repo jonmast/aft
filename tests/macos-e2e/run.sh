@@ -51,9 +51,16 @@ echo "  AFT binary:   $AFT_BINARY_PATH"
 echo "  Plugin dist:  $AFT_PLUGIN_DIST"
 
 # ---- Install OpenCode ------------------------------------------------------
-# Use the same standalone installer the Docker image uses.
-echo "── Installing OpenCode ──"
-curl -fsSL https://opencode.ai/install | bash
+# Pin to a known-good version. The OpenCode installer's `latest` resolution
+# hits api.github.com anonymously, which is rate-limited to 60 req/hr per
+# egress IP — and macOS GH Actions runners share egress, so concurrent runs
+# (or repeated re-runs) hit the limit and the installer prints
+# "Failed to fetch version information" then exits 1. Pinning sidesteps the
+# probe entirely. Bump alongside the Linux Docker image so both harnesses
+# exercise the same OpenCode version.
+OPENCODE_VERSION="${OPENCODE_VERSION:-1.14.39}"
+echo "── Installing OpenCode v${OPENCODE_VERSION} ──"
+curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
 export PATH="$HOME/.opencode/bin:$PATH"
 opencode --version
 
@@ -147,21 +154,10 @@ if [ -n "$PLUGIN_DIST_DEST" ]; then
     echo "  Injected local plugin dist into: $PLUGIN_DIST_DEST"
 fi
 
-# ---- Locate aimock + run shared harness ------------------------------------
-# Find the global aimock install. macOS GH runners install npm globals under
-# either /opt/homebrew/lib/node_modules or /usr/local/lib/node_modules — we
-# check both.
-for candidate in \
-    "/opt/homebrew/lib/node_modules/@copilotkit/aimock/lib/server.js" \
-    "/usr/local/lib/node_modules/@copilotkit/aimock/lib/server.js"; do
-    if [ -f "$candidate" ]; then
-        AIMOCK_SERVER_DEFAULT="$candidate"
-        break
-    fi
-done
-
-# We don't actually use aimock's own server.js — the Linux harness uses a
-# custom mock-server.js fixture under tests/docker/. Reuse it directly.
+# ---- Run shared harness ----------------------------------------------------
+# We don't use aimock's own server.js — the Linux harness drives aimock via
+# a custom mock-server.js fixture under tests/docker/. Reuse it directly so
+# Linux + macOS exercise the same scripted turns.
 export AFT_E2E_MOCK_SERVER="$REPO_ROOT/tests/docker/mock-server.js"
 if [ ! -f "$AFT_E2E_MOCK_SERVER" ]; then
     echo "Mock server fixture missing: $AFT_E2E_MOCK_SERVER" >&2
