@@ -744,15 +744,34 @@ Check "opencode reached scripted turns (not fallback)" {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 2: Issue #26 reproduction -- bash with all experimentals on, varying timeouts
+# Scenario 2: Issue #26 reproduction -- bash with all experimentals on, long task
 #
-# We ask the agent to run several bash commands with different timeout values
-# to measure whether the bridge transport timeout calc has enough headroom
-# on Windows (where process spawn is materially slower than Unix).
+# Issue #26 was a 65s bridge transport timeout on Windows when foreground
+# bash ran longer than the old 30s default. The v0.20+ architecture closes
+# the issue more thoroughly than the original transport-timeout fix:
+#
+#   - All bash routes through bash_background internally; Rust dispatch
+#     loop never blocks on the child process.
+#   - Foreground polling is capped at 5s (FOREGROUND_WAIT_WINDOW_MS);
+#     past that, the plugin promotes the task to background and returns
+#     a "promoted to background: bgb-XXX" string immediately.
+#   - The bg task survives plugin shutdown when experimental.bash.background
+#     is enabled (which this scenario sets in the AFT config).
+#
+# So the harness can't observe a 60s bash *call* anymore — it observes a
+# ~5s call that returns "promoted", followed by a detached bg task that
+# eventually writes the END marker. The check sequence below mirrors that:
+#
+#   1. opencode session runs ~10-15s (bash returns promoted, model wraps up)
+#   2. AFTER the session ends, poll the marker file for END (up to 90s)
+#   3. Assert: bash result text contained "promoted to background"
+#   4. Assert: marker has START + END (proves task survived shutdown)
+#   5. Assert: elapsed in marker is 55-70s (proves task wasn't killed early)
+#   6. Assert: no bridge timeout or "stdin not writable" in plugin log
 # ---------------------------------------------------------------------------
 
 Write-Host ""
-Write-Host "-- Scenario 2: Bash timeout headroom (issue #26) --"
+Write-Host "-- Scenario 2: Bash long-task auto-promotion (issue #26) --"
 Write-Host ""
 
 # Reset the plugin log so this scenario's assertions don't conflict with
@@ -768,11 +787,11 @@ Remove-Item $PluginLog -Force -ErrorAction SilentlyContinue
 $BashMarker = Join-Path $env:TEMP "bash-timing-marker.txt"
 Remove-Item $BashMarker -Force -ErrorAction SilentlyContinue
 
-# Single bash turn with a pre-staged 60s sleep script. Issue #26's
-# boundary is at requested timeout = 65s, transport budget = 70s. The
-# harness allows 240s for the whole opencode session because there's
-# also model streaming overhead, plugin startup work, and S2 starts
-# from a cold bridge that needs to reload ONNX + indexes.
+# Single bash turn with a pre-staged 60s Start-Sleep script. Issue #26's
+# original boundary was at requested timeout = 65s, transport budget = 70s
+# (no longer a meaningful concern after v0.20 — bash returns at ~5s now).
+# The session timeout stays at 240s for cold-bridge ONNX + index reload
+# headroom, but the actual bash call returns much faster.
 $Result2 = Join-Path $env:TEMP "result-scenario2.txt"
 $S2Start = Get-Date
 $ExitCode = Run-OpencodeSession `
@@ -781,6 +800,27 @@ $ExitCode = Run-OpencodeSession `
     -TimeoutSec 240
 $S2Duration = (Get-Date) - $S2Start
 Write-Host "  (S2 wall-clock: $([Math]::Round($S2Duration.TotalSeconds, 1))s)"
+
+# Wait for the detached bg task to complete the marker file. It started
+# during the opencode session (which has already ended) and continues
+# running with experimental.bash.background = true. The 60s sleep plus
+# PowerShell cold-start can take up to ~70s of wall time from when bash
+# was invoked; we already burned ~10-15s of that during the opencode
+# session, so 90s of post-session polling is generous headroom.
+$MarkerWaitDeadline = (Get-Date).AddSeconds(90)
+$MarkerComplete = $false
+while ((Get-Date) -lt $MarkerWaitDeadline) {
+    if (Test-Path $BashMarker) {
+        $markerContent = Get-Content $BashMarker -Raw -ErrorAction SilentlyContinue
+        if ($markerContent -and $markerContent -match "END") {
+            $MarkerComplete = $true
+            break
+        }
+    }
+    Start-Sleep -Milliseconds 500
+}
+$MarkerWaitElapsed = (Get-Date) - $S2Start
+Write-Host "  (marker END seen at $([Math]::Round($MarkerWaitElapsed.TotalSeconds, 1))s wall-clock from S2 start; complete=$MarkerComplete)"
 
 Check "bash session completed" { $ExitCode -eq 0 -or $ExitCode -eq 124 -or $ExitCode -eq -1 }
 Check "no bridge timeout from bash" { -not (LogContains $PluginLog 'timed out after \d+ms|stdin not writable') }
@@ -797,32 +837,37 @@ Check "no plugin crash (bash)" {
     return $true
 }
 
+# Confirm the v0.20+ auto-promotion path was actually exercised — the bash
+# tool result text must contain "promoted to background" because the 60s
+# Start-Sleep exceeds the 5s FOREGROUND_WAIT_WINDOW_MS.
+Check "bash returned auto-promotion message (v0.20+ contract)" {
+    if (-not (Test-Path $Result2)) { return $false }
+    $r2Content = Get-Content $Result2 -Raw
+    return $r2Content -match "promoted to background"
+}
+
 # ---- Empirical bash evidence (the actual issue #26 reproduction) ----
 #
-# These are the only checks that actually answer the question in issue #26.
-# The marker file content + duration proves bash:
-#   (1) was invoked at all
-#   (2) reached its sleep without crashing early
-#   (3) ran for the full 60s without being cut off by the bridge timeout
+# These are the checks that actually answer issue #26. With v0.20+, the
+# tool *call* returns at 5s (auto-promoted), but the underlying child
+# process must still run the full 60s without being killed by an old-style
+# 30s default kill cap. The marker file is the proof: it's written by the
+# detached child process at the END of its 60s sleep, well after opencode
+# has shut down.
 #
-# If issue #26 reproduces, "bash ran full 60s duration" will FAIL with the
-# marker showing only START + a sub-60s elapsed, and the bridge timeout
-# entry will appear in the plugin log.
-# Note: we do NOT check for AIMOCK_FALLBACK in S2's output. After the
-# scripted bash turn returns, opencode issues a follow-up assistant turn
-# whose user message (the bash tool result) doesn't match any specific
-# fixture — so the catch-all naturally fires to end the conversation.
-# That's expected. The empirical check that S2 actually exercised bash
-# is the marker file below.
+# If the v0.18-style 30s kill cap regressed, the marker would only have
+# START with elapsed ~30s, no END. If issue #26 itself regressed (bridge
+# transport timeout), we'd see "timed out after Nms" in the plugin log
+# during the bash call.
 Check "bash actually ran (marker file written)" {
     Test-Path $BashMarker
 }
-Check "bash completed full duration (START + END markers)" {
+Check "bg-promoted bash completed full duration (START + END markers)" {
     if (-not (Test-Path $BashMarker)) { return $false }
     $content = Get-Content $BashMarker -Raw
     return ($content -match "START" -and $content -match "END")
 }
-Check "bash duration in expected range (55-70s)" {
+Check "bg-promoted bash duration in expected range (55-70s)" {
     if (-not (Test-Path $BashMarker)) { return $false }
     $lines = Get-Content $BashMarker
     if ($lines.Count -lt 4) { return $false }
@@ -836,8 +881,8 @@ Check "bash duration in expected range (55-70s)" {
         $endTs   = [DateTime]::Parse($lines[3])
         $elapsed = ($endTs - $startTs).TotalSeconds
         Write-Host "  (bash sleep elapsed: $([Math]::Round($elapsed, 2))s)"
-        # `timeout /t 60` sleeps 59-61s in practice; allow generous range
-        # so a Windows process spawn slow-down doesn't false-fail.
+        # 60s Start-Sleep with PowerShell cold-start overhead lands at 60-65s
+        # in practice; the 55-70s range tolerates Windows process spawn jitter.
         return ($elapsed -ge 55 -and $elapsed -le 70)
     } catch {
         Write-Host "  (parse error: $($_.Exception.Message))"
