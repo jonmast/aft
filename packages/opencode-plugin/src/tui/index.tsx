@@ -138,6 +138,69 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
   );
 }
 
+/**
+ * Register the `/aft-status` slash command, preferring the v1.14.42+ keymap
+ * API and falling back to the legacy `api.command.register` for older hosts.
+ *
+ * The `keymap.registerLayer` shape uses `name`/`title`/`run`/`namespace`/
+ * `slashName` (see `@opencode-ai/plugin/tui` types) and is what the host's
+ * own legacy command-shim translates into. Calling it directly skips the
+ * deprecation warning and works without depending on the (now-deprecated)
+ * `api.command` namespace existing at all.
+ */
+function registerStatusCommand(api: TuiPluginApi): void {
+  type ApiAny = {
+    keymap?: {
+      registerLayer?: (layer: {
+        commands: Array<Record<string, unknown>>;
+        bindings: Array<Record<string, unknown>>;
+      }) => unknown;
+    };
+    command?: {
+      register?: (cb: () => Array<Record<string, unknown>>) => unknown;
+    };
+  };
+  const apiAny = api as unknown as ApiAny;
+
+  if (typeof apiAny.keymap?.registerLayer === "function") {
+    apiAny.keymap.registerLayer({
+      commands: [
+        {
+          namespace: "palette",
+          name: "aft.status",
+          title: "AFT: Status",
+          category: "AFT",
+          slashName: STATUS_COMMAND,
+          run() {
+            void showStatusDialog(api);
+          },
+        },
+      ],
+      bindings: [],
+    });
+    return;
+  }
+
+  if (typeof apiAny.command?.register === "function") {
+    apiAny.command.register(() => [
+      {
+        title: "AFT: Status",
+        value: "aft.status",
+        category: "AFT",
+        slash: { name: STATUS_COMMAND },
+        onSelect() {
+          void showStatusDialog(api);
+        },
+      },
+    ]);
+    return;
+  }
+
+  // Neither API surface is present. The TUI host can still load — we only
+  // lose the slash-command entry point. The sidebar (registered above)
+  // remains available so users can still see AFT status visually.
+}
+
 async function showStartupNotifications(api: TuiPluginApi): Promise<void> {
   const directory = api.state.path.directory ?? "";
   if (!directory) return;
@@ -203,17 +266,15 @@ const tui: TuiPlugin = async (api) => {
     // and keep the slash command working.
   }
 
-  api.command.register(() => [
-    {
-      title: "AFT: Status",
-      value: "aft.status",
-      category: "AFT",
-      slash: { name: STATUS_COMMAND },
-      onSelect() {
-        void showStatusDialog(api);
-      },
-    },
-  ]);
+  // OpenCode 1.14.42 removed `api.command.register` entirely
+  // (anomalyco/opencode PR #26053). Later patches reinstated it as a
+  // deprecated shim that translates to `api.keymap.registerLayer`. To work
+  // across the whole 1.14.x line — including the brief 1.14.42 / 1.14.43
+  // window where neither the legacy API nor a shim was present — we prefer
+  // `api.keymap.registerLayer` and fall back to `api.command.register` only
+  // when the keymap surface is missing (older hosts that predate keymap).
+  // See https://github.com/cortexkit/aft/issues/33.
+  registerStatusCommand(api);
 
   // Show startup notifications — RPC server is already running by the time TUI loads
   void showStartupNotifications(api);
