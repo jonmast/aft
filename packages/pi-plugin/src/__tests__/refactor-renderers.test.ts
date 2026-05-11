@@ -74,27 +74,13 @@ describe("refactor renderer", () => {
     expect(inline).toContain("inlined helper");
   });
 
-  test("renderRefactorResult handles dry-run, error, and empty payloads", () => {
-    const dryRun = renderToString(
+  test("renderRefactorResult handles error and empty payloads", () => {
+    const empty = renderToString(
       renderRefactorResult(
-        makeResult("", {
-          dry_run: true,
-          diffs: [
-            {
-              file: "src/a.ts",
-              diff: ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1 +1 @@", "-old", "+new"].join("\n"),
-            },
-          ],
-        }),
-        { op: "move", filePath: "src/a.ts", symbol: "run", destination: "src/b.ts", dryRun: true },
+        makeResult("", {}),
+        { op: "move", filePath: "src/a.ts", symbol: "run", destination: "src/b.ts" },
         mockTheme,
-        makeContext({
-          op: "move",
-          filePath: "src/a.ts",
-          symbol: "run",
-          destination: "src/b.ts",
-          dryRun: true,
-        }),
+        makeContext({ op: "move", filePath: "src/a.ts", symbol: "run", destination: "src/b.ts" }),
       ),
     );
     const error = renderToString(
@@ -109,8 +95,7 @@ describe("refactor renderer", () => {
       ),
     );
 
-    expect(dryRun).toContain("[dry run]");
-    expect(dryRun).toContain("+1 new");
+    expect(empty).toContain("moved symbol run");
     expect(error).toContain("ambiguous symbol");
   });
 });

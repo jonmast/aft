@@ -20,7 +20,6 @@ describe("aft_transform adapter", () => {
       container: "Service",
       code: "dispose() {}",
       position: "last",
-      dryRun: true,
     });
 
     expect(calls[0].command).toBe("add_member");
@@ -29,7 +28,6 @@ describe("aft_transform adapter", () => {
       scope: "Service",
       code: "dispose() {}",
       position: "last",
-      dry_run: true,
     });
   });
 

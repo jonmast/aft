@@ -46,7 +46,6 @@ const TransformParams = Type.Object({
         "Position hint: 'first', 'last' (default), 'before:name', 'after:name' for add_member",
     }),
   ),
-  dryRun: Type.Optional(Type.Boolean({ description: "Preview without modifying" })),
   validate: Type.Optional(
     StringEnum(["syntax", "full"] as const, {
       description: "Validation level (default: syntax)",
@@ -62,13 +61,6 @@ export function buildTransformSections(
 ): string[] {
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No transform result.")];
-
-  if (response.dry_run === true) {
-    return [
-      theme.fg("warning", `[dry run] ${args.op}`),
-      asString(response.diff) ?? theme.fg("muted", "No diff available."),
-    ];
-  }
 
   const target =
     asString(response.target) ??
@@ -121,7 +113,7 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
     name: "aft_transform",
     label: "transform",
     description:
-      "Scope-aware structural code transformations with correct indentation. See parameter descriptions for per-op requirements.",
+      "Scope-aware structural code transformations with correct indentation. Use aft_safety checkpoint/undo before risky transforms.",
     parameters: TransformParams,
     async execute(
       _toolCallId: string,
@@ -145,7 +137,6 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
       if (params.tag !== undefined) req.tag = params.tag;
       if (params.value !== undefined) req.value = params.value;
       if (params.position !== undefined) req.position = params.position;
-      if (params.dryRun !== undefined) req.dry_run = params.dryRun;
       if (params.validate !== undefined) req.validate = params.validate;
       const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));

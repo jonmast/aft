@@ -27,9 +27,8 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         "- 'wrap_try_catch': Wrap a TS/JS function body in try/catch. Requires 'target' (function name). Optional 'catchBody'.\n" +
         "- 'add_decorator': Add Python decorator to function/class. Requires 'target' and 'decorator' (without @). Optional 'position'.\n" +
         "- 'add_struct_tags': Add/update Go struct field tags. Requires 'target' (struct name), 'field', 'tag', 'value'.\n\n" +
-        "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
+        "Each op requires specific parameters — see parameter descriptions for requirements. Use aft_safety checkpoint/undo before risky transforms.\n\n" +
         "Returns:\n" +
-        "- Dry run (any op): { ok, dry_run, diff, syntax_valid? }\n" +
         "- add_member: { file, scope, position, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- add_derive: { file, target, derives, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- wrap_try_catch: { file, target, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
@@ -91,10 +90,6 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
           .describe(
             "Validation level: 'syntax' (default) or 'full'. Syntax = tree-sitter parse check only. Full = also runs LSP type-checking (slower, catches more errors)",
           ),
-        dryRun: z
-          .boolean()
-          .optional()
-          .describe("Preview without modifying the file (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
@@ -139,7 +134,6 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
 
         const params: Record<string, unknown> = { file: args.filePath };
         if (args.validate !== undefined) params.validate = args.validate;
-        if (args.dryRun !== undefined) params.dry_run = args.dryRun;
 
         switch (op) {
           case "add_member":

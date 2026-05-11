@@ -98,18 +98,4 @@ maybeDescribe("aft_import (real bridge)", () => {
     // Response structure includes groups/file keys — any of those proves dispatch worked
     expect(text).toMatch(/groups|file/i);
   });
-
-  test("dryRun does not modify the file", async () => {
-    await writeFixture(harness, "dry-target.ts", `export const x = 1;\n`);
-    const before = await readFile(harness.path("dry-target.ts"), "utf8");
-    await harness.callTool("aft_import", {
-      op: "add",
-      filePath: "dry-target.ts",
-      module: "./utils",
-      names: ["helper"],
-      dryRun: true,
-    });
-    const after = await readFile(harness.path("dry-target.ts"), "utf8");
-    expect(after).toBe(before);
-  });
 });

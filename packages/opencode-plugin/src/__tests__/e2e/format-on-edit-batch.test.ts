@@ -339,27 +339,6 @@ sed -E 's/  +/ /g; s/{/{\n    /; s/;}/;\n}/' "$file" > "$file.tmp" && mv "$file.
     expect(await readTextFile(h.path("scratch", "b.ts"))).toBe("export const NEW_VALUE = 2;\n");
   });
 
-  test("batch with dryRun: true", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("dry.ts"), "export    const   dry   = 1;\n", "utf8");
-
-    const response = parseToolJson(
-      await tools.edit.execute(
-        {
-          operations: [
-            { file: h.path("dry.ts"), command: "edit_match", match: "dry", replacement: "wet" },
-          ],
-          dryRun: true,
-        },
-        sdkCtx,
-      ),
-    );
-
-    expect(response.success).toBe(true);
-    expect(response.dry_run).toBe(true);
-    expect(await readTextFile(h.path("dry.ts"))).toBe("export    const   dry   = 1;\n");
-  });
-
   test("batch with file deletion via empty content range", async () => {
     const { h, bridge } = await (async () => {
       const h = await createFormatHarness(preparedBinary, BIOME_TS_PRESET, [

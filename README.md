@@ -496,9 +496,8 @@ Set `content` to `""` to delete lines. Per-edit `occurrence` is supported.
 Creates the file (and parent directories) if missing. Faster than read+write for adding to logs,
 notepad files, or large appendable structures.
 
-All modes support `dryRun: true` to preview as a diff without modifying files. LSP diagnostics
-are returned automatically after every edit (unless `dryRun` is set) — if type errors are
-introduced, they appear inline in the response.
+LSP diagnostics are returned automatically after every edit — if type errors are introduced,
+they appear inline in the response. Use `aft_safety checkpoint` / `undo` for recovery before risky edits.
 
 ---
 
@@ -1150,7 +1149,7 @@ Scope-aware structural transformations that handle indentation correctly.
 }
 ```
 
-All ops support `dryRun` and `validate` (`"syntax"` or `"full"`).
+All ops support `validate` (`"syntax"` or `"full"`). Use `aft_safety checkpoint` / `undo` before risky transforms.
 
 ---
 
@@ -1174,7 +1173,7 @@ Workspace-wide refactoring that updates imports and references across all files.
 }
 ```
 
-`move` saves a checkpoint before mutating anything. Use `dryRun: true` to preview as a diff.
+`move` saves a checkpoint before mutating anything. Use `aft_safety undo` to revert if needed.
 
 ---
 

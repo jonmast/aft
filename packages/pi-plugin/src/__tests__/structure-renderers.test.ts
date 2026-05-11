@@ -55,15 +55,7 @@ describe("transform renderer", () => {
     expect(output).toContain("target Service");
   });
 
-  test("renderTransformResult handles dry-run and error paths", () => {
-    const dryRun = renderToString(
-      renderTransformResult(
-        makeResult("", { dry_run: true, diff: "--- a/src/a.ts\n+++ b/src/a.ts" }),
-        { op: "add_member", filePath: "src/a.ts", container: "Service", dryRun: true },
-        mockTheme,
-        makeContext({ op: "add_member", filePath: "src/a.ts", container: "Service", dryRun: true }),
-      ),
-    );
+  test("renderTransformResult handles error paths", () => {
     const error = renderToString(
       renderTransformResult(
         makeResult("parse failed"),
@@ -76,7 +68,6 @@ describe("transform renderer", () => {
       ),
     );
 
-    expect(dryRun).toContain("[dry run]");
     expect(error).toContain("parse failed");
   });
 });

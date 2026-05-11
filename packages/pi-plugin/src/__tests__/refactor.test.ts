@@ -20,7 +20,6 @@ describe("aft_refactor adapter", () => {
       name: "computeTotal",
       startLine: 10,
       endLine: 12,
-      dryRun: true,
     });
 
     expect(calls[0].command).toBe("extract_function");
@@ -29,7 +28,6 @@ describe("aft_refactor adapter", () => {
       name: "computeTotal",
       start_line: 10,
       end_line: 13,
-      dry_run: true,
     });
   });
 

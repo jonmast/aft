@@ -686,9 +686,9 @@ Note: Modes 6 and 7 are options on mode 5 (find/replace) — they require \`oldS
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- LSP error-level diagnostics are returned automatically after non-dry-run edits
+- LSP error-level diagnostics are returned automatically after edits
 
-Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.
+Returns: JSON string for the selected edit mode. Edits may append inline LSP error lines.
 
 Common response fields: success (boolean), diff (object with before/after), backup_id (string), syntax_valid (boolean). Exact fields vary by mode.`;
   // Note: The Returns section intentionally stays high-level because per-mode JSON shapes
@@ -734,10 +734,6 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .describe(
           "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback. Note: uses 'file'/'match'/'replacement' (not filePath/oldString/newString)",
         ),
-      dryRun: z
-        .boolean()
-        .optional()
-        .describe("Preview changes without applying (returns diff, default: false)"),
     },
     execute: async (args, context): Promise<string> => {
       // Footgun guard: top-level startLine/endLine are not valid params on
@@ -778,9 +774,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
             : path.resolve(context.directory, op.file as string),
         }));
 
-        const params: Record<string, unknown> = { operations: resolvedOps };
-        params.dry_run = args.dryRun === true;
-        const data = await callBridge(ctx, context, "transaction", params);
+        const data = await callBridge(ctx, context, "transaction", { operations: resolvedOps });
         return JSON.stringify(data);
       }
 
@@ -856,15 +850,14 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
 
-      if (args.dryRun) params.dry_run = true;
-      if (!args.dryRun) params.diagnostics = true;
+      params.diagnostics = true;
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
-      if (!args.dryRun) params.include_diff = true;
+      params.include_diff = true;
 
       const data = await callBridge(ctx, context, command, params);
 
       // Store metadata for tool.execute.after hook (fromPlugin overwrites context.metadata)
-      if (!args.dryRun && data.success && data.diff) {
+      if (data.success && data.diff) {
         const diff = data.diff as {
           before?: string;
           after?: string;
@@ -899,26 +892,24 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       if (globSkipNote) result += `\n\n${globSkipNote}`;
 
       // Append inline diagnostics to output (matching write tool pattern)
-      if (!args.dryRun) {
-        const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
-        if (diags && diags.length > 0) {
-          const errors = diags.filter((d) => d.severity === "error");
-          if (errors.length > 0) {
-            const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
-            result += `\n\nLSP errors detected, please fix:\n${diagLines}`;
-          }
+      const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
+      if (diags && diags.length > 0) {
+        const errors = diags.filter((d) => d.severity === "error");
+        if (errors.length > 0) {
+          const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
+          result += `\n\nLSP errors detected, please fix:\n${diagLines}`;
         }
-        // v0.17.3 honest reporting: surface pending/exited servers so the
-        // agent doesn't mistake silence for "all clear" when an LSP server
-        // simply didn't respond before our wait_ms deadline.
-        const pendingServers = data.lsp_pending_servers as string[] | undefined;
-        const exitedServers = data.lsp_exited_servers as string[] | undefined;
-        if (pendingServers && pendingServers.length > 0) {
-          result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; rerun lsp_diagnostics later for a fresh check.`;
-        }
-        if (exitedServers && exitedServers.length > 0) {
-          result += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
-        }
+      }
+      // v0.17.3 honest reporting: surface pending/exited servers so the
+      // agent doesn't mistake silence for "all clear" when an LSP server
+      // simply didn't respond before our wait_ms deadline.
+      const pendingServers = data.lsp_pending_servers as string[] | undefined;
+      const exitedServers = data.lsp_exited_servers as string[] | undefined;
+      if (pendingServers && pendingServers.length > 0) {
+        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; rerun lsp_diagnostics later for a fresh check.`;
+      }
+      if (exitedServers && exitedServers.length > 0) {
+        result += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
       }
 
       return result;
@@ -1660,9 +1651,6 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             create_dirs: normalizedArgs.create_dirs !== false,
             diagnostics: true,
           };
-          if (normalizedArgs.dryRun === true || normalizedArgs.dry_run === true) {
-            writeParams.dry_run = true;
-          }
           const data = await callBridge(ctx, context, "write", writeParams);
           return JSON.stringify(data);
         }

@@ -251,43 +251,6 @@ describe("Tool round-trips", () => {
     expect(content).not.toContain("Goodbye");
   });
 
-  test("write dryRun returns diff without modifying file", async () => {
-    createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
-    sdkCtx = createMockSdkContext(tmpDir);
-
-    const filePath = resolve(tmpDir, "dryrun.ts");
-    const original = 'export function hello(): string {\n  return "hi";\n}\n';
-
-    // Write the original file first
-    await tools.aft_edit.execute({ mode: "write", file: filePath, content: original }, sdkCtx);
-
-    // Now dry-run a write with different content
-    const newContent = 'export function hello(): string {\n  return "world";\n}\n';
-    const resultStr = await tools.aft_edit.execute(
-      {
-        mode: "write",
-        file: filePath,
-        content: newContent,
-        dryRun: true,
-      },
-      sdkCtx,
-    );
-    const result = JSON.parse(resultStr);
-
-    expect(result.success).toBe(true);
-    expect(result.dry_run).toBe(true);
-    expect(typeof result.diff).toBe("string");
-    expect(result.diff).toContain("-");
-    expect(result.diff).toContain("+");
-    expect(result.syntax_valid).toBe(true);
-
-    // Verify file was NOT modified
-    const fileContent = await readFile(filePath, "utf-8");
-    expect(fileContent).toBe(original);
-  });
-
   test("transaction success applies multiple file writes", async () => {
     createBridge();
     const tools = aftPrefixedTools(createPluginContext(pool));
@@ -562,18 +525,17 @@ describe("extract_function round-trip", () => {
             name: "filterAndMap",
             startLine: 1,
             endLine: 4,
-            dryRun: true,
           },
           sdkCtx,
         ),
       );
 
       expect(result.success).toBe(true);
-      expect(result.dry_run).toBe(true);
       expect(Array.isArray(result.parameters)).toBe(true);
       expect(result.parameters.length).toBeGreaterThan(0);
       expect(result.return_type).toBeDefined();
-      expect(typeof result.diff).toBe("string");
+      const content = await readFile(filePath, "utf-8");
+      expect(content).toContain("function filterAndMap");
     },
     TEST_TIMEOUT_MS,
   );

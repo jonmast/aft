@@ -320,23 +320,6 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     expectEditOutcome(output, data, false, "formatter_excluded_path");
   });
 
-  test("dry run does NOT format", async () => {
-    const h = await formatHarness(formatterPreset("biome"), [countingTsShim()]);
-    const filePath = h.path("src", "dry.ts");
-    await seedFile(filePath);
-
-    const { data } = await editTool(h).execute({
-      filePath,
-      oldString: "alpha",
-      newString: "gamma",
-      dryRun: true,
-    });
-
-    expect(data.dry_run).toBe(true);
-    expect(await readFile(filePath, "utf8")).toBe(BASE_TS);
-    await expect(readFile(h.path("src", "formatter-count.log"), "utf8")).rejects.toThrow();
-  });
-
   test("edit with line range", async () => {
     const h = await formatHarness(BIOME_TS_PRESET);
     const filePath = h.path("src", "line-range.ts");

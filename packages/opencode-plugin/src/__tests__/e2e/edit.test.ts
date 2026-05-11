@@ -154,24 +154,6 @@ maybeDescribe("e2e edit commands", () => {
     expect(await readTextFile(filePath)).toContain("updated:");
   });
 
-  test("edit_match dry run returns a diff without modifying the file", async () => {
-    const h = await harness();
-    const filePath = h.path("sample.ts");
-    const original = await readTextFile(filePath);
-
-    const response = await h.bridge.send("edit_match", {
-      file: filePath,
-      match: "funcA",
-      replacement: "funcDryRun",
-      dry_run: true,
-    });
-
-    expect(response.success).toBe(true);
-    expect(response.dry_run).toBe(true);
-    expect(String(response.diff)).toContain("funcDryRun");
-    expect(await readTextFile(filePath)).toBe(original);
-  });
-
   test("transaction updates multiple files", async () => {
     const h = await harness();
     const fileA = h.path("sample.ts");
@@ -231,22 +213,6 @@ maybeDescribe("e2e edit commands", () => {
     expect(response.success).toBe(false);
     expect(response.code).toBe("transaction_failed");
     expect(await readTextFile(fileA)).toBe(original);
-  });
-
-  test("glob dry run does not modify files", async () => {
-    const h = await harness();
-    const before = await readTextFile(h.path("directory", "alpha.ts"));
-
-    const response = await h.bridge.send("edit_match", {
-      file: `${h.path("directory")}/*.ts`,
-      match: "OLD_VALUE",
-      replacement: "DRY_VALUE",
-      dry_run: true,
-    });
-
-    expect(response.success).toBe(true);
-    expect(response.dry_run).toBe(true);
-    expect(await readTextFile(h.path("directory", "alpha.ts"))).toBe(before);
   });
 
   test("batch line range edits work through the binary", async () => {

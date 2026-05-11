@@ -28,7 +28,7 @@ Pi's default `read`, `write`, `edit`, and `grep` are replaced with AFT-backed ve
 | ------- | ------------------------ | -------------------------------------------------------------------------------------------- |
 | `read`  | Node `fs.readFile`       | Rust reader with line-numbered output, directory listing, binary/image detection              |
 | `write` | Node `fs.writeFile`      | Atomic write with per-file backup, auto-format (biome/prettier/ruff/rustfmt), LSP diagnostics |
-| `edit`  | Plain substring replace  | Progressive fuzzy match (handles whitespace/Unicode drift), dry-run, glob-wide edits          |
+| `edit`  | Plain substring replace  | Progressive fuzzy match (handles whitespace/Unicode drift), backups, glob-wide edits          |
 | `grep`  | ripgrep shell-out        | Trigram-indexed search in-project, ripgrep fallback outside project root                      |
 
 All four keep the same agent-facing parameters as Pi's built-ins, so your prompts, skills, and muscle memory don't change.

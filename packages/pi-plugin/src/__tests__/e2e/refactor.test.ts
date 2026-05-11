@@ -65,23 +65,4 @@ maybeDescribe("aft_refactor (real bridge)", () => {
     expect(origin).not.toContain("function utility");
     expect(dest).toContain("function utility");
   });
-
-  test("dryRun does not write", async () => {
-    await writeFixture(
-      harness,
-      "dry-extract.ts",
-      `export function process(): number {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n`,
-    );
-    const before = await readFile(harness.path("dry-extract.ts"), "utf8");
-    await harness.callTool("aft_refactor", {
-      op: "extract",
-      filePath: "dry-extract.ts",
-      name: "pick",
-      startLine: 2,
-      endLine: 3,
-      dryRun: true,
-    });
-    const after = await readFile(harness.path("dry-extract.ts"), "utf8");
-    expect(after).toBe(before);
-  });
 });

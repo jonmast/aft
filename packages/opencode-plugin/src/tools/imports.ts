@@ -22,9 +22,8 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "Ops:\n" +
         "- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n" +
         "- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n" +
-        "- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'filePath'.\n\n" +
+        "- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'filePath'. Use aft_safety checkpoint/undo for recovery before broad cleanup.\n\n" +
         "Returns:\n" +
-        "- Dry run (any op): { ok, dry_run, diff, syntax_valid? }\n" +
         "- add: { file, added, module, group?, already_present?, formatted?, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- remove: { file, removed, module, name?, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- organize: { file, groups: [{ name, count }], removed_duplicates, formatted?, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }",
@@ -53,28 +52,21 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
           .describe(
             "Validation level: 'syntax' (default) or 'full'. Syntax = tree-sitter parse check only. Full = also runs LSP type-checking (slower, catches more errors)",
           ),
-        dryRun: z
-          .boolean()
-          .optional()
-          .describe("Preview without modifying the file (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
-        const isDryRun = args.dryRun === true;
 
         if ((op === "add" || op === "remove") && typeof args.module !== "string") {
           throw new Error(`'module' is required for '${op}' op`);
         }
 
-        if (!isDryRun) {
-          const filePath = resolveAbsolutePath(context, args.filePath as string);
-          const permissionError = await askEditPermission(
-            context,
-            [resolveRelativePattern(context, args.filePath as string)],
-            { filepath: filePath },
-          );
-          if (permissionError) return permissionDeniedResponse(permissionError);
-        }
+        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const permissionError = await askEditPermission(
+          context,
+          [resolveRelativePattern(context, args.filePath as string)],
+          { filepath: filePath },
+        );
+        if (permissionError) return permissionDeniedResponse(permissionError);
 
         const commandMap: Record<string, string> = {
           add: "add_import",
@@ -88,7 +80,6 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         if (args.typeOnly !== undefined) params.type_only = args.typeOnly;
         if (args.removeName !== undefined) params.name = args.removeName;
         if (args.validate !== undefined) params.validate = args.validate;
-        if (args.dryRun !== undefined) params.dry_run = args.dryRun;
         const response = await callBridge(ctx, context, commandMap[op], params);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);

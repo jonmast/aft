@@ -78,22 +78,4 @@ maybeDescribe("e2e import commands", () => {
     expect(parseIndex).toBeGreaterThanOrEqual(0);
     expect(axiosIndex).toBeLessThan(parseIndex);
   });
-
-  test("import commands support dry run response shapes", async () => {
-    const h = await harness();
-    const filePath = h.path("imports.ts");
-    const original = await readTextFile(filePath);
-
-    const response = await h.bridge.send("add_import", {
-      file: filePath,
-      module: "dayjs",
-      default_import: "dayjs",
-      dry_run: true,
-    });
-
-    expect(response.success).toBe(true);
-    expect(response.dry_run).toBe(true);
-    expect(String(response.diff)).toContain("dayjs");
-    expect(await readTextFile(filePath)).toBe(original);
-  });
 });

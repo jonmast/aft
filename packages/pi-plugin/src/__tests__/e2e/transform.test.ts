@@ -103,18 +103,4 @@ maybeDescribe("aft_transform (real bridge)", () => {
     expect(after).toContain("json:");
     expect(after).toContain("name");
   });
-
-  test("dryRun does not modify the file", async () => {
-    await writeFixture(harness, "dry.rs", `pub struct Keep {\n    pub id: u32,\n}\n`);
-    const before = await readFile(harness.path("dry.rs"), "utf8");
-    await harness.callTool("aft_transform", {
-      op: "add_derive",
-      filePath: "dry.rs",
-      target: "Keep",
-      derives: ["Clone"],
-      dryRun: true,
-    });
-    const after = await readFile(harness.path("dry.rs"), "utf8");
-    expect(after).toBe(before);
-  });
 });

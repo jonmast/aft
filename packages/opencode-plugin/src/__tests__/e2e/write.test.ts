@@ -93,23 +93,4 @@ maybeDescribe("e2e write command", () => {
       String((historyResponse.entries as Array<Record<string, unknown>>)[0]?.description),
     ).toContain("write");
   });
-
-  test("supports dry run without touching the file", async () => {
-    const h = await harness();
-    const filePath = h.path("dry-run.ts");
-    const original = 'export const state = "before";\n';
-    await writeFile(filePath, original);
-
-    const response = await h.bridge.send("write", {
-      file: filePath,
-      content: 'export const state = "after";\n',
-      dry_run: true,
-    });
-
-    expect(response.success).toBe(true);
-    expect(response.dry_run).toBe(true);
-    expect(String(response.diff)).toContain('-export const state = "before";');
-    expect(String(response.diff)).toContain('+export const state = "after";');
-    expect(await readTextFile(filePath)).toBe(original);
-  });
 });

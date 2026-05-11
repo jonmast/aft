@@ -29,7 +29,6 @@ describe("aft_import adapter", () => {
         names: ["useMemo"],
         defaultImport: "React",
         typeOnly: true,
-        dryRun: true,
         validate: "full",
       },
       makeExtContext("/repo", "session-import"),
@@ -42,7 +41,6 @@ describe("aft_import adapter", () => {
       names: ["useMemo"],
       default_import: "React",
       type_only: true,
-      dry_run: true,
       validate: "full",
       session_id: "session-import",
     });

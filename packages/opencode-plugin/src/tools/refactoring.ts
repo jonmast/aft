@@ -28,8 +28,8 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         "- 'extract': Extract a line range into a new function with auto-detected parameters. Requires 'name', 'startLine', 'endLine' (1-based, both inclusive). Supports TS/JS/TSX and Python.\n" +
         "- 'inline': Replace a function call with the function's body, substituting args for params. Requires 'symbol', 'callSiteLine' (1-based). Validates single-return constraint.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
-        "All ops need 'filePath'. Use dryRun to preview before applying.\n\n" +
-        "Returns: move dry-run { ok, dry_run, diffs }; move apply { ok, files_modified, consumers_updated, checkpoint_name, results }. extract returns { file, name, parameters, return_type, syntax_valid, formatted, ... }. inline returns { file, symbol, call_context, substitutions, conflicts, syntax_valid, formatted, ... }.",
+        "All ops need 'filePath'. Use aft_safety checkpoint/undo before risky refactors.\n\n" +
+        "Returns: move { ok, files_modified, consumers_updated, checkpoint_name, results }. extract returns { file, name, parameters, return_type, syntax_valid, formatted, ... }. inline returns { file, symbol, call_context, substitutions, conflicts, syntax_valid, formatted, ... }.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {
@@ -66,11 +66,6 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           .number()
           .optional()
           .describe("1-based call site line — required for 'inline' op"),
-        // common
-        dryRun: z
-          .boolean()
-          .optional()
-          .describe("Preview changes as diff without modifying files (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
@@ -110,7 +105,6 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           inline: "inline_symbol",
         };
         const params: Record<string, unknown> = { file: args.filePath };
-        if (args.dryRun !== undefined) params.dry_run = args.dryRun;
 
         switch (op) {
           case "move":

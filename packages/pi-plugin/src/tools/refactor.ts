@@ -19,7 +19,6 @@ import {
   renderErrorResult,
   renderSections,
   renderToolCall,
-  renderUnifiedDiff,
   shortenPath,
 } from "./render-helpers.js";
 
@@ -33,7 +32,6 @@ const RefactorParams = Type.Object({
   startLine: Type.Optional(Type.Number({ description: "1-based start line (for extract)" })),
   endLine: Type.Optional(Type.Number({ description: "1-based end line, inclusive (for extract)" })),
   callSiteLine: Type.Optional(Type.Number({ description: "1-based call site line (for inline)" })),
-  dryRun: Type.Optional(Type.Boolean({ description: "Preview as diff" })),
 });
 
 /** Exported for renderer unit tests. */
@@ -44,22 +42,6 @@ export function buildRefactorSections(
 ): string[] {
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No refactor result.")];
-
-  if (response.dry_run === true) {
-    const diffs = asRecords(response.diffs);
-    const sections = [theme.fg("warning", `[dry run] ${args.op}`)];
-    if (diffs.length === 0) {
-      sections.push(theme.fg("muted", "No diff available."));
-      return sections;
-    }
-    diffs.forEach((diff) => {
-      const file = shortenPath(asString(diff.file) ?? "(unknown file)");
-      const rendered =
-        renderUnifiedDiff(asString(diff.diff) ?? "") || theme.fg("muted", "No diff available.");
-      sections.push(`${theme.fg("accent", file)}\n${rendered}`);
-    });
-    return sections;
-  }
 
   if (args.op === "move") {
     const results = asRecords(response.results);
@@ -127,7 +109,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_refactor",
     label: "refactor",
     description:
-      "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol (only top-level exports); `extract` pulls a line range into a new function; `inline` replaces a call site with the function body.",
+      "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol; `extract` pulls a line range into a new function; `inline` replaces a call site. Use aft_safety checkpoint/undo before risky refactors.",
     parameters: RefactorParams,
     async execute(
       _toolCallId: string,
@@ -153,7 +135,6 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         req.end_line = params.op === "extract" ? params.endLine + 1 : params.endLine;
       }
       if (params.callSiteLine !== undefined) req.call_site_line = params.callSiteLine;
-      if (params.dryRun !== undefined) req.dry_run = params.dryRun;
       const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
