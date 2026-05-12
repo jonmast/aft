@@ -173,7 +173,7 @@ export async function findBinary(expectedVersion?: string): Promise<string> {
 
   // 5. Auto-download from GitHub releases
   log("Binary not found locally, attempting auto-download...");
-  const downloaded = await ensureBinary();
+  const downloaded = await ensureBinary(expectedVersion);
   if (downloaded) return downloaded;
 
   // All sources exhausted

@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import {
   error,
@@ -464,8 +465,8 @@ export class BinaryBridge {
     if (!this.onConfigureWarnings || !Array.isArray(configResult.warnings)) return;
     if (configResult.warnings.length === 0) return;
 
+    const sessionId = typeof params.session_id === "string" ? params.session_id : undefined;
     try {
-      const sessionId = typeof params.session_id === "string" ? params.session_id : undefined;
       await this.onConfigureWarnings({
         projectRoot: this.cwd,
         sessionId,
@@ -478,6 +479,10 @@ export class BinaryBridge {
       warn(
         `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+    } finally {
+      if (sessionId) {
+        this.configureWarningClients.delete(sessionId);
+      }
     }
   }
 
@@ -496,18 +501,25 @@ export class BinaryBridge {
     const rawSessionId = frame.session_id;
     const sessionId =
       typeof rawSessionId === "string" && rawSessionId.length > 0 ? rawSessionId : null;
-    await this.onConfigureWarnings({
-      projectRoot,
-      sessionId,
-      client: sessionId ? this.configureWarningClients.get(sessionId) : undefined,
-      warnings: warnings as ConfigureWarning[],
-    });
+    try {
+      await this.onConfigureWarnings({
+        projectRoot,
+        sessionId,
+        client: sessionId ? this.configureWarningClients.get(sessionId) : undefined,
+        warnings: warnings as ConfigureWarning[],
+      });
+    } finally {
+      if (sessionId) {
+        this.configureWarningClients.delete(sessionId);
+      }
+    }
   }
 
   /** Kill the child process and reject all pending requests. */
   async shutdown(): Promise<void> {
     this._shuttingDown = true;
     this.clearRestartResetTimer();
+    this.configureWarningClients.clear();
     this.rejectAllPending(new Error(`${this.errorPrefix} Bridge shutting down`));
 
     if (this.process) {
@@ -538,10 +550,16 @@ export class BinaryBridge {
     if (!this.minVersion) return;
     try {
       const resp = await this.send("version");
+      if (resp.success === false) {
+        throw new Error(
+          `Binary version check failed: ${String(resp.code ?? "unknown")} — likely too old`,
+        );
+      }
       const binaryVersion = resp.version as string | undefined;
-      if (!binaryVersion) {
-        log("Binary did not report a version — skipping version check");
-        return;
+      if (typeof binaryVersion !== "string") {
+        throw new Error(
+          `Binary did not report a version — likely too old (minVersion: ${this.minVersion})`,
+        );
       }
       log(`Binary version: ${binaryVersion}`);
       if (compareSemver(binaryVersion, this.minVersion) < 0) {
@@ -549,8 +567,8 @@ export class BinaryBridge {
         this.onVersionMismatch?.(binaryVersion, this.minVersion);
       }
     } catch (err) {
-      // Version check is best-effort — don't block tool usage if it fails
       warn(`Version check failed: ${(err as Error).message}`);
+      throw err;
     }
   }
 
@@ -623,18 +641,22 @@ export class BinaryBridge {
     });
     const currentChild = child;
 
+    const stdoutDecoder = new StringDecoder("utf8");
     child.stdout?.on("data", (chunk: Buffer) => {
-      this.onStdoutData(chunk.toString("utf-8"));
+      this.onStdoutData(stdoutDecoder.write(chunk));
+    });
+    child.stdout?.on("end", () => {
+      const remaining = stdoutDecoder.end();
+      if (remaining) this.onStdoutData(remaining);
     });
 
+    const stderrDecoder = new StringDecoder("utf8");
     child.stderr?.on("data", (chunk: Buffer) => {
-      const lines = chunk.toString("utf-8").trimEnd().split("\n");
-      for (const line of lines) {
-        if (!line) continue;
-        const tagged = tagStderrLine(line);
-        log(tagged);
-        this.pushStderrLine(tagged);
-      }
+      this.onStderrData(stderrDecoder.write(chunk));
+    });
+    child.stderr?.on("end", () => {
+      const remaining = stderrDecoder.end();
+      if (remaining) this.onStderrData(remaining);
     });
 
     child.on("error", (err) => {
@@ -680,6 +702,16 @@ export class BinaryBridge {
     this.stderrTail.push(line);
     if (this.stderrTail.length > BinaryBridge.STDERR_TAIL_MAX) {
       this.stderrTail.shift();
+    }
+  }
+
+  private onStderrData(data: string): void {
+    const lines = data.trimEnd().split("\n");
+    for (const line of lines) {
+      if (!line) continue;
+      const tagged = tagStderrLine(line);
+      log(tagged);
+      this.pushStderrLine(tagged);
     }
   }
 
@@ -770,15 +802,12 @@ export class BinaryBridge {
   }
 
   private handleTimeout(triggeringSessionId?: string): void {
-    // A single request timed out. Kill the hung process so the bridge can
-    // respawn on the next call — but do NOT reject other pending requests
-    // here (#21). Each pending request has its own timer and will reject
-    // itself if it also times out. Proactively rejecting peers destroys work
-    // that may have been perfectly healthy (e.g. a `read` call waiting behind
-    // a slow `bash` command).
-    //
-    // When the process dies, its stdout closes and the crash handler fires,
-    // which will reject any remaining pending requests through the normal path.
+    // A timed-out request means the child is about to be SIGKILLed. Reject all
+    // sibling in-flight requests now instead of leaving them parked until their
+    // own independent timers fire.
+    this.rejectAllPending(
+      new Error(`${this.errorPrefix} bridge killed during sibling timeout — request aborted`),
+    );
     if (this.process) {
       this.process.kill("SIGKILL");
       this.process = null;
@@ -806,11 +835,6 @@ export class BinaryBridge {
     } else {
       warn(killedMsg);
     }
-    // Peer requests are NOT rejected here. They will either:
-    // 1. Resolve if the binary somehow still delivers their response (unlikely
-    //    after SIGKILL, but harmless to leave pending briefly), or
-    // 2. Reject through their own timers when they individually expire, or
-    // 3. Reject immediately through handleCrash() when the stdout pipe closes.
   }
 
   private handleCrash(cause?: Error): void {
