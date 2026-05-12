@@ -98,7 +98,7 @@ pub fn run_external_tool(
         cmd.current_dir(dir);
     }
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(FormatError::NotFound {
@@ -1162,7 +1162,7 @@ pub fn run_external_tool_capture(
         cmd.current_dir(dir);
     }
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(FormatError::NotFound {

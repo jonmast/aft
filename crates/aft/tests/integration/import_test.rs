@@ -951,30 +951,32 @@ fn organize_imports_preserves_side_effect_order() {
         "organize_side_effects_{}.ts",
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
+    // All imports below are in the EXTERNAL group, so within-group ordering applies:
+    //   side-effects (preserve relative source order) before value/type (alphabetical).
     fs::write(
         &file,
-        "import './b';\nimport z from 'zod';\nimport './a';\nimport React from 'react';\n\nexport const x = 1;\n",
+        "import 'polyfill-b';\nimport z from 'zod';\nimport 'polyfill-a';\nimport React from 'react';\n\nexport const x = 1;\n",
     )
     .unwrap();
 
     let resp = send_organize_imports(&mut aft, "org-side-effects", &file.display().to_string());
     assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(&file).unwrap();
-    let b_pos = content.find("import './b';").unwrap();
-    let a_pos = content.find("import './a';").unwrap();
+    let polyfill_b_pos = content.find("import 'polyfill-b';").unwrap();
+    let polyfill_a_pos = content.find("import 'polyfill-a';").unwrap();
     let react_pos = content.find("import React from 'react';").unwrap();
     let zod_pos = content.find("import z from 'zod';").unwrap();
     assert!(
-        b_pos < a_pos,
-        "side effects keep original order:\n{content}"
+        polyfill_b_pos < polyfill_a_pos,
+        "side-effect imports keep original relative order (b before a):\n{content}"
     );
     assert!(
-        a_pos < react_pos,
-        "side effects precede value imports:\n{content}"
+        polyfill_a_pos < react_pos,
+        "side-effects come before value imports within the same group:\n{content}"
     );
     assert!(
         react_pos < zod_pos,
-        "value imports alphabetized:\n{content}"
+        "value imports alphabetized (react before zod):\n{content}"
     );
 
     fs::remove_file(&file).ok();
