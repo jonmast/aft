@@ -251,7 +251,7 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   // install, but this branch covers the "abandoned, incomplete" case where
   // the lib file isn't present (we wouldn't be here otherwise). Sweep them
   // out so the next download starts from a clean slate.
-  cleanupAbandonedOnnxAttempts(onnxBaseDir, ortDir);
+  cleanupAbandonedStagingDirs(onnxBaseDir);
 
   if (!acquireLock(lockPath)) {
     warn(
@@ -261,6 +261,7 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   }
 
   try {
+    cleanupIncompleteTargetIfUnowned(ortDir);
     return await downloadOnnxRuntime(info, ortDir);
   } finally {
     releaseLock(lockPath);
@@ -275,13 +276,12 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
  * dir's mtime exceeds STALE_LOCK_MS — covers Windows where we can't check
  * process liveness reliably).
  */
-function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void {
+function cleanupAbandonedStagingDirs(onnxBaseDir: string): void {
   // Sweep .tmp.* staging dirs whose pid is dead or are sufficiently old.
   try {
     const entries = readdirSync(onnxBaseDir);
-    const ortDirBaseName = ortDir.slice(onnxBaseDir.length + 1);
     for (const entry of entries) {
-      if (!entry.startsWith(`${ortDirBaseName}.tmp.`)) continue;
+      if (!entry.startsWith(`${ORT_VERSION}.tmp.`)) continue;
       const stagingDir = join(onnxBaseDir, entry);
       // Format: `${ORT_VERSION}.tmp.<pid>.<ts>`. Extract pid; if dead, sweep.
       const parts = entry.split(".");
@@ -316,7 +316,9 @@ function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void
   } catch {
     // base dir doesn't exist yet; nothing to sweep
   }
+}
 
+function cleanupIncompleteTargetIfUnowned(ortDir: string): void {
   // If the target dir exists but doesn't contain a meta file, the previous
   // attempt was killed mid-copy. Wipe it so download can recreate cleanly.
   try {
@@ -327,6 +329,11 @@ function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void
   } catch (err) {
     warn(`[onnx] failed to sweep ${ortDir}: ${err}`);
   }
+}
+
+function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void {
+  cleanupAbandonedStagingDirs(onnxBaseDir);
+  cleanupIncompleteTargetIfUnowned(ortDir);
 }
 
 /** Check common system locations for ONNX Runtime */
@@ -644,30 +651,7 @@ async function downloadOnnxRuntime(
       }
     }
 
-    // Copy real files first
-    for (const libFile of realFiles) {
-      const src = join(extractedDir, libFile);
-      const dst = join(targetDir, libFile);
-      try {
-        copyFileSync(src, dst);
-        if (process.platform !== "win32") {
-          chmodSync(dst, 0o755);
-        }
-      } catch (copyErr) {
-        log(`ORT extract: failed to copy ${libFile}: ${copyErr}`);
-      }
-    }
-
-    // Recreate symlinks in target directory
-    for (const link of symlinks) {
-      const dst = join(targetDir, link.name);
-      try {
-        unlinkSync(dst); // remove if exists from a previous partial install
-      } catch {
-        // ignore
-      }
-      symlinkSync(link.target, dst);
-    }
+    copyOnnxLibraries(info, extractedDir, targetDir, realFiles, symlinks);
 
     // Audit-3 v0.17 #1: persist version + archive sha256 for TOFU on
     // future sessions. Hash the actual main library file (not the
@@ -703,6 +687,62 @@ async function downloadOnnxRuntime(
       // ignore
     }
     return null;
+  }
+}
+
+function copyOnnxLibraries(
+  info: OrtPlatformInfo,
+  extractedDir: string,
+  targetDir: string,
+  realFiles: string[],
+  symlinks: Array<{ name: string; target: string }>,
+  copyFile: typeof copyFileSync = copyFileSync,
+): void {
+  const requiredLibs = new Set([info.libName]);
+
+  // Copy real files first. Required library failures are fatal; optional extra
+  // libraries stay best-effort so one unusual sidecar does not block install.
+  for (const libFile of realFiles) {
+    const src = join(extractedDir, libFile);
+    const dst = join(targetDir, libFile);
+    try {
+      copyFile(src, dst);
+      if (process.platform !== "win32") {
+        chmodSync(dst, 0o755);
+      }
+    } catch (copyErr) {
+      if (requiredLibs.has(libFile)) {
+        rmSync(targetDir, { recursive: true, force: true });
+        throw copyErr;
+      }
+      log(`ORT extract: failed to copy optional ${libFile}: ${copyErr}`);
+    }
+  }
+
+  // Recreate symlinks in target directory. If the required library is a
+  // symlink, failures must be fatal for the same reason as required copies.
+  for (const link of symlinks) {
+    const dst = join(targetDir, link.name);
+    try {
+      unlinkSync(dst); // remove if exists from a previous partial install
+    } catch {
+      // ignore
+    }
+    try {
+      symlinkSync(link.target, dst);
+    } catch (symlinkErr) {
+      if (requiredLibs.has(link.name)) {
+        rmSync(targetDir, { recursive: true, force: true });
+        throw symlinkErr;
+      }
+      log(`ORT extract: failed to symlink optional ${link.name}: ${symlinkErr}`);
+    }
+  }
+
+  const requiredPath = join(targetDir, info.libName);
+  if (!existsSync(requiredPath)) {
+    rmSync(targetDir, { recursive: true, force: true });
+    throw new Error(`Required ONNX Runtime library missing after install: ${requiredPath}`);
   }
 }
 
@@ -915,6 +955,9 @@ export function cleanupOnnxRuntime(storageDir: string): void {
  */
 export const __test__ = {
   cleanupAbandonedOnnxAttempts,
+  cleanupAbandonedStagingDirs,
+  cleanupIncompleteTargetIfUnowned,
+  copyOnnxLibraries,
   ORT_VERSION,
   ONNX_INSTALLED_META_FILE,
   detectOnnxVersion,

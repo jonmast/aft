@@ -20,6 +20,8 @@ import { join } from "node:path";
 import { __onnxTest__ } from "../index.js";
 
 const { cleanupAbandonedOnnxAttempts, ORT_VERSION, ONNX_INSTALLED_META_FILE } = __onnxTest__;
+const { cleanupAbandonedStagingDirs, cleanupIncompleteTargetIfUnowned, copyOnnxLibraries } =
+  __onnxTest__;
 
 let workDir: string;
 let onnxBaseDir: string;
@@ -103,6 +105,67 @@ describe("cleanupAbandonedOnnxAttempts", () => {
     cleanupAbandonedOnnxAttempts(onnxBaseDir, ortDir);
 
     expect(existsSync(ortDir)).toBe(false);
+  });
+
+  test("pre-lock staging cleanup preserves target dir without meta", () => {
+    mkdirSync(ortDir, { recursive: true });
+    writeFileSync(join(ortDir, "libonnxruntime.so.partial"), "in-progress under another lock");
+
+    cleanupAbandonedStagingDirs(onnxBaseDir);
+
+    expect(existsSync(ortDir)).toBe(true);
+    expect(existsSync(join(ortDir, "libonnxruntime.so.partial"))).toBe(true);
+  });
+
+  test("post-lock incomplete target cleanup removes target dir without meta", () => {
+    mkdirSync(ortDir, { recursive: true });
+    writeFileSync(join(ortDir, "libonnxruntime.so.partial"), "abandoned");
+
+    cleanupIncompleteTargetIfUnowned(ortDir);
+
+    expect(existsSync(ortDir)).toBe(false);
+  });
+
+  test("required ONNX library copy failure removes partial target and throws", () => {
+    const extractedDir = join(workDir, "extracted");
+    const targetDir = join(workDir, "target");
+    mkdirSync(extractedDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(join(targetDir, "leftover"), "partial install");
+
+    expect(() =>
+      copyOnnxLibraries(
+        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
+        extractedDir,
+        targetDir,
+        ["libonnxruntime.so"],
+        [],
+        () => {
+          throw new Error("copy failed");
+        },
+      ),
+    ).toThrow("copy failed");
+
+    expect(existsSync(targetDir)).toBe(false);
+  });
+
+  test("missing required ONNX library after optional copies removes partial target", () => {
+    const extractedDir = join(workDir, "extracted-missing");
+    const targetDir = join(workDir, "target-missing");
+    mkdirSync(extractedDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+
+    expect(() =>
+      copyOnnxLibraries(
+        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
+        extractedDir,
+        targetDir,
+        [],
+        [],
+      ),
+    ).toThrow("Required ONNX Runtime library missing");
+
+    expect(existsSync(targetDir)).toBe(false);
   });
 
   test("preserves complete install dir (meta file present)", () => {

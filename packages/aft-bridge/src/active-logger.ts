@@ -11,21 +11,30 @@
  */
 import type { Logger, LogMeta } from "./logger.js";
 
-let active: Logger | undefined;
+const ACTIVE_LOGGER_SYMBOL = Symbol.for("aft-bridge-active-logger");
+
+interface ActiveLoggerGlobal {
+  [ACTIVE_LOGGER_SYMBOL]?: Logger;
+}
+
+function loggerGlobal(): ActiveLoggerGlobal {
+  return globalThis as ActiveLoggerGlobal;
+}
 
 export function setActiveLogger(logger: Logger): void {
-  active = logger;
+  loggerGlobal()[ACTIVE_LOGGER_SYMBOL] = logger;
 }
 
 export function getActiveLogger(): Logger | undefined {
-  return active;
+  return loggerGlobal()[ACTIVE_LOGGER_SYMBOL];
 }
 
 export function getLogFilePath(): string | undefined {
-  return active?.getLogFilePath?.();
+  return getActiveLogger()?.getLogFilePath?.();
 }
 
 export function log(message: string, meta?: LogMeta): void {
+  const active = getActiveLogger();
   if (active) {
     active.log(message, meta);
   } else {
@@ -34,6 +43,7 @@ export function log(message: string, meta?: LogMeta): void {
 }
 
 export function warn(message: string, meta?: LogMeta): void {
+  const active = getActiveLogger();
   if (active) {
     active.warn(message, meta);
   } else {
@@ -42,6 +52,7 @@ export function warn(message: string, meta?: LogMeta): void {
 }
 
 export function error(message: string, meta?: LogMeta): void {
+  const active = getActiveLogger();
   if (active) {
     active.error(message, meta);
   } else {

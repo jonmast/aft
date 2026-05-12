@@ -1,7 +1,8 @@
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { error, log } from "./active-logger.js";
+import { error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
+import type { Logger, LogMeta } from "./logger.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = Infinity; // keep alive as long as the host is running
 const DEFAULT_MAX_POOL_SIZE = 8;
@@ -67,6 +68,7 @@ interface PoolEntry {
 export interface PoolOptions extends BridgeOptions {
   maxPoolSize?: number;
   idleTimeoutMs?: number;
+  logger?: Logger;
 }
 
 /**
@@ -93,6 +95,7 @@ export class BridgePool {
   private readonly idleTimeoutMs: number;
   private readonly bridgeOptions: BridgeOptions;
   private readonly configOverrides: Record<string, unknown>;
+  private readonly logger: Logger | undefined;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -103,6 +106,7 @@ export class BridgePool {
     this.binaryPath = binaryPath;
     this.maxPoolSize = options.maxPoolSize ?? DEFAULT_MAX_POOL_SIZE;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.logger = options.logger;
     this.bridgeOptions = {
       timeoutMs: options.timeoutMs,
       maxRestarts: options.maxRestarts,
@@ -181,8 +185,9 @@ export class BridgePool {
   private cleanup(): void {
     const now = Date.now();
     for (const [dir, entry] of this.bridges) {
+      if (entry.bridge.hasPendingRequests()) continue;
       if (now - entry.lastUsed > this.idleTimeoutMs) {
-        entry.bridge.shutdown().catch((err) => error("cleanup shutdown failed:", err));
+        entry.bridge.shutdown().catch((err) => this.error("cleanup shutdown failed:", err));
         this.bridges.delete(dir);
       }
     }
@@ -193,6 +198,7 @@ export class BridgePool {
     let oldestDir: string | null = null;
     let oldestTime = Infinity;
     for (const [dir, entry] of this.bridges) {
+      if (entry.bridge.hasPendingRequests()) continue;
       if (entry.lastUsed < oldestTime) {
         oldestTime = entry.lastUsed;
         oldestDir = dir;
@@ -200,7 +206,7 @@ export class BridgePool {
     }
     if (oldestDir) {
       const entry = this.bridges.get(oldestDir);
-      entry?.bridge.shutdown().catch((err) => error("eviction shutdown failed:", err));
+      entry?.bridge.shutdown().catch((err) => this.error("eviction shutdown failed:", err));
       this.bridges.delete(oldestDir);
     }
   }
@@ -229,9 +235,21 @@ export class BridgePool {
     const shutdowns = Array.from(this.bridges.values()).map((entry) => entry.bridge.shutdown());
     this.bridges.clear();
     await Promise.allSettled(shutdowns);
-    log(
+    this.log(
       `Binary path updated to ${newPath}. All bridges cleared — next calls will use the new binary.`,
     );
+  }
+
+  private log(message: string, meta?: LogMeta): void {
+    const logger = this.logger ?? getActiveLogger();
+    if (logger) logger.log(message, meta);
+    else log(message, meta);
+  }
+
+  private error(message: string, meta?: LogMeta): void {
+    const logger = this.logger ?? getActiveLogger();
+    if (logger) logger.error(message, meta);
+    else error(message, meta);
   }
 
   /**
