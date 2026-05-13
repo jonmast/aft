@@ -623,10 +623,17 @@ describe("BinaryBridge lifecycle", () => {
       // response — the fake binary doesn't speak NDJSON.
       (bridge as any).spawnProcess();
 
-      // Wait long enough for all 250+1 stderr lines to be flushed and parsed.
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      // Poll for MARKER_LAST to land in the ring buffer. Under load, the
+      // 250+1 stderr lines can take longer than a fixed sleep would allow,
+      // so we deadline-poll instead.
+      const deadline = Date.now() + 5_000;
+      let ring: string[] = (bridge as any).stderrTail as string[];
+      while (Date.now() < deadline) {
+        ring = (bridge as any).stderrTail as string[];
+        if (ring.some((line) => line.includes("MARKER_LAST"))) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
-      const ring = (bridge as any).stderrTail as string[];
       // Ring is capped at STDERR_TAIL_MAX (20) regardless of how many lines arrived.
       expect(ring.length).toBeLessThanOrEqual(20);
       // Last marker is preserved — the tail captures the END of the stream.
