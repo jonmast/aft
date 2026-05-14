@@ -696,6 +696,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
 
 /// Try to extract the ORT version from the library filename or resolved symlink.
 /// Examples: "libonnxruntime.so.1.19.0" → "1.19.0", "libonnxruntime.1.24.4.dylib" → "1.24.4"
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn detect_ort_version_from_path(lib_path: &str) -> Option<String> {
     let path = std::path::Path::new(lib_path);
 
@@ -730,12 +731,14 @@ fn detect_ort_version_from_path(lib_path: &str) -> Option<String> {
 }
 
 /// Extract version from filenames like "libonnxruntime.so.1.19.0" or "libonnxruntime.1.24.4.dylib"
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn extract_version_from_filename(name: &str) -> Option<String> {
     // Match patterns: .so.X.Y.Z or .X.Y.Z.dylib or .X.Y.Z.so
     let re = regex::Regex::new(r"(\d+\.\d+\.\d+)").ok()?;
     re.find(name).map(|m| m.as_str().to_string())
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn suggest_removal_command(lib_path: &str) -> String {
     if lib_path.starts_with("/usr/local/lib")
         || lib_path == "libonnxruntime.so"
@@ -756,6 +759,7 @@ fn suggest_removal_command(lib_path: &str) -> String {
 /// stability — the auto-fix recommendation must always come first because
 /// it's the only safe option, and the system-rm step must remain present
 /// because some users prefer the system-wide cleanup path.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> String {
     format!(
         "ONNX Runtime version mismatch: found v{} at '{}', but AFT requires v1.20+. \

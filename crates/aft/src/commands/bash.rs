@@ -191,11 +191,10 @@ fn default_workdir(ctx: &AppContext) -> PathBuf {
 /// `Command::spawn` (mock closures simulate per-shell outcomes).
 ///
 /// `Child` is generic so tests can substitute a unit type or mock value;
-/// production callers always pass `std::process::Child`. Compiled on all
-/// platforms so the retry-decision unit tests can run on macOS/Linux dev
-/// machines, even though only the Windows `spawn_shell_command` body
-/// invokes it in production.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// production callers always pass `std::process::Child`. Compiled for tests
+/// only so the retry-decision unit tests can run on macOS/Linux dev machines
+/// without leaving dead code in non-test builds.
+#[cfg(test)]
 fn try_spawn_with_fallback<C, F>(
     candidates: &[crate::windows_shell::WindowsShell],
     mut try_one: F,
