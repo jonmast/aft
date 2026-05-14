@@ -50,6 +50,7 @@ function containsPath(parent: string, child: string): boolean {
 async function assertExternalDirectoryPermission(
   extCtx: { cwd: string; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } },
   target: string,
+  action = "modify",
 ): Promise<void> {
   if (!target) return;
   const absoluteTarget = isAbsolute(target) ? target : resolve(extCtx.cwd, target);
@@ -57,7 +58,7 @@ async function assertExternalDirectoryPermission(
 
   const confirmed = await extCtx.ui?.confirm?.(
     "Allow external directory access?",
-    `AFT wants to modify a file outside the project: ${absoluteTarget}`,
+    `AFT wants to ${action} outside the project: ${absoluteTarget}`,
   );
   if (confirmed === true) return;
   throw new Error("Permission denied: external directory access was cancelled.");
@@ -322,7 +323,10 @@ export function registerHoistedTools(
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { pattern: params.pattern };
-        if (params.path) req.path = await resolvePathArg(extCtx.cwd, params.path);
+        if (params.path) {
+          await assertExternalDirectoryPermission(extCtx, params.path, "search");
+          req.path = await resolvePathArg(extCtx.cwd, params.path);
+        }
         if (params.include) req.include = splitIncludeGlobs(params.include);
         if (params.caseSensitive !== undefined) req.case_sensitive = params.caseSensitive;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
