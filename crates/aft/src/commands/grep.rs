@@ -13,6 +13,8 @@ use crate::search_index::{
     sort_grep_matches_by_mtime_desc, walk_project_files_from, GrepMatch, GrepResult, IndexStatus,
 };
 
+use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
+
 const DEFAULT_MAX_RESULTS: usize = 100;
 const MAX_LINE_CHARS: usize = 200;
 const MAX_MATCHES_PER_FILE: usize = 10;
@@ -43,14 +45,6 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|value| value.as_u64())
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MAX_RESULTS);
-    let path = match req.params.get("path").and_then(|value| value.as_str()) {
-        Some(path) => match ctx.validate_path(&req.id, Path::new(path)) {
-            Ok(path) => Some(path.to_string_lossy().to_string()),
-            Err(resp) => return resp,
-        },
-        None => None,
-    };
-
     let mut regex_builder = RegexBuilder::new(pattern);
     regex_builder.case_insensitive(!case_sensitive);
     regex_builder.size_limit(10 * 1024 * 1024);
@@ -79,87 +73,62 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
-    let search_scope = resolve_search_scope(&project_root, path.as_deref());
+    let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
+        Some(path) => match resolve_path_or_multi(path, &project_root, |candidate| {
+            ctx.validate_path(&req.id, candidate)
+        }) {
+            Ok(SearchPathResolution::Single(root)) => vec![root],
+            Ok(SearchPathResolution::Multi(roots)) => roots,
+            Err(resp) => return resp,
+        },
+        None => vec![resolve_search_scope(&project_root, None).root],
+    };
 
     // Return clear error if the search path doesn't exist
-    if !search_scope.root.exists() {
+    if let Some(missing_root) = search_roots.iter().find(|root| !root.exists()) {
         return Response::error(
             &req.id,
             "path_not_found",
             format!(
                 "grep: search path does not exist: {}",
-                search_scope.root.display()
+                missing_root.display()
             ),
         );
     }
-    let scope_has_files = walk_project_files_from(
-        &project_root,
-        &search_scope.root,
-        &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
-    )
-    .into_iter()
-    .next()
-    .is_some();
-
-    let fallback_status = if search_scope.use_index {
-        current_index_status(ctx)
-    } else {
-        IndexStatus::Fallback
-    };
+    let scope_has_files = search_roots
+        .iter()
+        .any(|root| scope_has_files(&project_root, root));
 
     let search_start = std::time::Instant::now();
-    let result = {
-        let search_index = ctx.search_index().borrow();
-        match search_index.as_ref() {
-            Some(index) if index.ready && search_scope.use_index => index.search_grep(
-                pattern,
-                case_sensitive,
-                &include,
-                &exclude,
-                &search_scope.root,
-                max_results,
-            ),
-            _ => {
-                // For out-of-project paths, try ripgrep first for better performance
-                if !search_scope.use_index {
-                    if let Some(result) = ripgrep_grep(
-                        &search_scope.root,
-                        pattern,
-                        case_sensitive,
-                        &include,
-                        &exclude,
-                        max_results,
-                    ) {
-                        let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
-                        return Response::success(
-                            &req.id,
-                            serde_json::json!({
-                                "text": format_grep_text(&result, &project_root),
-                                "complete": true,
-                                "no_files_matched_scope": !scope_has_files,
-                                "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
-                                "total_matches": result.total_matches,
-                                "files_searched": result.files_searched,
-                                "files_with_matches": result.files_with_matches,
-                                "index_status": result.index_status.as_str(),
-                                "truncated": result.truncated,
-                                "search_ms": (search_ms * 1000.0).round() / 1000.0,
-                            }),
-                        );
-                    }
-                }
-                fallback_grep(
+    let result = if search_roots.len() == 1 {
+        search_grep_root(
+            ctx,
+            &project_root,
+            &search_roots[0],
+            pattern,
+            case_sensitive,
+            &include,
+            &exclude,
+            max_results,
+        )
+    } else {
+        let per_path_max = max_results.saturating_mul(2).max(max_results);
+        let results = search_roots
+            .iter()
+            .map(|root| {
+                search_grep_root(
+                    ctx,
                     &project_root,
-                    &search_scope.root,
+                    root,
                     pattern,
                     case_sensitive,
                     &include,
                     &exclude,
-                    max_results,
-                    fallback_status,
+                    per_path_max,
                 )
-            }
-        }
+            })
+            .collect::<Vec<_>>();
+        merge_grep_results(results, &project_root, max_results)
     };
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let text = format_grep_text(&result, &project_root);
@@ -179,6 +148,126 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
             "search_ms": (search_ms * 1000.0).round() / 1000.0,
         }),
     )
+}
+
+fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {
+    walk_project_files_from(
+        project_root,
+        search_root,
+        &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
+    )
+    .into_iter()
+    .next()
+    .is_some()
+}
+
+fn search_grep_root(
+    ctx: &AppContext,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    case_sensitive: bool,
+    include: &[String],
+    exclude: &[String],
+    max_results: usize,
+) -> GrepResult {
+    let search_root_text = search_root.to_string_lossy();
+    let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
+    let fallback_status = if search_scope.use_index {
+        current_index_status(ctx)
+    } else {
+        IndexStatus::Fallback
+    };
+
+    let search_index = ctx.search_index().borrow();
+    match search_index.as_ref() {
+        Some(index) if index.ready && search_scope.use_index => index.search_grep(
+            pattern,
+            case_sensitive,
+            include,
+            exclude,
+            &search_scope.root,
+            max_results,
+        ),
+        _ => {
+            if !search_scope.use_index {
+                if let Some(result) = ripgrep_grep(
+                    &search_scope.root,
+                    pattern,
+                    case_sensitive,
+                    include,
+                    exclude,
+                    max_results,
+                ) {
+                    return result;
+                }
+            }
+            fallback_grep(
+                project_root,
+                &search_scope.root,
+                pattern,
+                case_sensitive,
+                include,
+                exclude,
+                max_results,
+                fallback_status,
+            )
+        }
+    }
+}
+
+fn merge_grep_results(
+    results: Vec<GrepResult>,
+    project_root: &Path,
+    max_results: usize,
+) -> GrepResult {
+    let mut matches = Vec::new();
+    let mut total_matches = 0usize;
+    let mut files_searched = 0usize;
+    let mut files_with_matches = 0usize;
+    let mut index_status = IndexStatus::Ready;
+    let mut truncated = false;
+    let mut seen_match_keys = HashSet::new();
+
+    for result in results {
+        total_matches += result.total_matches;
+        files_searched += result.files_searched;
+        files_with_matches += result.files_with_matches;
+        index_status = weakest_index_status(index_status, result.index_status);
+        truncated |= result.truncated;
+
+        for grep_match in result.matches {
+            let file_key = canonical_key(&grep_match.file);
+            let match_key = (file_key, grep_match.line, grep_match.column);
+            if seen_match_keys.insert(match_key) {
+                matches.push(grep_match);
+            }
+        }
+    }
+
+    sort_grep_matches_by_mtime_desc(&mut matches, project_root);
+    if matches.len() > max_results {
+        matches.truncate(max_results);
+        truncated = true;
+    }
+    truncated |= total_matches > max_results;
+
+    GrepResult {
+        matches,
+        total_matches,
+        files_searched,
+        files_with_matches,
+        index_status,
+        truncated,
+    }
+}
+
+fn weakest_index_status(left: IndexStatus, right: IndexStatus) -> IndexStatus {
+    match (left, right) {
+        (IndexStatus::Fallback, _) | (_, IndexStatus::Fallback) => IndexStatus::Fallback,
+        (IndexStatus::Building, _) | (_, IndexStatus::Building) => IndexStatus::Building,
+        (IndexStatus::Ready, IndexStatus::Ready) => IndexStatus::Ready,
+    }
 }
 
 fn fallback_grep(

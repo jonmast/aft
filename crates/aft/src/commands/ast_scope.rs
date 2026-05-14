@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::ast_grep_lang::AstGrepLang;
+use crate::context::AppContext;
 use crate::protocol::Response;
+
+use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
 
 pub(crate) struct AstScope {
     pub files: Vec<PathBuf>,
@@ -18,12 +21,13 @@ struct SearchRoot {
 pub(crate) fn collect_ast_files(
     req_id: &str,
     command: &str,
+    ctx: &AppContext,
     project_root: &Path,
     lang: &AstGrepLang,
     paths: &[String],
     globs: &[String],
 ) -> Result<AstScope, Response> {
-    let roots = resolve_roots(project_root, paths);
+    let roots = resolve_roots(req_id, ctx, project_root, paths)?;
 
     for root in &roots {
         if !root.path.exists() {
@@ -50,30 +54,53 @@ pub(crate) fn collect_ast_files(
     })
 }
 
-fn resolve_roots(project_root: &Path, paths: &[String]) -> Vec<SearchRoot> {
+fn resolve_roots(
+    req_id: &str,
+    ctx: &AppContext,
+    project_root: &Path,
+    paths: &[String],
+) -> Result<Vec<SearchRoot>, Response> {
     if paths.is_empty() {
-        return vec![SearchRoot {
+        return Ok(vec![SearchRoot {
             path: project_root.to_path_buf(),
             label: None,
-        }];
+        }]);
     }
 
-    paths
-        .iter()
-        .map(|path| {
-            let candidate = PathBuf::from(path);
-            let resolved = if candidate.is_absolute() {
-                candidate
-            } else {
-                project_root.join(path)
-            };
-
-            SearchRoot {
-                path: resolved,
+    let mut roots = Vec::new();
+    for path in paths {
+        match resolve_path_or_multi(path, project_root, |candidate| {
+            ctx.validate_path(req_id, candidate)
+        })? {
+            SearchPathResolution::Single(root) => roots.push(SearchRoot {
+                path: root,
                 label: Some(path.clone()),
+            }),
+            SearchPathResolution::Multi(expanded) => {
+                roots.extend(expanded.into_iter().map(|root| SearchRoot {
+                    label: Some(root.display().to_string()),
+                    path: root,
+                }));
             }
-        })
-        .collect()
+        }
+    }
+
+    Ok(dedupe_search_roots(roots))
+}
+
+fn dedupe_search_roots(roots: Vec<SearchRoot>) -> Vec<SearchRoot> {
+    let mut deduped = Vec::new();
+    for root in roots {
+        let key = canonical_key(&root.path);
+        if deduped
+            .iter()
+            .any(|existing: &SearchRoot| canonical_key(&existing.path) == key)
+        {
+            continue;
+        }
+        deduped.push(root);
+    }
+    deduped
 }
 
 fn scope_warnings(
@@ -164,9 +191,11 @@ fn walk_roots(
     lang: &AstGrepLang,
     globs: &[String],
 ) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
     roots
         .iter()
         .flat_map(|root| walk_root(project_root, root, lang, globs))
+        .filter(|file| seen.insert(canonical_key(file)))
         .collect()
 }
 

@@ -110,8 +110,15 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     drop(config);
 
-    let scope = match collect_ast_files(&req.id, "ast_search", &project_root, &lang, &paths, &globs)
-    {
+    let scope = match collect_ast_files(
+        &req.id,
+        "ast_search",
+        ctx,
+        &project_root,
+        &lang,
+        &paths,
+        &globs,
+    ) {
         Ok(scope) => scope,
         Err(resp) => return resp,
     };

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -7,6 +7,8 @@ use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, resolve_search_scope, sort_paths_by_mtime_desc, walk_project_files_from,
 };
+
+use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
 
 const MAX_GLOB_RESULTS: usize = 100;
 const GLOB_TRUNCATED_MESSAGE: &str =
@@ -37,62 +39,53 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let path = match req.params.get("path").and_then(|value| value.as_str()) {
-        Some(path) => match ctx.validate_path(&req.id, Path::new(path)) {
-            Ok(path) => Some(path.to_string_lossy().to_string()),
-            Err(resp) => return resp,
-        },
-        None => None,
-    };
     let project_root = ctx
         .config()
         .project_root
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
-    let search_scope = resolve_search_scope(&project_root, path.as_deref());
+    let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
+        Some(path) => match resolve_path_or_multi(path, &project_root, |candidate| {
+            ctx.validate_path(&req.id, candidate)
+        }) {
+            Ok(SearchPathResolution::Single(root)) => vec![root],
+            Ok(SearchPathResolution::Multi(roots)) => roots,
+            Err(resp) => return resp,
+        },
+        None => vec![resolve_search_scope(&project_root, None).root],
+    };
 
     // Return clear error if the search path doesn't exist
-    if !search_scope.root.exists() {
+    if let Some(missing_root) = search_roots.iter().find(|root| !root.exists()) {
         return Response::error(
             &req.id,
             "path_not_found",
             format!(
                 "glob: search path does not exist: {}",
-                search_scope.root.display()
+                missing_root.display()
             ),
         );
     }
-    let scope_has_files = walk_project_files_from(
-        &project_root,
-        &search_scope.root,
-        &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
-    )
-    .into_iter()
-    .next()
-    .is_some();
+    let scope_has_files = search_roots
+        .iter()
+        .any(|root| scope_has_files(&project_root, root));
 
-    let mut files = {
-        let search_index = ctx.search_index().borrow();
-        match search_index.as_ref() {
-            Some(index) if index.ready && search_scope.use_index => {
-                index.glob(pattern, &search_scope.root)
-            }
-            _ => {
-                // For out-of-project paths, try ripgrep first for better performance
-                if !search_scope.use_index {
-                    if let Some(rg_files) =
-                        super::grep::ripgrep_glob(&search_scope.root, pattern, MAX_GLOB_RESULTS + 1)
-                    {
-                        rg_files
-                    } else {
-                        fallback_glob(&project_root, &search_scope.root, pattern)
-                    }
-                } else {
-                    fallback_glob(&project_root, &search_scope.root, pattern)
-                }
-            }
-        }
+    let mut files = if search_roots.len() == 1 {
+        glob_root(
+            ctx,
+            &project_root,
+            &search_roots[0],
+            pattern,
+            MAX_GLOB_RESULTS + 1,
+        )
+    } else {
+        merge_glob_files(
+            search_roots
+                .iter()
+                .flat_map(|root| glob_root(ctx, &project_root, root, pattern, MAX_GLOB_RESULTS + 1))
+                .collect(),
+        )
     };
     let total = files.len();
     let truncated = total > MAX_GLOB_RESULTS;
@@ -111,6 +104,56 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             "truncated": truncated,
         }),
     )
+}
+
+fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {
+    walk_project_files_from(
+        project_root,
+        search_root,
+        &build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob"),
+    )
+    .into_iter()
+    .next()
+    .is_some()
+}
+
+fn glob_root(
+    ctx: &AppContext,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    max_results: usize,
+) -> Vec<PathBuf> {
+    let search_root_text = search_root.to_string_lossy();
+    let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
+    let search_index = ctx.search_index().borrow();
+    match search_index.as_ref() {
+        Some(index) if index.ready && search_scope.use_index => {
+            index.glob(pattern, &search_scope.root)
+        }
+        _ => {
+            if !search_scope.use_index {
+                if let Some(rg_files) =
+                    super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)
+                {
+                    return rg_files;
+                }
+            }
+            fallback_glob(project_root, &search_scope.root, pattern)
+        }
+    }
+}
+
+fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for file in files {
+        if seen.insert(canonical_key(&file)) {
+            deduped.push(file);
+        }
+    }
+    sort_paths_by_mtime_desc(&mut deduped);
+    deduped
 }
 
 fn fallback_glob(

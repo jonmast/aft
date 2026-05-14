@@ -188,11 +188,18 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let scope =
-        match collect_ast_files(&req.id, "ast_replace", &project_root, &lang, &paths, &globs) {
-            Ok(scope) => scope,
-            Err(resp) => return resp,
-        };
+    let scope = match collect_ast_files(
+        &req.id,
+        "ast_replace",
+        ctx,
+        &project_root,
+        &lang,
+        &paths,
+        &globs,
+    ) {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
 
     // Phase 1 — parallel compute. Each worker reads, parses, computes edits,
     // and produces the new content. No mutation of shared state, no ctx access.

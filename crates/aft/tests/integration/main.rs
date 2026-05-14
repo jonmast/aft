@@ -24,6 +24,7 @@ mod edit_test;
 mod error_path_test;
 mod extract_function_test;
 mod format_test;
+mod grep_glob_multi_path_test;
 mod grep_glob_test;
 mod honest_failures_test;
 mod import_test;
