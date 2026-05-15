@@ -187,7 +187,7 @@ impl BackupStore {
             });
         };
 
-        let keys_to_restore: Vec<PathBuf> = self
+        let mut keys_to_restore: Vec<PathBuf> = self
             .entries
             .get(session)
             .map(|files| {
@@ -201,6 +201,7 @@ impl BackupStore {
                     .collect()
             })
             .unwrap_or_default();
+        keys_to_restore.sort();
 
         if keys_to_restore.is_empty() {
             return Err(AftError::NoUndoHistory {
@@ -208,11 +209,79 @@ impl BackupStore {
             });
         }
 
+        let mut targets = Vec::new();
+        for key in &keys_to_restore {
+            let entry = self
+                .entries
+                .get(session)
+                .and_then(|files| files.get(key))
+                .and_then(|stack| stack.last())
+                .cloned()
+                .ok_or_else(|| AftError::NoUndoHistory {
+                    path: key.display().to_string(),
+                })?;
+            let existing_content = match std::fs::read(key) {
+                Ok(content) => Some(content),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(AftError::IoError {
+                        path: key.display().to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            };
+            let warning = self.check_external_modification(session, key, key);
+            targets.push((key.clone(), entry, warning, existing_content));
+        }
+
+        let mut created_dirs = Vec::new();
+        for (key, _, _, _) in &targets {
+            if let Some(parent) = key.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let missing_dirs = missing_parent_dirs(parent);
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        let mut dirs_to_remove = created_dirs;
+                        dirs_to_remove.extend(missing_dirs);
+                        let rollback_ok = rollback_created_dirs(&dirs_to_remove);
+                        return Err(AftError::IoError {
+                            path: parent.display().to_string(),
+                            message: format!(
+                                "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
+                                e,
+                                !rollback_ok,
+                                rollback_ok
+                            ),
+                        });
+                    }
+                    created_dirs.extend(missing_dirs);
+                }
+            }
+        }
+
+        let mut written = Vec::new();
+        for (key, entry, _, existing_content) in &targets {
+            if let Err(e) = std::fs::write(key, &entry.content) {
+                let files_rollback_ok =
+                    rollback_transactional_restore(&written, Some((key, existing_content)));
+                let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
+                let rollback_ok = files_rollback_ok && dirs_rollback_ok;
+                return Err(AftError::IoError {
+                    path: key.display().to_string(),
+                    message: format!(
+                        "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
+                        e,
+                        !rollback_ok,
+                        rollback_ok
+                    ),
+                });
+            }
+            written.push((key.clone(), existing_content.clone()));
+        }
+
         let mut restored = Vec::new();
         let mut warnings = Vec::new();
-        for key in keys_to_restore {
-            let warning = self.check_external_modification(session, &key, &key);
-            let (entry, _) = self.do_restore(session, &key, &key)?;
+        for (key, entry, warning, _) in targets {
+            self.commit_restored_backup(session, &key);
             if let Some(warning) = warning {
                 warnings.push(format!("{}: {}", key.display(), warning));
             }
@@ -410,6 +479,38 @@ impl BackupStore {
         }
 
         Ok((entry, None))
+    }
+
+    fn commit_restored_backup(&mut self, session: &str, key: &Path) {
+        let mut remove_key = false;
+        let mut remove_session = false;
+        let mut remaining_stack = None;
+
+        if let Some(session_entries) = self.entries.get_mut(session) {
+            if let Some(stack) = session_entries.get_mut(key) {
+                stack.pop();
+                if stack.is_empty() {
+                    remove_key = true;
+                } else {
+                    remaining_stack = Some(stack.clone());
+                }
+            }
+
+            if remove_key {
+                session_entries.remove(key);
+                remove_session = session_entries.is_empty();
+            }
+        }
+
+        if remove_session {
+            self.entries.remove(session);
+        }
+
+        if remove_key {
+            self.remove_disk_backups(session, key);
+        } else if let Some(stack) = remaining_stack {
+            self.write_snapshot_to_disk(session, key, &stack);
+        }
     }
 
     fn check_external_modification(
@@ -909,6 +1010,66 @@ fn canonicalize_key(path: &Path) -> PathBuf {
     })
 }
 
+fn rollback_transactional_restore(
+    written: &[(PathBuf, Option<Vec<u8>>)],
+    attempted: Option<(&PathBuf, &Option<Vec<u8>>)>,
+) -> bool {
+    let mut ok = true;
+
+    if let Some((path, content)) = attempted {
+        ok &= rollback_one_restore_write(path, content);
+    }
+
+    for (path, content) in written.iter().rev() {
+        ok &= rollback_one_restore_write(path, content);
+    }
+
+    ok
+}
+
+fn rollback_one_restore_write(path: &Path, content: &Option<Vec<u8>>) -> bool {
+    match content {
+        Some(content) => std::fs::write(path, content).is_ok(),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        },
+    }
+}
+
+fn missing_parent_dirs(parent: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(parent);
+
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || dir.exists() {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+
+    dirs
+}
+
+fn rollback_created_dirs(dirs: &[PathBuf]) -> bool {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    dirs.dedup();
+
+    let mut ok = true;
+    for dir in dirs {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => ok = false,
+        }
+    }
+
+    ok
+}
+
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -936,6 +1097,7 @@ mod tests {
     use super::*;
     use crate::protocol::DEFAULT_SESSION_ID;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_file(name: &str, content: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("aft_backup_tests");
@@ -1206,6 +1368,69 @@ mod tests {
         assert_eq!(restored.restored.len(), 2);
         assert_eq!(fs::read_to_string(&path_a).unwrap(), "a1");
         assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
+    }
+
+    #[test]
+    fn restore_last_operation_is_atomic_when_a_write_fails() {
+        let dir = std::env::temp_dir().join("aft_backup_tests_atomic_restore");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path_a = dir.join("a.txt");
+        let path_b = dir.join("b.txt");
+        let path_c = dir.join("c.txt");
+        fs::write(&path_a, "a-original").unwrap();
+        fs::write(&path_b, "b-original").unwrap();
+        fs::write(&path_c, "c-original").unwrap();
+
+        let mut store = BackupStore::new();
+        let op_id = "op-atomic-restore-01";
+        let id_a = store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_a, "a", Some(op_id))
+            .unwrap();
+        let id_b = store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_b, "b", Some(op_id))
+            .unwrap();
+        let id_c = store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_c, "c", Some(op_id))
+            .unwrap();
+        fs::write(&path_a, "a-modified").unwrap();
+        fs::write(&path_b, "b-modified").unwrap();
+        fs::write(&path_c, "c-modified").unwrap();
+
+        let original_permissions = fs::metadata(&path_b).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_mode(0o444);
+        fs::set_permissions(&path_b, readonly_permissions).unwrap();
+
+        let result = store.restore_last_operation(DEFAULT_SESSION_ID);
+        fs::set_permissions(&path_b, original_permissions).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "a-modified");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b-modified");
+        assert_eq!(fs::read_to_string(&path_c).unwrap(), "c-modified");
+
+        let history_a = store.history(DEFAULT_SESSION_ID, &path_a);
+        let history_b = store.history(DEFAULT_SESSION_ID, &path_b);
+        let history_c = store.history(DEFAULT_SESSION_ID, &path_c);
+        assert_eq!(history_a.len(), 1);
+        assert_eq!(history_b.len(), 1);
+        assert_eq!(history_c.len(), 1);
+        assert_eq!(history_a[0].backup_id, id_a);
+        assert_eq!(history_b[0].backup_id, id_b);
+        assert_eq!(history_c[0].backup_id, id_c);
+        assert_eq!(history_a[0].op_id.as_deref(), Some(op_id));
+        assert_eq!(history_b[0].op_id.as_deref(), Some(op_id));
+        assert_eq!(history_c[0].op_id.as_deref(), Some(op_id));
+
+        let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(restored.op_id, op_id);
+        assert_eq!(restored.restored.len(), 3);
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "a-original");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b-original");
+        assert_eq!(fs::read_to_string(&path_c).unwrap(), "c-original");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
