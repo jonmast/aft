@@ -363,6 +363,8 @@ const SCALA_QUERY: &str = r#"
   name: (identifier) @class.name) @class.def
 (object_definition
   name: (identifier) @object.name) @object.def
+(enum_definition
+  name: (_) @enum.name) @enum.def
 (trait_definition
   name: (identifier) @trait.name) @trait.def
 ;; methods (def)
@@ -375,6 +377,8 @@ const SCALA_QUERY: &str = r#"
   pattern: (identifier) @val.name) @val.def
 (var_definition
   pattern: (identifier) @var.name) @var.def
+(given_definition
+  name: (_) @given.name) @given.def
 (type_definition
   name: (type_identifier) @type.name) @type.def
 "#;
@@ -3198,7 +3202,7 @@ fn scala_scope_chain(node: &Node, source: &str) -> Vec<String> {
 
     while let Some(parent) = current {
         match parent.kind() {
-            "class_definition" | "object_definition" | "trait_definition" => {
+            "class_definition" | "object_definition" | "enum_definition" | "trait_definition" => {
                 if let Some(name_node) = parent.child_by_field_name("name") {
                     chain.push(node_text(source, &name_node).to_string());
                 }
@@ -3232,6 +3236,8 @@ fn extract_scala_symbols(
         let mut class_def_node = None;
         let mut object_name_node = None;
         let mut object_def_node = None;
+        let mut enum_name_node = None;
+        let mut enum_def_node = None;
         let mut trait_name_node = None;
         let mut trait_def_node = None;
         let mut fn_name_node = None;
@@ -3252,6 +3258,8 @@ fn extract_scala_symbols(
                 "class.def" => class_def_node = Some(cap.node),
                 "object.name" => object_name_node = Some(cap.node),
                 "object.def" => object_def_node = Some(cap.node),
+                "enum.name" => enum_name_node = Some(cap.node),
+                "enum.def" => enum_def_node = Some(cap.node),
                 "trait.name" => trait_name_node = Some(cap.node),
                 "trait.def" => trait_def_node = Some(cap.node),
                 "fn.name" => fn_name_node = Some(cap.node),
@@ -3260,6 +3268,8 @@ fn extract_scala_symbols(
                 "val.def" => val_def_node = Some(cap.node),
                 "var.name" => var_name_node = Some(cap.node),
                 "var.def" => var_def_node = Some(cap.node),
+                "given.name" => val_name_node = Some(cap.node),
+                "given.def" => val_def_node = Some(cap.node),
                 "type.name" => type_name_node = Some(cap.node),
                 "type.def" => type_def_node = Some(cap.node),
                 _ => {}
@@ -3279,6 +3289,18 @@ fn extract_scala_symbols(
         }
 
         if let (Some(name_node), Some(def_node)) = (object_name_node, object_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Class,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: scala_scope_chain(&def_node, source),
+                exported: true,
+                parent: scala_scope_chain(&def_node, source).last().cloned(),
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,

@@ -180,6 +180,54 @@ fn outline_html_symbols_include_heading_hierarchy() {
 }
 
 #[test]
+fn outline_scala3_symbols_include_enums_and_named_givens() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "src/main/scala/demo/Color.scala",
+        r#"package demo
+
+enum Color {
+  case Red, Green, Blue
+  def describe: String = this match { case Red => "r"; case Green => "g"; case Blue => "b" }
+}
+
+given Ordering[Int] = Ordering.fromLessThan(_ < _)
+
+given intShow: Show[Int] = Show.show(_.toString)
+
+object Module {
+  given stringEq: Eq[String] = (a, b) => a == b
+}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let text = outline_text(&mut aft, &file);
+    for expected in [
+        "E cls  enum Color 3:6",
+        "    .E mth  def describe: String = this match { case Red => \"r\"; case Green => \"g\"; case Blue => \"b\" } 5:5",
+        "E var  given intShow: Show[Int] = Show.show(_.toString) 10:10",
+        "E cls  object Module 12:14",
+        "    .E var  given stringEq: Eq[String] = (a, b) => a == b 13:13",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing {expected} in outline: {text}"
+        );
+    }
+    assert!(
+        !text.contains("Ordering[Int]"),
+        "anonymous given should be skipped: {text}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn zoom_html_heading_returns_content_with_context() {
     let dir = TempDir::new().unwrap();
     let file = write_file(
