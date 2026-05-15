@@ -154,6 +154,37 @@ fn test_undo_restores_file_after_edit_command() {
 }
 
 #[test]
+fn test_operation_undo_restores_multiple_deleted_files() {
+    let dir = temp_dir("operation_undo_delete_many");
+    let file_a = dir.join("a.txt");
+    let file_b = dir.join("b.txt");
+
+    fs::write(&file_a, "original-a").unwrap();
+    fs::write(&file_b, "original-b").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-many",
+        "command": "delete_file",
+        "files": [file_a.display().to_string(), file_b.display().to_string()],
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], true, "delete: {delete_resp:?}");
+    assert!(!file_a.exists());
+    assert!(!file_b.exists());
+
+    let undo = aft.send(r#"{"id":"undo-operation","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert_eq!(undo["restored_count"], 2);
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "original-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn test_edit_history_returns_stack() {
     let dir = temp_dir("edit_history");
     let file = dir.join("tracked.txt");

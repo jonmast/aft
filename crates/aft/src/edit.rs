@@ -195,13 +195,14 @@ pub fn auto_backup(
     session: &str,
     path: &Path,
     description: &str,
+    op_id: Option<&str>,
 ) -> Result<Option<String>, AftError> {
     if !path.exists() {
         return Ok(None);
     }
     let backup_id = {
         let mut store = ctx.backup().borrow_mut();
-        store.snapshot(session, path, description)?
+        store.snapshot_with_op(session, path, description, op_id)?
     }; // borrow dropped here
     Ok(Some(backup_id))
 }

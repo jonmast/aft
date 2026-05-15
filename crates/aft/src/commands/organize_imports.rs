@@ -25,6 +25,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, groups: [{name, count}], removed_duplicates, syntax_valid?, backup_id? }`
 pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -103,6 +104,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &path,
         "organize_imports: pre-edit backup",
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

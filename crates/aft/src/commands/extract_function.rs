@@ -33,6 +33,7 @@ use crate::protocol::{RawRequest, Response};
 ///   - `unsupported_language` — file is not TS/JS/TSX/Python
 ///   - `this_reference_in_range` — range contains `this`/`self`
 pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -313,6 +314,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &path,
         &format!("extract_function: {}", name),
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

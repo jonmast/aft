@@ -19,6 +19,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, target, derives, syntax_valid?, backup_id? }`
 pub fn handle_add_derive(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -156,13 +157,18 @@ pub fn handle_add_derive(req: &RawRequest, ctx: &AppContext) -> Response {
     let (new_source, final_derives) = apply_derive(&source, &root, target_info, &derives);
 
     // --- Auto-backup ---
-    let backup_id =
-        match edit::auto_backup(ctx, req.session(), &path, "add_derive: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "add_derive: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     // --- Write, format, and validate ---
     let mut write_result =

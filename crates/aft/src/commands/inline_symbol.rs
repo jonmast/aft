@@ -34,6 +34,7 @@ use crate::protocol::{RawRequest, Response};
 ///   - `symbol_not_found` — function symbol not found in file
 ///   - `call_not_found` — no call expression found at the specified line
 pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -345,6 +346,7 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &path,
         &format!("inline_symbol: {}", symbol),
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

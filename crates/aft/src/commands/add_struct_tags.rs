@@ -21,6 +21,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, target, field, tag_string, syntax_valid?, backup_id? }`
 pub fn handle_add_struct_tags(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -201,6 +202,7 @@ pub fn handle_add_struct_tags(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &path,
         "add_struct_tags: pre-edit backup",
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

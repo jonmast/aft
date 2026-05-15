@@ -28,6 +28,7 @@ struct ResolvedEdit {
 /// Returns on success: `{ file, edits_applied, syntax_valid, backup_id? }`
 /// Returns on failure: error with the failing edit index.
 pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -88,7 +89,13 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Phase 2: Auto-backup once before applying
-    let backup_id = match edit::auto_backup(ctx, req.session(), &path, "batch: pre-batch backup") {
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "batch: pre-batch backup",
+        Some(&op_id),
+    ) {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());

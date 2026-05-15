@@ -30,8 +30,9 @@ use crate::protocol::{RawRequest, Response};
 ///   - Original single-file behavior
 ///   - Returns: `{ file, replacements: 1, syntax_valid, backup_id? }`
 pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     if req.params.get("op").and_then(|v| v.as_str()) == Some("append") {
-        return handle_append(req, ctx);
+        return handle_append(req, ctx, &op_id);
     }
 
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
@@ -81,14 +82,14 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Detect glob pattern
     if is_glob_pattern(file) {
-        return handle_glob_edit_match(req, ctx, file, match_str, replacement);
+        return handle_glob_edit_match(req, ctx, file, match_str, replacement, &op_id);
     }
 
     // Single-file path
-    handle_single_file_edit_match(req, ctx, file, match_str, replacement)
+    handle_single_file_edit_match(req, ctx, file, match_str, replacement, &op_id)
 }
 
-fn handle_append(req: &RawRequest, ctx: &AppContext) -> Response {
+fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     let file = match req
         .params
         .get("file")
@@ -149,7 +150,13 @@ fn handle_append(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let existed = path.exists();
     let backup_id = if existed {
-        match edit::auto_backup(ctx, req.session(), path.as_path(), "edit_match: append") {
+        match edit::auto_backup(
+            ctx,
+            req.session(),
+            path.as_path(),
+            "edit_match: append",
+            Some(op_id),
+        ) {
             Ok(id) => id,
             Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
         }
@@ -291,6 +298,7 @@ fn handle_glob_edit_match(
     pattern: &str,
     match_str: &str,
     replacement: &str,
+    op_id: &str,
 ) -> Response {
     // Resolve glob relative to project root (or cwd)
     let config = ctx.config();
@@ -414,6 +422,7 @@ fn handle_glob_edit_match(
             req.session(),
             &edit.path,
             &format!("glob_edit_match: {}", match_str),
+            Some(op_id),
         ) {
             if let Some(name) = &checkpoint_name {
                 delete_glob_checkpoint(ctx, req.session(), name);
@@ -708,6 +717,7 @@ fn handle_single_file_edit_match(
     file: &str,
     match_str: &str,
     replacement: &str,
+    op_id: &str,
 ) -> Response {
     let occurrence = req
         .params
@@ -820,7 +830,8 @@ fn handle_single_file_edit_match(
     } else {
         format!("edit_match: {}", match_str)
     };
-    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label) {
+    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label, Some(op_id))
+    {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());

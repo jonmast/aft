@@ -1,5 +1,5 @@
 /**
- * aft_safety — per-file undo, named checkpoints, restore, list, history.
+ * aft_safety — operation undo, per-file history, named checkpoints, restore, list.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -26,7 +26,9 @@ const SafetyParams = Type.Object({
   op: StringEnum(["undo", "history", "checkpoint", "restore", "list"] as const, {
     description: "Safety operation",
   }),
-  filePath: Type.Optional(Type.String({ description: "File path (required for undo, history)" })),
+  filePath: Type.Optional(
+    Type.String({ description: "File path (required for history, optional for undo)" }),
+  ),
   name: Type.Optional(
     Type.String({ description: "Checkpoint name (required for checkpoint, restore)" }),
   ),
@@ -47,6 +49,12 @@ export function buildSafetySections(
   if (!response) return [theme.fg("muted", "No safety result.")];
 
   if (args.op === "undo") {
+    if (response.operation === true) {
+      return [
+        `${theme.fg("success", "restored operation")} ${theme.fg("accent", asString(response.op_id) ?? "(operation)")}`,
+        `${theme.fg("muted", "files")} ${asNumber(response.restored_count) ?? asRecords(response.restored).length}`,
+      ];
+    }
     return [
       `${theme.fg("success", "restored")} ${theme.fg("accent", shortenPath(asString(response.path) ?? args.filePath ?? "(file)"))}`,
       `${theme.fg("muted", "backup")} ${asString(response.backup_id) ?? "—"}`,
@@ -146,7 +154,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
     name: "aft_safety",
     label: "safety",
     description:
-      "File safety and recovery operations. Ops: `undo` (pop latest snapshot for a file — irreversible), `history` (list snapshots for a file), `checkpoint` (save named snapshot), `restore` (restore named checkpoint), `list` (list checkpoints). Per-file undo stack is capped at 20.",
+      "File safety and recovery operations. Ops: `undo` (omit filePath to undo the entire last tool call; pass filePath to pop latest snapshot for one file — irreversible), `history` (list snapshots for a file), `checkpoint` (save named snapshot), `restore` (restore named checkpoint), `list` (list checkpoints). Per-file undo stack is capped at 20.",
     parameters: SafetyParams,
     async execute(
       _toolCallId: string,
@@ -155,7 +163,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       _onUpdate,
       extCtx,
     ) {
-      if ((params.op === "undo" || params.op === "history") && !params.filePath) {
+      if (params.op === "history" && !params.filePath) {
         throw new Error(`op='${params.op}' requires 'filePath'`);
       }
       if ((params.op === "checkpoint" || params.op === "restore") && !params.name) {

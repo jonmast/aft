@@ -25,7 +25,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "File safety and recovery operations.\n\n" +
         "Per-file undo stack is capped at 20 entries (oldest evicted).\n\n" +
         "Ops:\n" +
-        "- 'undo': Undo the last edit to a file. Requires 'filePath'. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect before undoing.\n" +
+        "- 'undo': Undo the entire last tool call when 'filePath' is omitted (typical), or undo the last edit to one file when 'filePath' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n" +
         "- 'history': List all edit snapshots for a file. Requires 'filePath'.\n" +
         "- 'checkpoint': Save a named snapshot of tracked files. Requires 'name'. Optional 'files' to snapshot specific files only.\n" +
         "- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n" +
@@ -42,7 +42,9 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         filePath: z
           .string()
           .optional()
-          .describe("File path (required for undo, history). Absolute or relative to project root"),
+          .describe(
+            "File path (required for history, optional for undo). Absolute or relative to project root",
+          ),
         name: z.string().optional().describe("Checkpoint name (required for checkpoint, restore)"),
         files: z
           .array(z.string())
@@ -54,7 +56,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
 
-        if ((op === "undo" || op === "history") && typeof args.filePath !== "string") {
+        if (op === "history" && typeof args.filePath !== "string") {
           throw new Error(`'filePath' is required for '${op}' op`);
         }
         if ((op === "checkpoint" || op === "restore") && typeof args.name !== "string") {

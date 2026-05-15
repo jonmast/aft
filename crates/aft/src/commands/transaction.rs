@@ -61,6 +61,7 @@ struct TransactionOpError {
 /// On success: `{ ok, files_modified, results: [{ file, syntax_valid, formatted, format_skipped_reason }] }`
 /// On failure: `{ error: { code: "transaction_failed", message, failed_operation, rolled_back } }`
 pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Parse operations ---
     let operations = match req.params.get("operations").and_then(|v| v.as_array()) {
         Some(ops) => ops,
@@ -109,7 +110,7 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
             // Snapshot existing file — scoped borrow (D029)
             let snapshot_result = {
                 let mut store = ctx.backup().borrow_mut();
-                store.snapshot(req.session(), &op.file, "transaction")
+                store.snapshot_with_op(req.session(), &op.file, "transaction", Some(&op_id))
             };
             if let Err(e) = snapshot_result {
                 return Response::error(&req.id, e.code(), e.to_string());

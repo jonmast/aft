@@ -215,6 +215,31 @@ describe("permission audit regressions", () => {
     expect(calls[0]?.command).toBe("undo");
   });
 
+  test("aft_safety undo without filePath calls bridge without file param", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, operation: true }));
+
+    const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls).toHaveLength(0);
+    expect(calls[0]?.command).toBe("undo");
+    expect(calls[0]?.params).not.toHaveProperty("file");
+  });
+
+  test("aft_safety undo with filePath still passes file param", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const sdkCtx = createSdkContext(project, recordingAsk([]));
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, backup_id: "b1" }));
+
+    await tools.aft_safety.execute({ op: "undo", filePath: "inside.ts" }, sdkCtx);
+
+    expect(calls[0]?.command).toBe("undo");
+    expect(calls[0]?.params).toMatchObject({ file: "inside.ts" });
+  });
+
   test("ast_grep_search denies external paths before bridge execution", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const sdkCtx = createSdkContext(

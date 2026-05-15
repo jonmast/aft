@@ -17,6 +17,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, destination, moved, backup_id }`
 pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -93,6 +94,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         src_path.as_path(),
         "move_file: pre-move backup",
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

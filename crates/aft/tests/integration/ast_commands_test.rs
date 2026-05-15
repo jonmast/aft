@@ -182,6 +182,59 @@ fn ast_replace_replaces_all_matches_across_multiple_files() {
 }
 
 #[test]
+fn ast_replace_operation_undo_restores_all_touched_files() {
+    let project = setup_project(&[
+        ("src/one.ts", "console.log(alpha);\n"),
+        ("src/two.ts", "console.log(beta);\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-before-operation-undo",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "logger.info($ARG)",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+    assert_eq!(replace["success"], true, "replace: {replace:?}");
+    assert_eq!(
+        read_file(project.path(), "src/one.ts"),
+        "logger.info(alpha);\n"
+    );
+    assert_eq!(
+        read_file(project.path(), "src/two.ts"),
+        "logger.info(beta);\n"
+    );
+
+    let undo = send(
+        &mut aft,
+        json!({
+            "id": "undo-ast-operation",
+            "command": "undo",
+        }),
+    );
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert_eq!(undo["restored_count"], 2);
+    assert_eq!(
+        read_file(project.path(), "src/one.ts"),
+        "console.log(alpha);\n"
+    );
+    assert_eq!(
+        read_file(project.path(), "src/two.ts"),
+        "console.log(beta);\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn ast_replace_dry_run_reports_counts_without_writing_files() {
     let original = "console.log(first);\nconsole.log(second);\n";
     let project = setup_project(&[("sample.ts", original)]);

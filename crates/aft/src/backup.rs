@@ -11,7 +11,7 @@ const MAX_UNDO_DEPTH: usize = 20;
 ///
 /// Bump this when the `meta.json` shape changes. Readers check the field and
 /// refuse or migrate older versions instead of misinterpreting them.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
@@ -20,6 +20,20 @@ pub struct BackupEntry {
     pub content: String,
     pub timestamp: u64,
     pub description: String,
+    pub op_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoredOperation {
+    pub op_id: String,
+    pub restored: Vec<RestoredFile>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoredFile {
+    pub path: PathBuf,
+    pub backup_id: String,
 }
 
 /// Per-(session, file) undo store with optional disk persistence.
@@ -95,6 +109,19 @@ impl BackupStore {
         path: &Path,
         description: &str,
     ) -> Result<String, AftError> {
+        self.snapshot_with_op(session, path, description, None)
+    }
+
+    /// Snapshot the current contents of `path` under the given session namespace,
+    /// optionally tagging it with an operation id shared by all files touched by
+    /// one mutating tool call.
+    pub fn snapshot_with_op(
+        &mut self,
+        session: &str,
+        path: &Path,
+        description: &str,
+        op_id: Option<&str>,
+    ) -> Result<String, AftError> {
         let content = std::fs::read_to_string(path).map_err(|_| AftError::FileNotFound {
             path: path.display().to_string(),
         })?;
@@ -106,6 +133,7 @@ impl BackupStore {
             content,
             timestamp: current_timestamp(),
             description: description.to_string(),
+            op_id: op_id.map(str::to_string),
         };
 
         let session_entries = self.entries.entry(session.to_string()).or_default();
@@ -121,6 +149,85 @@ impl BackupStore {
         self.touch_session(session);
 
         Ok(id)
+    }
+
+    /// Restore every top-of-stack backup entry belonging to the most recent
+    /// operation in this session.
+    pub fn restore_last_operation(&mut self, session: &str) -> Result<RestoredOperation, AftError> {
+        let disk_keys: Vec<PathBuf> = self
+            .disk_index
+            .get(session)
+            .map(|files| files.keys().cloned().collect())
+            .unwrap_or_default();
+        for key in disk_keys {
+            self.load_from_disk_if_needed(session, &key);
+        }
+
+        let mut latest: Option<((u64, u64), String)> = None;
+        if let Some(files) = self.entries.get(session) {
+            for stack in files.values() {
+                for entry in stack {
+                    if let Some(op_id) = &entry.op_id {
+                        let seq = backup_sequence(&entry.backup_id).unwrap_or(0);
+                        let order = (entry.timestamp, seq);
+                        if latest
+                            .as_ref()
+                            .map_or(true, |(latest_order, _)| order > *latest_order)
+                        {
+                            latest = Some((order, op_id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some((_, op_id)) = latest else {
+            return Err(AftError::NoUndoHistory {
+                path: "operation".to_string(),
+            });
+        };
+
+        let keys_to_restore: Vec<PathBuf> = self
+            .entries
+            .get(session)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|(key, stack)| {
+                        stack.last().and_then(|entry| {
+                            (entry.op_id.as_deref() == Some(op_id.as_str())).then(|| key.clone())
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if keys_to_restore.is_empty() {
+            return Err(AftError::NoUndoHistory {
+                path: "operation".to_string(),
+            });
+        }
+
+        let mut restored = Vec::new();
+        let mut warnings = Vec::new();
+        for key in keys_to_restore {
+            let warning = self.check_external_modification(session, &key, &key);
+            let (entry, _) = self.do_restore(session, &key, &key)?;
+            if let Some(warning) = warning {
+                warnings.push(format!("{}: {}", key.display(), warning));
+            }
+            restored.push(RestoredFile {
+                path: key,
+                backup_id: entry.backup_id,
+            });
+        }
+        self.touch_session(session);
+
+        Ok(RestoredOperation {
+            op_id,
+            restored,
+            warnings,
+        })
     }
 
     /// Pop the most recent backup for `(session, path)` and restore the file.
@@ -492,9 +599,26 @@ impl BackupStore {
             Err(_) => return,
         };
         if let Some(obj) = parsed.as_object_mut() {
-            obj.entry("schema_version")
-                .or_insert(serde_json::json!(SCHEMA_VERSION));
+            let count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            obj.insert(
+                "schema_version".to_string(),
+                serde_json::json!(SCHEMA_VERSION),
+            );
             obj.insert("session_id".to_string(), serde_json::json!(session_id));
+            obj.entry("entries").or_insert_with(|| {
+                serde_json::Value::Array(
+                    (0..count)
+                        .map(|i| {
+                            serde_json::json!({
+                                "backup_id": format!("disk-{}", i),
+                                "timestamp": 0,
+                                "description": "restored from disk",
+                                "op_id": null,
+                            })
+                        })
+                        .collect(),
+                )
+            });
         }
         if let Ok(s) = serde_json::to_string_pretty(&parsed) {
             let tmp = meta_path.with_extension("json.tmp");
@@ -592,14 +716,36 @@ impl BackupStore {
         };
 
         let mut entries = Vec::new();
+        let entry_meta = std::fs::read_to_string(meta.dir.join("meta.json"))
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|meta| meta.get("entries").and_then(|v| v.as_array()).cloned())
+            .unwrap_or_default();
+
         for i in 0..meta.count {
             let bak_path = meta.dir.join(format!("{}.bak", i));
             if let Ok(content) = std::fs::read_to_string(&bak_path) {
+                let meta = entry_meta.get(i);
                 entries.push(BackupEntry {
-                    backup_id: format!("disk-{}", i),
+                    backup_id: meta
+                        .and_then(|m| m.get("backup_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("disk-{}", i)),
                     content,
-                    timestamp: 0,
-                    description: "restored from disk".to_string(),
+                    timestamp: meta
+                        .and_then(|m| m.get("timestamp"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    description: meta
+                        .and_then(|m| m.get("description"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("restored from disk")
+                        .to_string(),
+                    op_id: meta
+                        .and_then(|m| m.get("op_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                 });
             }
         }
@@ -661,11 +807,23 @@ impl BackupStore {
             }
         }
 
+        let entries: Vec<serde_json::Value> = stack
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "backup_id": entry.backup_id,
+                    "timestamp": entry.timestamp,
+                    "description": entry.description,
+                    "op_id": entry.op_id,
+                })
+            })
+            .collect();
         let meta = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "session_id": session,
             "path": key.display().to_string(),
             "count": stack.len(),
+            "entries": entries,
         });
         let meta_path = dir.join("meta.json");
         let meta_tmp = dir.join("meta.json.tmp");
@@ -718,6 +876,17 @@ pub fn hash_session(session: &str) -> String {
     stable_hash_16(session.as_bytes())
 }
 
+pub fn new_op_id() -> String {
+    let mut bytes = [0u8; 4];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes = current_timestamp().to_le_bytes()[..4]
+            .try_into()
+            .unwrap_or([0; 4]);
+    }
+    let rand = u32::from_le_bytes(bytes);
+    format!("op-{}-{:08x}", current_timestamp() * 1000, rand)
+}
+
 fn canonicalize_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|err| {
         log::debug!(
@@ -742,6 +911,13 @@ fn stable_hash_16(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{:02x}", byte))
         .collect()
+}
+
+fn backup_sequence(backup_id: &str) -> Option<u64> {
+    backup_id
+        .strip_prefix("backup-")
+        .or_else(|| backup_id.strip_prefix("disk-"))
+        .and_then(|s| s.parse().ok())
 }
 
 #[cfg(test)]
@@ -996,5 +1172,132 @@ mod tests {
 
         assert!(!stale_session_dir.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_last_operation_restores_all_top_entries_for_same_op() {
+        let path_a = temp_file("op_restore_a.txt", "a1");
+        let path_b = temp_file("op_restore_b.txt", "b1");
+        let mut store = BackupStore::new();
+        let op_id = "op-test-00000001";
+
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_a, "a", Some(op_id))
+            .unwrap();
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_b, "b", Some(op_id))
+            .unwrap();
+        fs::write(&path_a, "a2").unwrap();
+        fs::write(&path_b, "b2").unwrap();
+
+        let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(restored.op_id, op_id);
+        assert_eq!(restored.restored.len(), 2);
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "a1");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
+    }
+
+    #[test]
+    fn restore_last_operation_restores_only_most_recent_op() {
+        let path_a = temp_file("op_recent_a.txt", "a1");
+        let path_b = temp_file("op_recent_b.txt", "b1");
+        let mut store = BackupStore::new();
+
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_a, "older", Some("op-older"))
+            .unwrap();
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_b, "newer", Some("op-newer"))
+            .unwrap();
+        fs::write(&path_a, "a2").unwrap();
+        fs::write(&path_b, "b2").unwrap();
+
+        let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(restored.op_id, "op-newer");
+        assert_eq!(restored.restored.len(), 1);
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "a2");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
+    }
+
+    #[test]
+    fn restore_last_operation_ignores_legacy_entries_without_op_id() {
+        let path = temp_file("op_legacy_none.txt", "v1");
+        let mut store = BackupStore::new();
+
+        store.snapshot(DEFAULT_SESSION_ID, &path, "legacy").unwrap();
+        fs::write(&path, "v2").unwrap();
+
+        let err = store.restore_last_operation(DEFAULT_SESSION_ID);
+        assert!(matches!(err, Err(AftError::NoUndoHistory { .. })));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v2");
+    }
+
+    #[test]
+    fn schema_v2_meta_loads_with_none_op_id_and_persists_as_v3() {
+        let dir = std::env::temp_dir().join("aft_backup_v2_to_v3_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = temp_file("v2_to_v3.txt", "original");
+        let key = canonicalize_key(&file_path);
+        let session_dir = dir
+            .join("backups")
+            .join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let path_dir = session_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::write(path_dir.join("0.bak"), "original").unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "session_id": DEFAULT_SESSION_ID,
+                "last_accessed": current_timestamp(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            path_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "session_id": DEFAULT_SESSION_ID,
+                "path": key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.clone(), 72);
+        assert!(store.load_from_disk_if_needed(DEFAULT_SESSION_ID, &key));
+        let history = store.history(DEFAULT_SESSION_ID, &file_path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op_id, None);
+
+        fs::write(&file_path, "second").unwrap();
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &file_path, "second", Some("op-v3"))
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path_dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(written["schema_version"], SCHEMA_VERSION);
+        assert_eq!(written["entries"][0]["op_id"], serde_json::Value::Null);
+        assert_eq!(written["entries"][1]["op_id"], "op-v3");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_file_restore_latest_still_works_with_op_ids() {
+        let path = temp_file("op_per_file.txt", "v1");
+        let mut store = BackupStore::new();
+
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path, "op", Some("op-file"))
+            .unwrap();
+        fs::write(&path, "v2").unwrap();
+
+        let (entry, _) = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
+        assert_eq!(entry.op_id.as_deref(), Some("op-file"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v1");
     }
 }

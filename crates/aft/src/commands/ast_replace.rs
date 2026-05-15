@@ -67,6 +67,7 @@ fn dry_run_diff(original: &str, proposed: &str, path: &Path) -> DryRunResult {
 /// Returns (dry_run=false):
 ///   `{ ok: true, files: [{ file, replacements, backup_id? }], total_replacements: N, total_files: N, files_with_matches: N, files_searched: N }`
 pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let pattern = match req.params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
         None => {
@@ -273,7 +274,12 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             let backup_id = ctx
                 .backup()
                 .borrow_mut()
-                .snapshot(req.session(), validated_path.as_path(), "ast_replace")
+                .snapshot_with_op(
+                    req.session(),
+                    validated_path.as_path(),
+                    "ast_replace",
+                    Some(&op_id),
+                )
                 .ok();
 
             match std::fs::write(validated_path.as_path(), &change.new_content) {

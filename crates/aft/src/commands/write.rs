@@ -17,6 +17,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, created, syntax_valid?, backup_id? }`
 pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -73,6 +74,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         path.as_path(),
         "write: pre-write backup",
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

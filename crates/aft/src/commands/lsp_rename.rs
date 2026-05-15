@@ -195,6 +195,7 @@ fn apply_workspace_edit(
     session: &str,
     req_id: &str,
 ) -> Result<Vec<FileChange>, Response> {
+    let op_id = crate::backup::new_op_id();
     let file_changes = collect_workspace_edit_changes(edit, ctx, req_id)?;
     if file_changes.is_empty() {
         return Err(Response::error(
@@ -204,7 +205,7 @@ fn apply_workspace_edit(
         ));
     }
 
-    let snapshotted = snapshot_affected_files(&file_changes, session, ctx)
+    let snapshotted = snapshot_affected_files(&file_changes, session, ctx, &op_id)
         .map_err(|err| Response::error(req_id, "lsp_error", format!("rename failed: {err}")))?;
     let result = apply_collected_changes(&file_changes, ctx);
 
@@ -304,13 +305,14 @@ fn snapshot_affected_files(
     file_changes: &BTreeMap<PathBuf, Vec<PendingTextEdit>>,
     session: &str,
     ctx: &AppContext,
+    op_id: &str,
 ) -> Result<Vec<PathBuf>, LspError> {
     let mut backup = ctx.backup().borrow_mut();
     let mut snapshotted = Vec::with_capacity(file_changes.len());
 
     for path in file_changes.keys() {
         backup
-            .snapshot(session, path, "lsp_rename")
+            .snapshot_with_op(session, path, "lsp_rename", Some(op_id))
             .map_err(|err| {
                 LspError::NotFound(format!("failed to snapshot '{}': {err}", path.display()))
             })?;

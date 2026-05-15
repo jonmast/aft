@@ -21,6 +21,7 @@ use crate::symbols::Range;
 /// Returns on success: `{ file, symbol, operation, range, new_range?, syntax_valid, backup_id }`
 /// Returns on ambiguity: `{ code: "ambiguous_symbol", candidates: [...] }`
 pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -255,6 +256,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &path,
         &format!("edit_symbol: {} {}", operation, symbol_name),
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {

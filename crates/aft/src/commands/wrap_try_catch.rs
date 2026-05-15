@@ -20,6 +20,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, target, syntax_valid?, backup_id? }`
 pub fn handle_wrap_try_catch(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -183,13 +184,18 @@ pub fn handle_wrap_try_catch(req: &RawRequest, ctx: &AppContext) -> Response {
     );
 
     // --- Auto-backup ---
-    let backup_id =
-        match edit::auto_backup(ctx, req.session(), &path, "wrap_try_catch: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "wrap_try_catch: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     // --- Replace ---
     let new_source = match edit::replace_byte_range(&source, body_node.0, body_node.1, &wrapped) {

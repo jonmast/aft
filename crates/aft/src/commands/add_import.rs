@@ -23,6 +23,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, added, module, group, already_present?, syntax_valid?, backup_id? }`
 pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -160,13 +161,18 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Auto-backup ---
-    let backup_id =
-        match edit::auto_backup(ctx, req.session(), &path, "add_import: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "add_import: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     // --- Insert ---
     let new_source =
