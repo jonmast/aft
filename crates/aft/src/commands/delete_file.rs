@@ -150,8 +150,8 @@ fn delete_one_or_dir(
 /// Recursively delete a directory after backing up every file inside.
 ///
 /// Every file backup uses the same `op_id` so a single `aft_safety undo`
-/// restores the entire tree atomically. Symlinks are tracked but not
-/// followed into subdirectories (avoids loops).
+/// restores the entire tree atomically. Guardrails reject symlinks and empty
+/// directories until backup metadata can preserve those node types.
 fn delete_directory(
     req: &RawRequest,
     ctx: &AppContext,
@@ -159,6 +159,24 @@ fn delete_directory(
     original: &str,
     op_id: &str,
 ) -> Result<serde_json::Value, Response> {
+    let unsupported_paths = validate_directory_for_recursive_delete(path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!(
+                "delete_file: failed to validate directory '{}': {}",
+                original, e
+            ),
+        )
+    })?;
+    if !unsupported_paths.is_empty() {
+        return Err(Response::error(
+            &req.id,
+            "unsupported_directory_contents",
+            unsupported_directory_contents_message(&unsupported_paths),
+        ));
+    }
+
     let mut files_to_backup: Vec<PathBuf> = Vec::new();
     if let Err(e) = collect_files(path, &mut files_to_backup) {
         return Err(Response::error(
@@ -227,6 +245,68 @@ fn delete_directory(
         "files_deleted": files_to_backup.len(),
         "backup_ids": backup_ids,
     }))
+}
+
+/// Guardrail for recursive deletes: the backup/undo format currently records
+/// only file contents. Reject directory trees that contain entries undo cannot
+/// restore atomically (symlinks and empty directories) before taking backups or
+/// deleting anything.
+fn validate_directory_for_recursive_delete(dir: &Path) -> std::io::Result<Vec<String>> {
+    let mut unsupported_paths = Vec::new();
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        unsupported_paths.push(dir.display().to_string());
+        return Ok(unsupported_paths);
+    }
+    validate_directory_entries(dir, &mut unsupported_paths)?;
+    Ok(unsupported_paths)
+}
+
+fn validate_directory_entries(
+    dir: &Path,
+    unsupported_paths: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        entries.push(entry?);
+    }
+
+    if entries.is_empty() {
+        unsupported_paths.push(dir.display().to_string());
+        return Ok(());
+    }
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            unsupported_paths.push(path.display().to_string());
+        } else if file_type.is_dir() {
+            validate_directory_entries(&path, unsupported_paths)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn unsupported_directory_contents_message(paths: &[String]) -> String {
+    const MAX_PATHS: usize = 5;
+
+    let mut message = String::from(
+        "aft_delete with recursive: true does not yet support directory trees containing symlinks or empty directories. Restore would not recover these entries atomically.",
+    );
+    message.push_str(" Offending path(s): ");
+    message.push_str(
+        &paths
+            .iter()
+            .take(MAX_PATHS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if paths.len() > MAX_PATHS {
+        message.push_str(&format!(", ... and {} more", paths.len() - MAX_PATHS));
+    }
+    message
 }
 
 /// Walk a directory recursively, collecting all regular file paths.
