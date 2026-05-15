@@ -17,216 +17,87 @@ env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 jobs:
-  test:
-    name: Test
-    # Pin to ubuntu-22.04 to match tests.yml — the previous ubuntu-latest
-    # mismatch contributed to release runs that ran far longer than PR-time
-    # CI on the same code (no shared rust-cache between PR and release runs
-    # either). Keeping both workflows on the same image + cache prevents
-    # surprise behavior differences at release time.
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v5
+  # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e).
+  # Defined as a reusable workflow so tests.yml shares the exact same
+  # workload. Release mode (strict=true) makes EVERY job blocking — including
+  # the Windows jobs that are non-blocking at PR time. If a Windows-only
+  # regression slipped past PR-time CI, this gate catches it before publish.
+  unit:
+    name: Unit
+    uses: ./.github/workflows/_unit-suite.yml
+    with:
+      strict: true
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-
-      - name: Rust tests
-        run: cargo test --workspace
-
-      - name: Build aft binary (needed for e2e tests)
-        run: cargo build -p agent-file-tools
-
-      - name: Install JS dependencies
-        run: bun install
-
-      - name: Build aft-bridge (consumers need its dist/ for typecheck)
-        # Workspace consumers (opencode-plugin, pi-plugin) import from
-        # @cortexkit/aft-bridge. Bun resolves to the workspace package whose
-        # dist/ doesn't exist yet (gitignored). Build it first so tsc can
-        # find its .d.ts files. Required because v0.19.0 hasn't published yet
-        # (publish-npm runs AFTER this Test job).
-        run: bun run --cwd packages/aft-bridge build
-
-      - name: Build pi-plugin dist (Pi RPC tests need it)
-        # `tests/pi-rpc` spawns real Pi processes that load
-        # packages/pi-plugin/dist/index.js. Build it before `bun run test`
-        # so the recursive workspace test pass picks up the fresh dist
-        # instead of failing fast on missing entrypoint.
-        run: bun run --cwd packages/pi-plugin build
-
-      - name: TypeScript typecheck
-        run: bun run typecheck
-
-      - name: Plugin tests
-        run: bun run test
-
-      - name: Lint
-        run: bun run lint
-
-      - name: Build all JS packages (gate publish)
-        run: bun run --filter '*' build
-
-  # macOS unit-test gate — mirrors the Linux `test` job's cargo + plugin test
-  # coverage on a real macOS runner. The build-darwin-* jobs below only run
-  # `cargo build --release`, not `cargo test`, so this is the only place where
-  # macOS-specific code paths are actually exercised at release time:
-  #   - FSEvents watcher behavior (different coalescing latency from inotify)
-  #   - /var vs /private/var symlink canonicalization
-  #   - Broken-symlink-chain fallback in context.rs
-  #   - bash_background SIGTERM behavior on Apple Silicon
-  # Lint and `bun run --filter '*' build` only run in the Linux `test` job —
-  # they are platform-independent so duplicating them on macOS adds no signal.
-  test-macos:
-    name: Test (macOS)
-    runs-on: macos-latest
-    # Mirror tests.yml's rust-macos timeout. Without this the job inherits
-    # GitHub Actions' 6h default, which means a flaky macos-latest runner
-    # that hangs (e.g. stuck network call, frozen test process) keeps the
-    # whole release blocked for 6 hours before failing. 25min is plenty
-    # for the actual workload (~3min on a healthy runner) and gives us
-    # logs instead of a runner timeout.
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Intentionally NO Swatinem/rust-cache on macOS jobs.
-      # We have observed repeatedly that rust-cache restore on macos-latest
-      # overwrites the just-installed ~/.cargo/bin/cargo shim with stale
-      # cached bytes — the shim then misreads its own argv as if it were
-      # `rustup-init`, producing:
-      #   error: unexpected argument 'test' found
-      #   Usage: rustup-init[EXE] [OPTIONS]
-      # Failures observed in release runs 25839773442 and 25840332625.
-      # Cold cargo build on macos-latest is ~3min — acceptable cost for
-      # release reliability. If we ever bring caching back, restore must
-      # happen BEFORE dtolnay/rust-toolchain so the toolchain install wins.
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-
-      - name: Rust tests
-        run: cargo test --workspace
-        env:
-          AFT_TEST_DIAG: "1"
-
-      - name: Install JS dependencies
-        run: bun install
-
-      - name: Build aft-bridge (consumers need its dist/ for typecheck)
-        run: bun run --cwd packages/aft-bridge build
-
-      - name: Build pi-plugin dist (Pi RPC tests need it)
-        # See same step in `test` job above. Same reason: workspace
-        # `bun run test` recurses into tests/pi-rpc which spawns Pi
-        # against packages/pi-plugin/dist/index.js.
-        run: bun run --cwd packages/pi-plugin build
-
-      - name: TypeScript typecheck
-        run: bun run typecheck
-
-      - name: Plugin tests
-        run: bun run test
-        env:
-          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-
-  # Bash permission flow on Windows — release-time mirror of the
-  # bun-windows-bash job in tests.yml. Verifies the runAsk + Effect runtime
-  # path through real BinaryBridge spawning aft.exe over stdio NDJSON on
-  # the Windows process model. Scoped to bash.test.ts only because the
-  # full bun suite blocks on integration-harness JSON-path escape issues
-  # (see rust-windows comment in tests.yml). continue-on-error is ON for
-  # now; promote to required once we have stable green runs.
-  test-windows-bash:
-    name: Test (Windows — bash permission e2e)
-    runs-on: windows-2022
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-
-      - name: Install workspace deps
-        run: bun install --frozen-lockfile
-        shell: pwsh
-
-      - name: Build aft-bridge dist (workspace consumers depend on it)
-        run: bun run --cwd packages/aft-bridge build
-        shell: pwsh
-
-      - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
-        run: cargo build -p agent-file-tools
-        shell: pwsh
-
-      - name: Bun test (bash permission flow — full bridge + plugin + Rust)
-        run: bun test src/__tests__/e2e/bash.test.ts
-        working-directory: packages/opencode-plugin
-        shell: pwsh
-        env:
-          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-
-  # Run the full E2E matrix (Linux Docker + Windows native + macOS native) at
-  # release time. Reuses the same workflow tests.yml runs at PR time — single
-  # source of truth, so PR-time and release-time e2e can never drift.
-  # Build/publish jobs below `needs:` this job, so an e2e regression blocks
-  # the release.
+  # Run the full E2E matrix (Linux Docker + Pi RPC + Windows native +
+  # macOS native) at release time. Reuses the same workflow tests.yml runs
+  # at PR time — single source of truth, so PR-time and release-time e2e
+  # can never drift. Build/publish jobs below `needs:` this job, so an e2e
+  # regression blocks the release.
   e2e:
     name: E2E
-    needs: [test, test-macos]
+    needs: unit
     uses: ./.github/workflows/_e2e-suite.yml
 
   publish-crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: [test, e2e]
+    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - uses: dtolnay/rust-toolchain@stable
 
+      # Sync Cargo.toml version to match the tag. Without this, `cargo publish`
+      # tries to publish whatever version is in HEAD's Cargo.toml — which is
+      # last-released-version on tag pushes (the tag does NOT carry a separate
+      # version commit; release.sh commits the version bump locally, but if
+      # someone retags HEAD without running release.sh, Cargo.toml stays
+      # stale). Mirrors the same step in publish-npm-platforms.
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
       - name: Publish to crates.io
-        # Allow re-runs of the same tag: treat "already exists" as success.
-        run: cargo publish --package agent-file-tools || { ec=$?; cargo publish --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && exit 0 || exit $ec; }
+        # Allow re-runs of the same tag: treat "already exists" as success
+        # ONLY if the version we're publishing matches the tag. Otherwise the
+        # fallback silently masks the version-mismatch bug (we try to publish
+        # vN, it already exists, we say success even though we wanted vN+1).
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' crates/aft/Cargo.toml | head -1 | sed -E 's/version = "([^"]+)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME wants $TAG_VERSION but Cargo.toml has $CARGO_VERSION after version-sync. version-sync.mjs broken?"
+            exit 1
+          fi
+          cargo publish --package agent-file-tools \
+            || { ec=$?; cargo publish --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && exit 0 || exit $ec; }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   build-darwin-arm64:
     name: Build macOS ARM64
     runs-on: macos-latest
-    needs: [test, e2e]
+    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      # Safety net: if someone retags HEAD without running release.sh,
+      # Cargo.toml.version stays stale. Bake the tag's version into the
+      # binary before cargo build so `aft --version` matches what the
+      # plugin expects.
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin
@@ -243,13 +114,20 @@ jobs:
   build-darwin-x64:
     name: Build macOS x64
     runs-on: macos-latest
-    needs: [test, e2e]
+    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin
@@ -266,13 +144,20 @@ jobs:
   build-linux-arm64:
     name: Build Linux ARM64
     runs-on: ubuntu-latest
-    needs: [test, e2e]
+    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
 
       - name: Install cross
         run: cargo install cross --version 0.2.5 --locked
@@ -295,11 +180,18 @@ jobs:
     # and any distro with GLIBC >= 2.35. Using ubuntu-latest (24.04) would
     # require GLIBC 2.39 and break older LTS users.
     runs-on: ubuntu-22.04
-    needs: [test, e2e]
+    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
 
       # Native x64 build on Ubuntu runner — no cross-compilation needed.
       # Uses gnu target (not musl) so dlopen works for ONNX Runtime loading.
@@ -315,13 +207,21 @@ jobs:
   build-win32-x64:
     name: Build Windows x64
     runs-on: windows-latest
-    needs: [test, e2e]
+    needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+        shell: pwsh
 
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc
