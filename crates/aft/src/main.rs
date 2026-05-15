@@ -7,6 +7,9 @@ use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     // Handle --version flag before anything else
@@ -69,9 +72,41 @@ fn main() {
         },
     ))));
 
-    let stdin = io::stdin();
-    let reader = stdin.lock();
-    for line_result in reader.lines() {
+    // Stdin is read by a dedicated thread that forwards lines through a
+    // channel. The main thread does recv_timeout so it wakes periodically
+    // even when no agent traffic is arriving — that periodic wake runs
+    // the drain_* functions so background-build channel events (e.g.
+    // SemanticIndexEvent::Ready) get processed and their status_changed
+    // push frames emitted. Without the wake, the sidebar can stay stuck
+    // on "loading" indefinitely until the next request happens to arrive.
+    const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+    let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let reader = stdin.lock();
+        for line_result in reader.lines() {
+            if line_tx.send(line_result).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let line_result = match line_rx.recv_timeout(DRAIN_INTERVAL) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Periodic drain so push frames flow even without requests.
+                // Cheap on the idle path: each drain just checks try_recv
+                // on a channel and bails if empty.
+                drain_search_index_events(&ctx);
+                drain_semantic_index_events(&ctx);
+                drain_watcher_events(&ctx);
+                drain_lsp_events(&ctx);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
