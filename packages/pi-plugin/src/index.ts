@@ -557,6 +557,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         );
         return;
       }
+      // Await ONNX runtime resolution BEFORE spawning the bridge — otherwise
+      // the bridge starts without _ort_dylib_dir on its configure overrides,
+      // and Rust falls back to a system-path dlopen("libonnxruntime.dylib")
+      // that almost always fails on macOS / Windows (the user has the runtime
+      // managed in `<storage_dir>/onnxruntime/`, not on the system loader
+      // path). The race symptom in the wild: log shows
+      //   Spawning binary: ...
+      //   ONNX Runtime ready at ...   <- 4ms later
+      //   failed to build semantic index: ONNX Runtime not found
+      // because the bridge spawn at t=0 has no _ort_dylib_dir yet, and once
+      // it's set on the pool only NEW bridges pick it up. Mirror the
+      // OpenCode plugin: cap at 60s so a slow/broken download doesn't block
+      // the warmup permanently; the bridge still spawns without ORT after
+      // the cap and semantic just fails honestly.
+      if (onnxRuntimePromise) {
+        await Promise.race([
+          onnxRuntimePromise,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 60_000)),
+        ]);
+      }
       const bridge = pool.getBridge(cwd);
       // No session_id: runs before any user session exists; configure
       // threads spawned by this warmup will log with no [ses_xxx] prefix.
