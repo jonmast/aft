@@ -1097,6 +1097,7 @@ mod tests {
     use super::*;
     use crate::protocol::DEFAULT_SESSION_ID;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_file(name: &str, content: &str) -> PathBuf {
@@ -1370,6 +1371,11 @@ mod tests {
         assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
     }
 
+    // Uses Unix-specific PermissionsExt::set_mode to make a target file
+    // read-only and force the Phase 1 write to fail. The atomicity logic
+    // it exercises is platform-independent — Windows has different
+    // mechanisms for forcing write failures, covered separately.
+    #[cfg(unix)]
     #[test]
     fn restore_last_operation_is_atomic_when_a_write_fails() {
         let dir = std::env::temp_dir().join("aft_backup_tests_atomic_restore");
