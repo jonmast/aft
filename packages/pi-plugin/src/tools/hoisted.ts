@@ -25,16 +25,16 @@ import {
   type ExtensionAPI,
   renderDiff,
   type Theme,
-} from "@mariozechner/pi-coding-agent";
-import { type Component, Container, Spacer, Text } from "@mariozechner/pi-tui";
-import { type Static, Type } from "@sinclair/typebox";
+} from "@earendil-works/pi-coding-agent";
+import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
 
 /**
  * Local shape for Pi's render context — the real type is exposed by
- * `@mariozechner/pi-coding-agent`'s internals but not publicly exported.
+ * `@earendil-works/pi-coding-agent`'s internals but not publicly exported.
  * We only read `lastComponent` and `isError` here; everything else is ignored.
  */
 interface RenderContextLike {

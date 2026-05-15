@@ -3,7 +3,7 @@
  */
 
 import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
-import type { AgentToolResult, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PluginContext } from "../types.js";
 

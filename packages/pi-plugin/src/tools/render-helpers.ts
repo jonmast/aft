@@ -3,8 +3,8 @@
  */
 
 import { homedir } from "node:os";
-import { type AgentToolResult, renderDiff, type Theme } from "@mariozechner/pi-coding-agent";
-import { type Component, Container, Spacer, Text } from "@mariozechner/pi-tui";
+import { type AgentToolResult, renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
+import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 export interface RenderContextLike<TArgs = unknown> {
   args: TArgs;

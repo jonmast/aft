@@ -5,7 +5,7 @@
 // bridge-extraction refactor (see ctx_note #53).
 // ---------------------------------------------------------------------------
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "./config.js";
 import { log } from "./logger.js";
 

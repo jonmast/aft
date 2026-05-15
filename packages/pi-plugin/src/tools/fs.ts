@@ -3,8 +3,8 @@
  * Both go through Rust so backups and checkpoint rollback work the same way.
  */
 
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, resolveSessionId, textResult } from "./_shared.js";
 import {

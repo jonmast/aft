@@ -3,9 +3,9 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   Theme,
-} from "@mariozechner/pi-coding-agent";
-import { Container, Spacer, Text } from "@mariozechner/pi-tui";
-import { type Static, Type } from "@sinclair/typebox";
+} from "@earendil-works/pi-coding-agent";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { type Static, Type } from "typebox";
 import { trackBgTask } from "../bg-notifications.js";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, resolveSessionId } from "./_shared.js";
@@ -107,7 +107,7 @@ interface BashKillDetails {
 
 /** Local shape for Pi's render context — mirrors hoisted.ts pattern. */
 interface RenderContextLike {
-  lastComponent: import("@mariozechner/pi-tui").Component | undefined;
+  lastComponent: import("@earendil-works/pi-tui").Component | undefined;
   isError: boolean;
 }
 
@@ -119,12 +119,12 @@ function truncateToVisualLines(text: string, maxLines: number): string {
 }
 
 /** Reuse a compatible Text component from last render, or create fresh. */
-function reuseText(last: import("@mariozechner/pi-tui").Component | undefined): Text {
+function reuseText(last: import("@earendil-works/pi-tui").Component | undefined): Text {
   return last instanceof Text ? last : new Text("", 0, 0);
 }
 
 /** Reuse a compatible Container from last render, or create fresh. */
-function reuseContainer(last: import("@mariozechner/pi-tui").Component | undefined): Container {
+function reuseContainer(last: import("@earendil-works/pi-tui").Component | undefined): Container {
   return last instanceof Container ? last : new Container();
 }
 
@@ -466,7 +466,7 @@ function renderBashResult(
   result: AgentToolResult<BashDetails>,
   theme: Theme,
   context: RenderContextLike,
-): import("@mariozechner/pi-tui").Component {
+): import("@earendil-works/pi-tui").Component {
   // Errors: red text with error details
   if (context.isError) {
     const errorText = result.content

@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
-import type { AgentToolResult, Theme } from "@mariozechner/pi-coding-agent";
-import type { Component } from "@mariozechner/pi-tui";
+import type { AgentToolResult, Theme } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import type { RenderContextLike } from "../tools/render-helpers.js";
 
 export const mockTheme = {

@@ -6,8 +6,8 @@
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fetchUrlToTempFile, formatZoomText } from "@cortexkit/aft-bridge";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
 import {

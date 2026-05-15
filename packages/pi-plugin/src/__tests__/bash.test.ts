@@ -10,8 +10,8 @@
 
 import { describe, expect, test } from "bun:test";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { Container, Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { registerBashTool } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
 

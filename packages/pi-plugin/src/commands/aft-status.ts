@@ -6,7 +6,7 @@
  * back to a notification.
  */
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { coerceAftStatus, formatStatusDialogMessage } from "../shared/status.js";
 import { bridgeFor, callBridge } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";

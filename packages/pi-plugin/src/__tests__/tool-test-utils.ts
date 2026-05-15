@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { PluginContext } from "../types.js";
 
 export interface MockToolDef {

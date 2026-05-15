@@ -26,7 +26,7 @@ function compareSemver(a: string, b: string): number {
 
 function resolvePiPackageJson(): string {
   try {
-    return require_.resolve("@mariozechner/pi-coding-agent/package.json");
+    return require_.resolve("@earendil-works/pi-coding-agent/package.json");
   } catch {
     const bunModules = join(REPO_ROOT, "node_modules/.bun");
     const prefix = "@mariozechner+pi-coding-agent@";
@@ -39,9 +39,9 @@ function resolvePiPackageJson(): string {
       .sort((a, b) => compareSemver(b.version, a.version));
     const best = candidates[0];
     if (best === undefined) {
-      throw new Error(`Could not locate @mariozechner/pi-coding-agent under ${bunModules}`);
+      throw new Error(`Could not locate @earendil-works/pi-coding-agent under ${bunModules}`);
     }
-    return join(bunModules, best.name, "node_modules/@mariozechner/pi-coding-agent/package.json");
+    return join(bunModules, best.name, "node_modules/@earendil-works/pi-coding-agent/package.json");
   }
 }
 
