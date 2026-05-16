@@ -7,13 +7,14 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use rayon::prelude::*;
 use serde::Serialize;
+use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
-use crate::calls::extract_calls_full;
+use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
@@ -28,6 +29,12 @@ use crate::symbols::{Range, SymbolKind};
 type SharedPath = Arc<PathBuf>;
 type SharedStr = Arc<str>;
 type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
+type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
+
+static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 
 /// A single call site within a function body.
 #[derive(Debug, Clone)]
@@ -565,9 +572,15 @@ impl CallGraph {
             // Direct named import: import { foo } from './utils'
             if imp.names.iter().any(|name| name == short_name) {
                 if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
+                    let target_file = resolve_reexported_symbol_path(
+                        &resolved_path,
+                        short_name,
+                        &mut file_exports_symbol,
+                    )
+                    .unwrap_or(resolved_path);
                     // The name in the import is the original name from the source module
                     return EdgeResolution::Resolved {
-                        file: resolved_path,
+                        file: target_file,
                         symbol: short_name.to_owned(),
                     };
                 }
@@ -2150,6 +2163,37 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
         }
     }
 
+    let symbol_ranges: Vec<(usize, usize)> = symbols
+        .iter()
+        .map(|sym| {
+            (
+                line_col_to_byte(&source, sym.range.start_line, sym.range.start_col),
+                line_col_to_byte(&source, sym.range.end_line, sym.range.end_col),
+            )
+        })
+        .collect();
+
+    let top_level_sites: Vec<CallSite> =
+        collect_calls_full_with_ranges(root, &source, 0, source.len(), lang)
+            .into_iter()
+            .filter(|site| {
+                !symbol_ranges
+                    .iter()
+                    .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
+            })
+            .map(|site| CallSite {
+                callee_name: site.short,
+                full_callee: site.full,
+                line: site.line,
+                byte_start: site.byte_start,
+                byte_end: site.byte_end,
+            })
+            .collect();
+
+    if !top_level_sites.is_empty() {
+        calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
+    }
+
     let default_export = find_default_export(&source, root, path, lang);
 
     if let Some(default_export) = &default_export {
@@ -2214,6 +2258,22 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
                 signature: Some(first_line_signature(&source, &default_export.node)),
                 line: default_export.node.start_position().row as u32 + 1,
                 range: crate::parser::node_range(&default_export.node),
+            });
+    }
+    if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL) {
+        symbol_metadata
+            .entry(TOP_LEVEL_SYMBOL.to_string())
+            .or_insert(SymbolMeta {
+                kind: SymbolKind::Function,
+                exported: false,
+                signature: None,
+                line: 1,
+                range: Range {
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 0,
+                    end_col: 0,
+                },
             });
     }
 
@@ -2453,6 +2513,83 @@ fn find_child_by_kind<'a>(
     None
 }
 
+#[derive(Debug, Clone)]
+struct CallSiteWithRange {
+    full: String,
+    short: String,
+    line: u32,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+fn collect_calls_full_with_ranges(
+    root: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    lang: LangId,
+) -> Vec<CallSiteWithRange> {
+    let mut results = Vec::new();
+    let call_kinds = call_node_kinds(lang);
+    collect_calls_full_with_ranges_inner(
+        root,
+        source,
+        byte_start,
+        byte_end,
+        &call_kinds,
+        &mut results,
+    );
+    results
+}
+
+fn collect_calls_full_with_ranges_inner(
+    node: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    call_kinds: &[&str],
+    results: &mut Vec<CallSiteWithRange>,
+) {
+    let node_start = node.start_byte();
+    let node_end = node.end_byte();
+
+    if node_end <= byte_start || node_start >= byte_end {
+        return;
+    }
+
+    if call_kinds.contains(&node.kind()) && node_start >= byte_start && node_end <= byte_end {
+        if let (Some(full), Some(short)) = (
+            extract_full_callee(&node, source),
+            extract_callee_name(&node, source),
+        ) {
+            results.push(CallSiteWithRange {
+                full,
+                short,
+                line: node.start_position().row as u32 + 1,
+                byte_start: node_start,
+                byte_end: node_end,
+            });
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_calls_full_with_ranges_inner(
+                cursor.node(),
+                source,
+                byte_start,
+                byte_end,
+                call_kinds,
+                results,
+            );
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
 /// Extract full and short callee names from a call_expression node.
 fn extract_callee_names(node: tree_sitter::Node, source: &str) -> (Option<String>, Option<String>) {
     // The "function" field holds the callee
@@ -2479,12 +2616,24 @@ fn extract_callee_names(node: tree_sitter::Node, source: &str) -> (Option<String
 ///
 /// Tries common file extensions for TypeScript/JavaScript projects.
 pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
-    // Only handle relative imports
-    if !module_path.starts_with('.') {
+    if module_path.starts_with('.') {
+        return resolve_relative_module_path(from_dir, module_path);
+    }
+
+    if module_path.starts_with('/') {
         return None;
     }
 
+    resolve_workspace_module_path(from_dir, module_path)
+}
+
+fn resolve_relative_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
     let base = from_dir.join(module_path);
+    resolve_file_like_path(&base)
+}
+
+fn resolve_file_like_path(base: &Path) -> Option<PathBuf> {
+    let base = base.to_path_buf();
 
     // Try exact path first
     if base.is_file() {
@@ -2508,6 +2657,391 @@ pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<
     }
 
     None
+}
+
+fn resolve_workspace_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    let (package_name, subpath) = split_package_import(module_path)?;
+    let package_root = find_package_root_for_import(from_dir, &package_name)?;
+    resolve_package_entry(&package_root, &subpath)
+}
+
+fn split_package_import(module_path: &str) -> Option<(String, Option<String>)> {
+    let mut parts = module_path.split('/');
+    let first = parts.next()?;
+    if first.is_empty() {
+        return None;
+    }
+
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        if second.is_empty() {
+            return None;
+        }
+        let package_name = format!("{first}/{second}");
+        let subpath = parts.collect::<Vec<_>>().join("/");
+        let subpath = (!subpath.is_empty()).then_some(subpath);
+        Some((package_name, subpath))
+    } else {
+        let package_name = first.to_string();
+        let subpath = parts.collect::<Vec<_>>().join("/");
+        let subpath = (!subpath.is_empty()).then_some(subpath);
+        Some((package_name, subpath))
+    }
+}
+
+fn find_package_root_for_import(from_dir: &Path, package_name: &str) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        if package_json_name(dir).as_deref() == Some(package_name) {
+            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        current = dir.parent();
+    }
+
+    find_workspace_root(from_dir)
+        .and_then(|workspace_root| resolve_workspace_package(&workspace_root, package_name))
+}
+
+fn find_workspace_root(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        if is_workspace_root(dir) {
+            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn is_workspace_root(dir: &Path) -> bool {
+    package_json_value(dir)
+        .and_then(|value| value.get("workspaces").cloned())
+        .is_some()
+        || dir.join("bun.lock").is_file()
+        || dir.join("package-lock.json").is_file()
+}
+
+fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Option<PathBuf> {
+    let workspace_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let cache_key = (workspace_root.clone(), package_name.to_string());
+
+    if let Some(cached) = WORKSPACE_PACKAGE_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return cached;
+    }
+
+    let resolved = workspace_member_dirs(&workspace_root)
+        .into_iter()
+        .find(|dir| package_json_name(dir).as_deref() == Some(package_name))
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
+
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.insert(cache_key, resolved.clone());
+    }
+
+    resolved
+}
+
+fn workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(package_json) = package_json_value(workspace_root) else {
+        return Vec::new();
+    };
+
+    workspace_patterns(&package_json)
+        .into_iter()
+        .flat_map(|pattern| expand_workspace_pattern(workspace_root, &pattern))
+        .collect()
+}
+
+fn workspace_patterns(package_json: &Value) -> Vec<String> {
+    match package_json.get("workspaces") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect(),
+        Some(Value::Object(map)) => map
+            .get("packages")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn expand_workspace_pattern(workspace_root: &Path, pattern: &str) -> Vec<PathBuf> {
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        let parent = workspace_root.join(prefix);
+        return std::fs::read_dir(parent)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| path.join("package.json").is_file())
+            .collect();
+    }
+
+    let dir = workspace_root.join(pattern);
+    if dir.join("package.json").is_file() {
+        vec![dir]
+    } else {
+        Vec::new()
+    }
+}
+
+fn package_json_value(dir: &Path) -> Option<Value> {
+    let package_json = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    serde_json::from_str(&package_json).ok()
+}
+
+fn package_json_name(dir: &Path) -> Option<String> {
+    package_json_value(dir)?
+        .get("name")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_package_entry(package_root: &Path, subpath: &Option<String>) -> Option<PathBuf> {
+    let package_json = package_json_value(package_root).unwrap_or(Value::Null);
+
+    if let Some(exports) = package_json.get("exports") {
+        if let Some(target) = export_target_for_subpath(exports, subpath.as_deref()) {
+            if let Some(path) = resolve_package_target(package_root, &target) {
+                return Some(path);
+            }
+        }
+    }
+
+    if subpath.is_none() {
+        for field in ["module", "main"] {
+            if let Some(target) = package_json.get(field).and_then(Value::as_str) {
+                if let Some(path) = resolve_package_target(package_root, target) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    resolve_package_fallback(package_root, subpath.as_deref())
+}
+
+fn export_target_for_subpath(exports: &Value, subpath: Option<&str>) -> Option<String> {
+    let key = subpath
+        .map(|value| format!("./{value}"))
+        .unwrap_or_else(|| ".".to_string());
+
+    match exports {
+        Value::String(target) if key == "." => Some(target.clone()),
+        Value::Object(map) => {
+            if let Some(target) = map.get(&key).and_then(export_condition_target) {
+                return Some(target);
+            }
+
+            if let Some(target) = wildcard_export_target(map, &key) {
+                return Some(target);
+            }
+
+            if key == "." && !map.contains_key(".") && !map.keys().any(|k| k.starts_with("./")) {
+                return export_condition_target(exports);
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn wildcard_export_target(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    for (pattern, target) in map {
+        let Some(star_index) = pattern.find('*') else {
+            continue;
+        };
+        let (prefix, suffix_with_star) = pattern.split_at(star_index);
+        let suffix = &suffix_with_star[1..];
+        if !key.starts_with(prefix) || !key.ends_with(suffix) {
+            continue;
+        }
+        let matched = &key[prefix.len()..key.len() - suffix.len()];
+        if let Some(target_pattern) = export_condition_target(target) {
+            return Some(target_pattern.replace('*', matched));
+        }
+    }
+    None
+}
+
+fn export_condition_target(value: &Value) -> Option<String> {
+    match value {
+        Value::String(target) => Some(target.clone()),
+        Value::Object(map) => ["source", "import", "module", "default", "types"]
+            .into_iter()
+            .find_map(|field| map.get(field).and_then(export_condition_target)),
+        _ => None,
+    }
+}
+
+fn resolve_package_target(package_root: &Path, target: &str) -> Option<PathBuf> {
+    let target = target.strip_prefix("./").unwrap_or(target);
+    resolve_file_like_path(&package_root.join(target)).or_else(|| {
+        target.strip_prefix("dist/").and_then(|src_relative| {
+            resolve_file_like_path(&package_root.join("src").join(src_relative))
+        })
+    })
+}
+
+fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Option<PathBuf> {
+    match subpath {
+        Some(subpath) => resolve_file_like_path(&package_root.join(subpath))
+            .or_else(|| resolve_file_like_path(&package_root.join("src").join(subpath))),
+        None => resolve_file_like_path(&package_root.join("src").join("index"))
+            .or_else(|| resolve_file_like_path(&package_root.join("index"))),
+    }
+}
+
+fn resolve_reexported_symbol_path<F>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let mut visited = HashSet::new();
+    resolve_reexported_symbol_path_inner(file, symbol_name, file_exports_symbol, &mut visited)
+}
+
+fn resolve_reexported_symbol_path_inner<F>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    if !visited.insert((canon.clone(), symbol_name.to_string())) {
+        return None;
+    }
+
+    if file_exports_symbol(&canon, symbol_name) {
+        return Some(canon);
+    }
+
+    let source = std::fs::read_to_string(&canon).ok()?;
+    let lang = detect_language(&canon)?;
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        return None;
+    }
+
+    let grammar = grammar_for(lang);
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(&source, None)?;
+    let from_dir = canon.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut cursor = tree.root_node().walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "export_statement" {
+            if let Some(target) = resolve_reexport_statement(
+                &source,
+                node,
+                from_dir,
+                symbol_name,
+                file_exports_symbol,
+                visited,
+            ) {
+                return Some(target);
+            }
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn resolve_reexport_statement<F>(
+    source: &str,
+    node: tree_sitter::Node,
+    from_dir: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let source_node = node.child_by_field_name("source")?;
+    let module_path = string_literal_content(source, source_node)?;
+    let target_file = resolve_module_path(from_dir, &module_path)?;
+    let raw_export = node_text(node, source);
+
+    if let Some(source_symbol) = reexport_clause_source_symbol(&raw_export, symbol_name) {
+        return resolve_reexported_symbol_path_inner(
+            &target_file,
+            &source_symbol,
+            file_exports_symbol,
+            visited,
+        )
+        .or(Some(target_file));
+    }
+
+    if raw_export.contains('*') {
+        return resolve_reexported_symbol_path_inner(
+            &target_file,
+            symbol_name,
+            file_exports_symbol,
+            visited,
+        );
+    }
+
+    None
+}
+
+fn reexport_clause_source_symbol(raw_export: &str, requested_export: &str) -> Option<String> {
+    let start = raw_export.find('{')? + 1;
+    let end = raw_export[start..].find('}')? + start;
+    for specifier in raw_export[start..end].split(',') {
+        let specifier = specifier.trim();
+        if specifier.is_empty() {
+            continue;
+        }
+        let specifier = specifier.strip_prefix("type ").unwrap_or(specifier).trim();
+        if let Some((imported, exported)) = specifier.split_once(" as ") {
+            if exported.trim() == requested_export {
+                return Some(imported.trim().to_string());
+            }
+        } else if specifier == requested_export {
+            return Some(requested_export.to_string());
+        }
+    }
+    None
+}
+
+fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<String> {
+    let raw = source[node.byte_range()].trim();
+    let quote = raw.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    raw.strip_prefix(quote)
+        .and_then(|value| value.strip_suffix(quote))
+        .map(ToOwned::to_owned)
 }
 
 /// Find an index file in a directory.

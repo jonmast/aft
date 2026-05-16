@@ -5,6 +5,7 @@
 
 use crate::helpers::{fixture_path, AftProcess};
 use std::fs;
+use tempfile::tempdir;
 
 /// `configure` sets project root and returns success.
 #[test]
@@ -394,6 +395,240 @@ fn callgraph_callers_recursive() {
         total >= 2,
         "with depth 2, validate should have >= 2 callers (direct + transitive), got {}",
         total
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_resolves_workspace_package_import_callers_and_tree() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+
+    let pkg_a = root.join("packages/pkg-a");
+    let pkg_b = root.join("packages/pkg-b");
+    fs::create_dir_all(pkg_a.join("src")).unwrap();
+    fs::create_dir_all(pkg_b.join("src")).unwrap();
+    fs::write(
+        pkg_a.join("package.json"),
+        r#"{"name":"@scope/pkg-a","exports":{".":{"import":"./dist/index.js"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg_a.join("src/index.ts"),
+        r#"export { workspaceTarget } from "./target.js";
+"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg_a.join("src/target.ts"),
+        r#"export function workspaceTarget(): string {
+  return "ok";
+}
+"#,
+    )
+    .unwrap();
+    fs::write(pkg_b.join("package.json"), r#"{"name":"pkg-b"}"#).unwrap();
+    fs::write(
+        pkg_b.join("src/main.ts"),
+        r#"import { workspaceTarget } from "@scope/pkg-a";
+
+export function runWorkspaceImport(): string {
+  return workspaceTarget();
+}
+"#,
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let root_display = root.display().to_string();
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root_display
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}","symbol":"workspaceTarget","depth":1}}"#,
+        pkg_a.join("src/target.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
+    assert_eq!(
+        resp["total_callers"], 1,
+        "workspace import caller should resolve"
+    );
+    let callers = resp["callers"].as_array().expect("callers array");
+    let pkg_b_group = callers.iter().find(|group| {
+        group["file"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("packages/pkg-b/src/main.ts")
+    });
+    assert!(
+        pkg_b_group.is_some(),
+        "caller should be pkg-b main.ts: {:?}",
+        callers
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"3","command":"call_tree","file":"{}","symbol":"runWorkspaceImport","depth":2}}"#,
+        pkg_b.join("src/main.ts").display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "call_tree should succeed: {:?}",
+        resp
+    );
+    let children = resp["children"].as_array().expect("children array");
+    let target_child = children
+        .iter()
+        .find(|child| child["name"] == "workspaceTarget")
+        .expect("runWorkspaceImport should call workspaceTarget");
+    assert_eq!(target_child["resolved"], true);
+    assert!(
+        target_child["file"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("packages/pkg-a/src/target.ts"),
+        "workspaceTarget should resolve through package export to source file: {:?}",
+        target_child
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_indexes_relative_calls_inside_test_callbacks() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/shared")).unwrap();
+    fs::create_dir_all(root.join("src/__tests__")).unwrap();
+    fs::write(
+        root.join("src/shared/model.ts"),
+        r#"export function testTarget(): number {
+  return 1;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/__tests__/model.test.ts"),
+        r#"import { expect, test } from "bun:test";
+import { testTarget } from "../shared/model.js";
+
+test("calls target", () => {
+  expect(testTarget()).toBe(1);
+});
+"#,
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let root_display = root.display().to_string();
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root_display
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}","symbol":"testTarget","depth":1}}"#,
+        root.join("src/shared/model.ts").display()
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
+    assert_eq!(
+        resp["total_callers"], 1,
+        "test callback caller should be indexed"
+    );
+    let callers = resp["callers"].as_array().expect("callers array");
+    let test_group = callers.iter().find(|group| {
+        group["file"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("src/__tests__/model.test.ts")
+    });
+    assert!(
+        test_group.is_some(),
+        "caller should be the test file: {:?}",
+        callers
+    );
+    let entries = test_group.unwrap()["callers"]
+        .as_array()
+        .expect("caller entries");
+    assert!(
+        entries.iter().any(|entry| entry["line"] == 5),
+        "testTarget call site should be line 5: {:?}",
+        entries
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_leaves_non_workspace_package_imports_unresolved() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let app = root.join("packages/app");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(app.join("package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        app.join("src/main.ts"),
+        r#"import { useMemo } from "react";
+
+export function render(): unknown {
+  return useMemo(() => "ok", []);
+}
+"#,
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let root_display = root.display().to_string();
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root_display
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"call_tree","file":"{}","symbol":"render","depth":1}}"#,
+        app.join("src/main.ts").display()
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "call_tree should succeed: {:?}",
+        resp
+    );
+    let children = resp["children"].as_array().expect("children array");
+    let use_memo = children
+        .iter()
+        .find(|child| child["name"] == "useMemo")
+        .expect("render should call useMemo");
+    assert_eq!(
+        use_memo["resolved"], false,
+        "react import should not resolve as workspace"
     );
 
     aft.shutdown();
