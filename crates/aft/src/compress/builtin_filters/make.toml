@@ -20,5 +20,5 @@ max_lines = 80
 keep = "tail"
 
 [shortcircuit]
-when = '^\s*$'
+when = '\A\s*\z'
 replacement = "make: ok"

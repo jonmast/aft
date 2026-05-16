@@ -7,5 +7,5 @@ max_lines = 150
 keep = "tail"
 
 [shortcircuit]
-when = '^\s*$'
+when = '\A\s*\z'
 replacement = "helm: ok"

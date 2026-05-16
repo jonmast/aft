@@ -18,5 +18,5 @@ max_lines = 100
 keep = "tail"
 
 [shortcircuit]
-when = '^\s*$'
+when = '\A\s*\z'
 replacement = "ansible-playbook: ok"

@@ -102,6 +102,16 @@ fn xcodebuild_filter() {
 }
 
 #[test]
+fn make_shortcircuit_only_matches_empty_body() {
+    let filter = load_filter("make");
+
+    assert_eq!(apply_filter(&filter, ""), "make: ok");
+
+    let with_inner_blank = apply_filter(&filter, "error\n\nhint");
+    assert_eq!(with_inner_blank, "error\n\nhint");
+}
+
+#[test]
 fn toml_filter_strip_ansi_false_sees_raw_ansi() {
     let registry = build_registry(
         &[(

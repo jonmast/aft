@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::compress::Compressor;
+use crate::compress::{generic::GenericCompressor, Compressor};
 
 pub struct TscCompressor;
 
@@ -19,11 +19,15 @@ fn compress_tsc(output: &str) -> String {
     let error_lines: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|line| is_tsc_error_line(line))
+        .filter(|line| is_tsc_error_line(line) || is_tsc_top_level_error_line(line))
         .collect();
 
     if error_lines.is_empty() {
-        return "No errors. [cmpaft]".to_string();
+        if output_is_likely_success(output) {
+            return "No errors. [cmpaft]".to_string();
+        }
+
+        return GenericCompressor::compress_output(output);
     }
 
     let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -70,6 +74,23 @@ fn compress_tsc(output: &str) -> String {
 
 fn is_tsc_error_line(line: &str) -> bool {
     line.contains(": error TS") && error_file(line).is_some()
+}
+
+fn is_tsc_top_level_error_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("error TS")
+        && trimmed["error TS".len()..]
+            .chars()
+            .next()
+            .is_some_and(|char| char.is_ascii_digit())
+}
+
+fn output_is_likely_success(output: &str) -> bool {
+    let trimmed = output.trim();
+    trimmed.is_empty()
+        || trimmed
+            .lines()
+            .any(|line| line.trim().contains("Found 0 errors"))
 }
 
 fn error_file(line: &str) -> Option<String> {

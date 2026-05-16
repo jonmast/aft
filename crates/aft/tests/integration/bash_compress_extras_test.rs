@@ -143,11 +143,25 @@ fn tsc_groups_errors_by_file_and_handles_clean_output() {
     assert!(compressed.contains("... and 13 more files with errors"));
     assert!(compressed.contains("Found 57 errors in 23 files"));
 
-    let clean = TscCompressor.compress("tsc --noEmit", "Project build started\nCompiling...\n");
-    assert_eq!(clean, "No errors. [cmpaft]");
-
     let ratio = compressed.len() as f32 / output.len() as f32;
     assert!(ratio < 0.45, "ratio was {ratio}");
+}
+
+#[test]
+fn tsc_preserves_top_level_errors_and_only_reports_proven_success() {
+    let top_level_error = "error TS18003: No inputs were found in config file 'tsconfig.json'. Specified 'include' paths were '[\"src\"]'.\n";
+    let compressed = TscCompressor.compress("tsc --noEmit", top_level_error);
+    assert!(compressed.contains("error TS18003: No inputs were found"));
+    assert!(!compressed.contains("No errors"));
+
+    let watch_success = TscCompressor.compress(
+        "tsc --watch",
+        "12:00:00 PM - Found 0 errors. Watching for file changes.\n",
+    );
+    assert_eq!(watch_success, "No errors. [cmpaft]");
+
+    let empty = TscCompressor.compress("tsc --noEmit", "");
+    assert_eq!(empty, "No errors. [cmpaft]");
 }
 
 #[test]

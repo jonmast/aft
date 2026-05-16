@@ -8,8 +8,10 @@
 //! ## Pipeline
 //!
 //! For a matched filter, output flows through:
-//! 1. `[strip]` — drop lines matching any regex
+//! 1. `[strip]` — drop lines matching any regex (compiled with multiline mode)
 //! 2. `[shortcircuit]` — if remaining content matches `when`, replace with `replacement`
+//!    (compiled without multiline mode; use `(?m)` explicitly for line anchors,
+//!    and use `\A...\z` for full-body anchors such as empty output)
 //! 3. `[truncate]` — middle-truncate lines longer than `line_max`
 //! 4. `[cap]` — keep at most `max_lines` lines (head/tail/middle)
 //!
@@ -300,7 +302,8 @@ pub fn parse_filter(name: &str, content: &str, source: FilterSource) -> Result<T
     }
     let mut strip = Vec::with_capacity(strip_patterns.len());
     for pattern in strip_patterns {
-        let regex = build_regex(&pattern).map_err(|e| format!("strip pattern {pattern:?}: {e}"))?;
+        let regex =
+            build_regex(&pattern, true).map_err(|e| format!("strip pattern {pattern:?}: {e}"))?;
         strip.push(regex);
     }
 
@@ -324,8 +327,8 @@ pub fn parse_filter(name: &str, content: &str, source: FilterSource) -> Result<T
     let (shortcircuit_when, shortcircuit_replacement) =
         match (shortcircuit.when, shortcircuit.replacement) {
             (Some(when), Some(replacement)) => {
-                let regex =
-                    build_regex(&when).map_err(|e| format!("shortcircuit.when {when:?}: {e}"))?;
+                let regex = build_regex(&when, false)
+                    .map_err(|e| format!("shortcircuit.when {when:?}: {e}"))?;
                 (Some(regex), Some(replacement))
             }
             (Some(_), None) => return Err("shortcircuit.when set but replacement missing".into()),
@@ -350,10 +353,10 @@ pub fn parse_filter(name: &str, content: &str, source: FilterSource) -> Result<T
     })
 }
 
-fn build_regex(pattern: &str) -> Result<Regex, String> {
+fn build_regex(pattern: &str, multiline: bool) -> Result<Regex, String> {
     RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
-        .multi_line(true)
+        .multi_line(multiline)
         .build()
         .map_err(|e| e.to_string())
 }
@@ -580,13 +583,29 @@ matches = ["x"]
 patterns = ['^make\[\d+\]:.*']
 
 [shortcircuit]
-when = '^$'
+when = '\A\z'
 replacement = "make: ok"
 "#,
         );
         let input = "make[1]: Entering directory `/tmp`\nmake[1]: Leaving directory `/tmp`";
         let out = apply_filter(&filter, input);
         assert_eq!(out, "make: ok");
+    }
+
+    #[test]
+    fn shortcircuit_line_anchors_do_not_match_inner_blank_lines() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[shortcircuit]
+when = '^\s*$'
+replacement = "ok"
+"#,
+        );
+        let out = apply_filter(&filter, "error\n\nhint");
+        assert_eq!(out, "error\n\nhint");
     }
 
     #[test]
