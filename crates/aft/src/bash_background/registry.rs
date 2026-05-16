@@ -2032,11 +2032,8 @@ mod tests {
             state.metadata.duration_ms = None;
             // Persist the reset state to disk so update_task's terminal
             // rollback guard sees a non-terminal starting point.
-            crate::bash_background::persistence::write_task(
-                &task.paths.json,
-                &state.metadata,
-            )
-            .expect("persist reset Running metadata for reap_child test");
+            crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata)
+                .expect("persist reset Running metadata for reap_child test");
             // If the watchdog already nulled state.child, we need to
             // simulate "child exists and is dead" so reap_child's
             // try_wait path runs. Spawn a quick-exit child as a stand-in.
