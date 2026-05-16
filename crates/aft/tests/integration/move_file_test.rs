@@ -131,6 +131,49 @@ fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
         && change["type"] == 1));
 }
 
+#[test]
+fn undo_after_move_file_restores_source_and_removes_destination() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    let source = root.join("before.txt");
+    let destination = root.join("nested").join("after.txt");
+    std::fs::write(&source, "move me\n").expect("write source");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, root);
+
+    let move_resp = send(
+        &mut aft,
+        json!({
+            "id": "move-before-undo",
+            "command": "move_file",
+            "file": source.display().to_string(),
+            "destination": destination.display().to_string(),
+        }),
+    );
+    assert_eq!(move_resp["success"], true, "move failed: {move_resp:?}");
+    assert!(!source.exists(), "source should be moved away");
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "move me\n");
+
+    let undo = send(
+        &mut aft,
+        json!({
+            "id": "undo-move-operation",
+            "command": "undo",
+        }),
+    );
+    assert_eq!(undo["success"], true, "undo failed: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "move me\n");
+    assert!(
+        !destination.exists(),
+        "destination should be removed by move tombstone undo"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {

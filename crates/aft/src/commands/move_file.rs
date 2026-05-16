@@ -131,6 +131,15 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if let Err(e) = ctx.backup().borrow_mut().snapshot_op_tombstone(
+        req.session(),
+        &op_id,
+        &dst_path,
+        "move_file: destination created during move",
+    ) {
+        return Response::error(&req.id, e.code(), e.to_string());
+    }
+
     log::debug!("move_file: {} -> {}", file, destination);
 
     if move_outcome == MoveOutcome::Moved {

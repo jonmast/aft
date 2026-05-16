@@ -261,6 +261,7 @@ fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Resul
     }
 
     let mut restored_paths: Vec<PathBuf> = Vec::new();
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
     for path in paths {
         let content = checkpoint
             .file_contents
@@ -268,12 +269,13 @@ fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Resul
             .ok_or_else(|| AftError::FileNotFound {
                 path: path.display().to_string(),
             })?;
-        if let Err(e) = write_restored_file(path, content) {
+        if let Err(e) = write_restored_file(path, content, &mut created_dirs) {
             for restored_path in restored_paths.iter().rev() {
                 if let Some(snapshot) = pre_restore_snapshot.get(restored_path) {
                     let _ = restore_snapshot_file(restored_path, snapshot.as_deref());
                 }
             }
+            rollback_created_dirs(&created_dirs);
             return Err(e);
         }
         restored_paths.push(path.clone());
@@ -284,7 +286,7 @@ fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Resul
 
 fn restore_snapshot_file(path: &Path, content: Option<&str>) -> Result<(), AftError> {
     match content {
-        Some(content) => write_restored_file(path, content),
+        Some(content) => write_restored_file(path, content, &mut Vec::new()),
         None => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -295,15 +297,46 @@ fn restore_snapshot_file(path: &Path, content: Option<&str>) -> Result<(), AftEr
     }
 }
 
-fn write_restored_file(path: &Path, content: &str) -> Result<(), AftError> {
+fn write_restored_file(
+    path: &Path,
+    content: &str,
+    created_dirs: &mut Vec<PathBuf>,
+) -> Result<(), AftError> {
     if let Some(parent) = path.parent() {
+        let missing_dirs = missing_parent_dirs(parent);
         std::fs::create_dir_all(parent).map_err(|_| AftError::FileNotFound {
             path: path.display().to_string(),
         })?;
+        created_dirs.extend(missing_dirs);
     }
     std::fs::write(path, content).map_err(|_| AftError::FileNotFound {
         path: path.display().to_string(),
     })
+}
+
+fn missing_parent_dirs(parent: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(parent);
+
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || dir.exists() {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+
+    dirs
+}
+
+fn rollback_created_dirs(dirs: &[PathBuf]) {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    dirs.dedup();
+
+    for dir in dirs {
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
 
 fn current_timestamp() -> u64 {
@@ -663,5 +696,36 @@ mod tests {
         assert!(result.is_err(), "restore should surface write failure");
         assert_eq!(fs::read_to_string(&path_a).unwrap(), "pre-restore-a");
         assert_eq!(fs::read_to_string(&path_b).unwrap(), "pre-restore-b");
+    }
+
+    #[test]
+    fn checkpoint_restore_failure_removes_created_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("created");
+        let path_a = missing_root.join("nested").join("a.txt");
+        let path_b = dir.path().join("blocking-dir");
+        fs::create_dir(&path_b).unwrap();
+
+        let checkpoint = Checkpoint {
+            name: "dir-cleanup".to_string(),
+            file_contents: HashMap::from([
+                (path_a.clone(), "checkpoint-a".to_string()),
+                (path_b.clone(), "checkpoint-b".to_string()),
+            ]),
+            created_at: current_timestamp(),
+        };
+
+        let result = restore_paths_atomically(&checkpoint, &[path_a.clone(), path_b.clone()]);
+
+        assert!(
+            result.is_err(),
+            "second restore write should fail on directory"
+        );
+        assert!(!path_a.exists(), "restored file should be rolled back");
+        assert!(
+            !missing_root.exists(),
+            "new parent directories should be removed on rollback"
+        );
+        assert!(path_b.is_dir(), "pre-existing blocking directory remains");
     }
 }

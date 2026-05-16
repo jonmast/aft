@@ -21,6 +21,13 @@ pub struct BackupEntry {
     pub timestamp: u64,
     pub description: String,
     pub op_id: Option<String>,
+    pub kind: BackupEntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupEntryKind {
+    Content,
+    Tombstone,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +104,9 @@ impl BackupStore {
     /// default namespace.
     pub fn set_storage_dir(&mut self, dir: PathBuf, ttl_hours: u32) {
         self.storage_dir = Some(dir);
+        self.entries.clear();
+        self.disk_index.clear();
+        self.session_meta.clear();
         self.gc_stale_sessions(ttl_hours);
         self.migrate_legacy_layout_if_needed();
         self.load_disk_index();
@@ -134,6 +144,7 @@ impl BackupStore {
             timestamp: current_timestamp(),
             description: description.to_string(),
             op_id: op_id.map(str::to_string),
+            kind: BackupEntryKind::Content,
         };
 
         let session_entries = self.entries.entry(session.to_string()).or_default();
@@ -144,6 +155,40 @@ impl BackupStore {
         stack.push(entry);
 
         // Persist to disk
+        let stack_clone = stack.clone();
+        self.write_snapshot_to_disk(session, &key, &stack_clone);
+        self.touch_session(session);
+
+        Ok(id)
+    }
+
+    /// Record that `path` was created by the operation and should be removed
+    /// if that operation is undone. No file content is captured.
+    pub fn snapshot_op_tombstone(
+        &mut self,
+        session: &str,
+        op_id: &str,
+        path: &Path,
+        description: &str,
+    ) -> Result<String, AftError> {
+        let key = canonicalize_key(path);
+        let id = self.next_id();
+        let entry = BackupEntry {
+            backup_id: id.clone(),
+            content: String::new(),
+            timestamp: current_timestamp(),
+            description: description.to_string(),
+            op_id: Some(op_id.to_string()),
+            kind: BackupEntryKind::Tombstone,
+        };
+
+        let session_entries = self.entries.entry(session.to_string()).or_default();
+        let stack = session_entries.entry(key.clone()).or_default();
+        if stack.len() >= MAX_UNDO_DEPTH {
+            stack.remove(0);
+        }
+        stack.push(entry);
+
         let stack_clone = stack.clone();
         self.write_snapshot_to_disk(session, &key, &stack_clone);
         self.touch_session(session);
@@ -209,7 +254,8 @@ impl BackupStore {
             });
         }
 
-        let mut targets = Vec::new();
+        let mut content_targets = Vec::new();
+        let mut tombstone_targets = Vec::new();
         for key in &keys_to_restore {
             let entry = self
                 .entries
@@ -220,22 +266,37 @@ impl BackupStore {
                 .ok_or_else(|| AftError::NoUndoHistory {
                     path: key.display().to_string(),
                 })?;
-            let existing_content = match std::fs::read(key) {
-                Ok(content) => Some(content),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(AftError::IoError {
-                        path: key.display().to_string(),
-                        message: e.to_string(),
-                    });
+            match entry.kind {
+                BackupEntryKind::Content => {
+                    let existing_content = match std::fs::read(key) {
+                        Ok(content) => Some(content),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(AftError::IoError {
+                                path: key.display().to_string(),
+                                message: e.to_string(),
+                            });
+                        }
+                    };
+                    let warning = self.check_external_modification(session, key, key);
+                    content_targets.push((key.clone(), entry, warning, existing_content));
                 }
-            };
-            let warning = self.check_external_modification(session, key, key);
-            targets.push((key.clone(), entry, warning, existing_content));
+                BackupEntryKind::Tombstone => {
+                    let existing_content = if key.is_file() {
+                        Some(std::fs::read(key).map_err(|e| AftError::IoError {
+                            path: key.display().to_string(),
+                            message: e.to_string(),
+                        })?)
+                    } else {
+                        None
+                    };
+                    tombstone_targets.push((key.clone(), entry, existing_content));
+                }
+            }
         }
 
         let mut created_dirs = Vec::new();
-        for (key, _, _, _) in &targets {
+        for (key, _, _, _) in &content_targets {
             if let Some(parent) = key.parent() {
                 if !parent.as_os_str().is_empty() {
                     let missing_dirs = missing_parent_dirs(parent);
@@ -259,7 +320,7 @@ impl BackupStore {
         }
 
         let mut written = Vec::new();
-        for (key, entry, _, existing_content) in &targets {
+        for (key, entry, _, existing_content) in &content_targets {
             if let Err(e) = std::fs::write(key, &entry.content) {
                 let files_rollback_ok =
                     rollback_transactional_restore(&written, Some((key, existing_content)));
@@ -278,9 +339,35 @@ impl BackupStore {
             written.push((key.clone(), existing_content.clone()));
         }
 
+        let mut deleted_tombstones = Vec::new();
+        for (key, _, existing_content) in &tombstone_targets {
+            match std::fs::remove_file(key) {
+                Ok(()) => deleted_tombstones.push((key.clone(), existing_content.clone())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    deleted_tombstones.push((key.clone(), None));
+                }
+                Err(e) => {
+                    let files_rollback_ok = rollback_transactional_restore(&written, None);
+                    let tombstone_rollback_ok = rollback_deleted_tombstones(&deleted_tombstones);
+                    let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
+                    let rollback_ok =
+                        files_rollback_ok && tombstone_rollback_ok && dirs_rollback_ok;
+                    return Err(AftError::IoError {
+                        path: key.display().to_string(),
+                        message: format!(
+                            "{}; restore_last_operation aborted; partial_rollback: {}; rollback_succeeded: {}",
+                            e,
+                            !rollback_ok,
+                            rollback_ok
+                        ),
+                    });
+                }
+            }
+        }
+
         let mut restored = Vec::new();
         let mut warnings = Vec::new();
-        for (key, entry, warning, _) in targets {
+        for (key, entry, warning, _) in content_targets {
             self.commit_restored_backup(session, &key);
             if let Some(warning) = warning {
                 warnings.push(format!("{}: {}", key.display(), warning));
@@ -289,6 +376,9 @@ impl BackupStore {
                 path: key,
                 backup_id: entry.backup_id,
             });
+        }
+        for (key, _, _) in tombstone_targets {
+            self.commit_restored_backup(session, &key);
         }
         self.touch_session(session);
 
@@ -757,8 +847,16 @@ impl BackupStore {
             }
             // Recover the session_id from session.json if present, otherwise skip
             // (can't invert the hash to recover the original).
-            let session_id = Self::read_session_marker(&session_dir)
-                .unwrap_or_else(|| crate::protocol::DEFAULT_SESSION_ID.to_string());
+            let session_id = match Self::read_session_marker(&session_dir) {
+                Some(session_id) => session_id,
+                None => {
+                    crate::slog_warn!(
+                        "skipping backup session dir without readable session marker: {}",
+                        session_dir.display()
+                    );
+                    continue;
+                }
+            };
 
             let path_dirs = match std::fs::read_dir(&session_dir) {
                 Ok(e) => e,
@@ -817,7 +915,7 @@ impl BackupStore {
     }
 
     fn load_from_disk_if_needed(&mut self, session: &str, key: &Path) -> bool {
-        let meta = match self
+        let disk_meta = match self
             .disk_index
             .get(session)
             .and_then(|s| s.get(key))
@@ -828,38 +926,50 @@ impl BackupStore {
         };
 
         let mut entries = Vec::new();
-        let entry_meta = std::fs::read_to_string(meta.dir.join("meta.json"))
+        let entry_meta = std::fs::read_to_string(disk_meta.dir.join("meta.json"))
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|meta| meta.get("entries").and_then(|v| v.as_array()).cloned())
             .unwrap_or_default();
 
-        for i in 0..meta.count {
-            let bak_path = meta.dir.join(format!("{}.bak", i));
-            if let Ok(content) = std::fs::read_to_string(&bak_path) {
-                let meta = entry_meta.get(i);
-                entries.push(BackupEntry {
-                    backup_id: meta
-                        .and_then(|m| m.get("backup_id"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("disk-{}", i)),
-                    content,
-                    timestamp: meta
-                        .and_then(|m| m.get("timestamp"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    description: meta
-                        .and_then(|m| m.get("description"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("restored from disk")
-                        .to_string(),
-                    op_id: meta
-                        .and_then(|m| m.get("op_id"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                });
-            }
+        for i in 0..disk_meta.count {
+            let meta = entry_meta.get(i);
+            let kind = match meta.and_then(|m| m.get("kind")).and_then(|v| v.as_str()) {
+                Some("tombstone") => BackupEntryKind::Tombstone,
+                _ => BackupEntryKind::Content,
+            };
+            let content = match kind {
+                BackupEntryKind::Content => {
+                    let bak_path = disk_meta.dir.join(format!("{}.bak", i));
+                    match std::fs::read_to_string(&bak_path) {
+                        Ok(content) => content,
+                        Err(_) => continue,
+                    }
+                }
+                BackupEntryKind::Tombstone => String::new(),
+            };
+            entries.push(BackupEntry {
+                backup_id: meta
+                    .and_then(|m| m.get("backup_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("disk-{}", i)),
+                content,
+                timestamp: meta
+                    .and_then(|m| m.get("timestamp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                description: meta
+                    .and_then(|m| m.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("restored from disk")
+                    .to_string(),
+                op_id: meta
+                    .and_then(|m| m.get("op_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                kind,
+            });
         }
 
         if entries.is_empty() {
@@ -906,8 +1016,16 @@ impl BackupStore {
         for (i, entry) in stack.iter().enumerate() {
             let bak_path = dir.join(format!("{}.bak", i));
             let tmp_path = dir.join(format!("{}.bak.tmp", i));
-            if std::fs::write(&tmp_path, &entry.content).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &bak_path);
+            match entry.kind {
+                BackupEntryKind::Content => {
+                    if std::fs::write(&tmp_path, &entry.content).is_ok() {
+                        let _ = std::fs::rename(&tmp_path, &bak_path);
+                    }
+                }
+                BackupEntryKind::Tombstone => {
+                    let _ = std::fs::remove_file(&bak_path);
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
             }
         }
 
@@ -927,6 +1045,10 @@ impl BackupStore {
                     "timestamp": entry.timestamp,
                     "description": entry.description,
                     "op_id": entry.op_id,
+                    "kind": match entry.kind {
+                        BackupEntryKind::Content => "content",
+                        BackupEntryKind::Tombstone => "tombstone",
+                    },
                 })
             })
             .collect();
@@ -1036,6 +1158,24 @@ fn rollback_one_restore_write(path: &Path, content: &Option<Vec<u8>>) -> bool {
             Err(_) => false,
         },
     }
+}
+
+fn rollback_deleted_tombstones(deleted: &[(PathBuf, Option<Vec<u8>>)]) -> bool {
+    let mut ok = true;
+    for (path, content) in deleted.iter().rev() {
+        if let Some(content) = content {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
+                    ok = false;
+                    continue;
+                }
+            }
+            if std::fs::write(path, content).is_err() {
+                ok = false;
+            }
+        }
+    }
+    ok
 }
 
 fn missing_parent_dirs(parent: &Path) -> Vec<PathBuf> {
@@ -1349,6 +1489,70 @@ mod tests {
     }
 
     #[test]
+    fn markerless_session_dir_is_skipped_not_mapped_to_default() {
+        let dir = std::env::temp_dir().join("aft_backup_markerless_skip_test");
+        let _ = fs::remove_dir_all(&dir);
+        let file_path = temp_file("markerless.txt", "original");
+        let key = canonicalize_key(&file_path);
+        let path_dir = dir
+            .join("backups")
+            .join("corrupt-session")
+            .join("path-entry");
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::write(path_dir.join("0.bak"), "original").unwrap();
+        fs::write(
+            path_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": "lost-session",
+                "path": key.display().to_string(),
+                "count": 1,
+                "entries": [{
+                    "backup_id": "disk-0",
+                    "timestamp": 0,
+                    "description": "corrupt marker test",
+                    "op_id": null,
+                    "kind": "content",
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.clone(), 72);
+
+        assert_eq!(store.disk_history_count(DEFAULT_SESSION_ID, &file_path), 0);
+        assert!(store.sessions_with_backups().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_storage_dir_reconfiguration_drops_previous_disk_index() {
+        let dir_a = std::env::temp_dir().join("aft_backup_storage_a_test");
+        let dir_b = std::env::temp_dir().join("aft_backup_storage_b_test");
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        let file_path = temp_file("storage_reconfigure.txt", "original");
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir_a.clone(), 72);
+        store
+            .snapshot(DEFAULT_SESSION_ID, &file_path, "stored in a")
+            .unwrap();
+        assert_eq!(store.disk_history_count(DEFAULT_SESSION_ID, &file_path), 1);
+
+        store.set_storage_dir(dir_b.clone(), 72);
+
+        assert_eq!(store.disk_history_count(DEFAULT_SESSION_ID, &file_path), 0);
+        assert!(store.tracked_files(DEFAULT_SESSION_ID).is_empty());
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
     fn restore_last_operation_restores_all_top_entries_for_same_op() {
         let path_a = temp_file("op_restore_a.txt", "a1");
         let path_b = temp_file("op_restore_b.txt", "b1");
@@ -1369,6 +1573,68 @@ mod tests {
         assert_eq!(restored.restored.len(), 2);
         assert_eq!(fs::read_to_string(&path_a).unwrap(), "a1");
         assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
+    }
+
+    #[test]
+    fn restore_last_operation_deletes_tombstone_destination() {
+        let dir = std::env::temp_dir().join("aft_backup_tombstone_delete_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.txt");
+        let destination = dir.join("destination.txt");
+        fs::write(&source, "original").unwrap();
+
+        let mut store = BackupStore::new();
+        let op_id = "op-tombstone-delete";
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &source, "move source", Some(op_id))
+            .unwrap();
+        fs::rename(&source, &destination).unwrap();
+        store
+            .snapshot_op_tombstone(DEFAULT_SESSION_ID, op_id, &destination, "created dest")
+            .unwrap();
+
+        let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(restored.op_id, op_id);
+        assert_eq!(restored.restored.len(), 1);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+        assert!(!destination.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_last_operation_rolls_back_source_when_tombstone_delete_fails() {
+        let dir = std::env::temp_dir().join("aft_backup_tombstone_atomic_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.txt");
+        let destination = dir.join("destination.txt");
+        fs::write(&source, "original").unwrap();
+
+        let mut store = BackupStore::new();
+        let op_id = "op-tombstone-atomic";
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &source, "move source", Some(op_id))
+            .unwrap();
+        fs::rename(&source, &destination).unwrap();
+        store
+            .snapshot_op_tombstone(DEFAULT_SESSION_ID, op_id, &destination, "created dest")
+            .unwrap();
+
+        fs::remove_file(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let result = store.restore_last_operation(DEFAULT_SESSION_ID);
+
+        assert!(result.is_err(), "directory tombstone target should fail");
+        assert!(
+            !source.exists(),
+            "source restore must roll back when destination deletion fails"
+        );
+        assert!(
+            destination.is_dir(),
+            "failed tombstone target should remain"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // Uses Unix-specific PermissionsExt::set_mode to make a target file

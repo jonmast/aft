@@ -1052,11 +1052,22 @@ impl AppContext {
         // fails (e.g. path does not exist or traverses a broken symlink), inspect
         // every existing component with lstat before falling back lexically so a
         // broken in-root symlink cannot be used to write outside project_root.
-        let resolved = match std::fs::canonicalize(path) {
+        let path_for_resolution = if path.is_relative() {
+            raw_root.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        let resolved = match std::fs::canonicalize(&path_for_resolution) {
             Ok(resolved) => resolved,
             Err(_) => {
-                let normalized = normalize_path(path);
-                reject_escaping_symlink(req_id, path, &normalized, &resolved_root, &raw_root)?;
+                let normalized = normalize_path(&path_for_resolution);
+                reject_escaping_symlink(
+                    req_id,
+                    &path_for_resolution,
+                    &normalized,
+                    &resolved_root,
+                    &raw_root,
+                )?;
                 resolve_with_existing_ancestors(&normalized)
             }
         };

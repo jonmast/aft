@@ -227,21 +227,18 @@ fn validate_path_rejects_broken_symlink_chain_escape() {
 
 #[test]
 fn write_resolves_relative_dotdot_path_within_project_root() {
-    let cwd = std::env::current_dir().unwrap();
-    let dir = tempfile::tempdir_in(&cwd).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
     fs::create_dir_all(root.join("nested")).unwrap();
 
     let mut aft = AftProcess::spawn();
     configure_restricted(&mut aft, &root);
 
-    let requested = root.join("nested/../resolved.txt");
-    let relative_requested = requested.strip_prefix(&cwd).unwrap().to_path_buf();
     let resp = aft.send(
         &serde_json::to_string(&serde_json::json!({
             "id": "write-relative-dotdot",
             "command": "write",
-            "file": relative_requested.display().to_string(),
+            "file": "nested/../resolved.txt",
             "content": "ok",
         }))
         .unwrap(),
@@ -252,6 +249,24 @@ fn write_resolves_relative_dotdot_path_within_project_root() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn validate_path_resolves_relative_paths_against_project_root_not_process_cwd() {
+    let cwd = std::env::current_dir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let file = root.join("src").join("main.rs");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "fn main() {}\n").unwrap();
+
+    let ctx = restricted_context(&root);
+    let validated = ctx
+        .validate_path("relative-project-root", Path::new("src/main.rs"))
+        .expect("relative path should resolve inside project root");
+
+    assert_eq!(validated, std::fs::canonicalize(&file).unwrap());
+    assert_eq!(std::env::current_dir().unwrap(), cwd);
 }
 
 #[test]
