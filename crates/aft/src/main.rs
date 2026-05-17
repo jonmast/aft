@@ -621,12 +621,24 @@ fn drain_watcher_events(ctx: &AppContext) {
 
     let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
     if let Some(index) = semantic_index_ref.as_mut() {
+        let mut semantic_stale = false;
         for path in &changed {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if SOURCE_EXTENSIONS.contains(&ext) {
                     index.invalidate_file(path);
+                    if path.exists() {
+                        semantic_stale = true;
+                    }
                 }
             }
+        }
+        if semantic_stale {
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                stage: "stale_after_file_change".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
         }
     }
 

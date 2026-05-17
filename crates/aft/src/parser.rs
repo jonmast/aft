@@ -695,7 +695,11 @@ impl SymbolCache {
         let mut loaded = 0usize;
 
         for entry in cache.entries {
-            let path = current_root.join(&entry.relative_path);
+            let Some(path) =
+                crate::search_index::cached_path_under_root(current_root, &entry.relative_path)
+            else {
+                continue;
+            };
             let cached_freshness = FileFreshness {
                 mtime: entry.mtime,
                 size: entry.size,

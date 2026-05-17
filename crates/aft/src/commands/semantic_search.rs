@@ -130,6 +130,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.search_index()
             .borrow()
             .as_ref()
+            .filter(|index| index.ready)
             .map(|index| {
                 index.lexical_rank(&query_trigrams, Some(&is_semantic_indexed_extension), 50)
             })

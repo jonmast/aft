@@ -1270,7 +1270,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         search_index_cache_reused = baseline.is_some();
 
         if let Some(index) = baseline.as_mut() {
-            if current_head.is_some() && index.stored_git_head() == current_head.as_deref() {
+            if index.stored_git_head() == current_head.as_deref() {
+                index.verify_against_disk(current_head.clone());
                 *ctx.search_index().borrow_mut() = Some(index.clone());
             } else {
                 index.set_ready(false);

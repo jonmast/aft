@@ -1,6 +1,7 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::config::{SemanticBackend, SemanticBackendConfig};
 use crate::parser::{detect_language, extract_symbols_from_tree, grammar_for};
+use crate::search_index::{cache_relative_path, cached_path_under_root};
 use crate::symbols::{Symbol, SymbolKind};
 use crate::{slog_info, slog_warn};
 
@@ -1675,6 +1676,22 @@ impl SemanticIndex {
                 Some(encoded.into_bytes())
             }
         });
+        let file_mtimes: Vec<_> = self
+            .file_mtimes
+            .iter()
+            .filter_map(|(path, mtime)| {
+                cache_relative_path(&self.project_root, path)
+                    .map(|relative| (relative, path, mtime))
+            })
+            .collect();
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                cache_relative_path(&self.project_root, &entry.chunk.file)
+                    .map(|relative| (relative, entry))
+            })
+            .collect();
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
@@ -1691,18 +1708,15 @@ impl SemanticIndex {
         let version = SEMANTIC_INDEX_VERSION_V6;
         buf.push(version);
         buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
-        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         let fp_bytes_ref: &[u8] = fingerprint_bytes.as_deref().unwrap_or(&[]);
         buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
         buf.extend_from_slice(fp_bytes_ref);
 
         // File mtime table: count(4) + entries
         // V3 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4)
-        buf.extend_from_slice(&(self.file_mtimes.len() as u32).to_le_bytes());
-        for (path, mtime) in &self.file_mtimes {
-            let relative = path
-                .strip_prefix(&self.project_root)
-                .unwrap_or(path.as_path());
+        buf.extend_from_slice(&(file_mtimes.len() as u32).to_le_bytes());
+        for (relative, path, mtime) in &file_mtimes {
             let path_bytes = relative.to_string_lossy().as_bytes().to_vec();
             buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&path_bytes);
@@ -1711,25 +1725,21 @@ impl SemanticIndex {
                 .unwrap_or_default();
             buf.extend_from_slice(&duration.as_secs().to_le_bytes());
             buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
-            let size = self.file_sizes.get(path).copied().unwrap_or_default();
+            let size = self.file_sizes.get(*path).copied().unwrap_or_default();
             buf.extend_from_slice(&size.to_le_bytes());
             let hash = self
                 .file_hashes
-                .get(path)
+                .get(*path)
                 .copied()
                 .unwrap_or_else(cache_freshness::zero_hash);
             buf.extend_from_slice(hash.as_bytes());
         }
 
         // Entries: each is metadata + vector
-        for entry in &self.entries {
+        for (relative, entry) in &entries {
             let c = &entry.chunk;
 
             // File path
-            let relative = c
-                .file
-                .strip_prefix(&self.project_root)
-                .unwrap_or(c.file.as_path());
             let file_bytes = relative.to_string_lossy().as_bytes().to_vec();
             buf.extend_from_slice(&(file_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&file_bytes);
@@ -1910,7 +1920,8 @@ impl SemanticIndex {
                     )
                 })?;
             let path = if version == SEMANTIC_INDEX_VERSION_V6 {
-                current_canonical_root.join(PathBuf::from(path))
+                cached_path_under_root(current_canonical_root, &PathBuf::from(path))
+                    .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
             } else {
                 PathBuf::from(path)
             };
@@ -1924,7 +1935,8 @@ impl SemanticIndex {
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string(data, &mut pos)?);
             let file = if version == SEMANTIC_INDEX_VERSION_V6 {
-                current_canonical_root.join(raw_file)
+                cached_path_under_root(current_canonical_root, &raw_file)
+                    .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
             } else {
                 raw_file
             };
@@ -2516,6 +2528,39 @@ mod tests {
     }
 
     #[test]
+    fn semantic_cache_serialization_skips_paths_outside_project_root() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = fs::canonicalize(dir.path()).expect("canonical project");
+        let outside = project.join("..").join("outside.rs");
+        let mut index = SemanticIndex::new(project.clone(), 3);
+        index
+            .file_mtimes
+            .insert(outside.clone(), SystemTime::UNIX_EPOCH);
+        index.file_sizes.insert(outside.clone(), 1);
+        index
+            .file_hashes
+            .insert(outside.clone(), cache_freshness::zero_hash());
+        index.entries.push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: outside,
+                name: "outside".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 0,
+                exported: false,
+                embed_text: "outside".to_string(),
+                snippet: "outside".to_string(),
+            },
+            vector: vec![1.0, 0.0, 0.0],
+        });
+
+        let bytes = index.to_bytes();
+        let loaded = SemanticIndex::from_bytes(&bytes, &project).expect("load serialized index");
+        assert_eq!(loaded.entries.len(), 0);
+        assert!(loaded.file_mtimes.is_empty());
+    }
+
+    #[test]
     fn test_cosine_similarity_identical() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
@@ -2538,10 +2583,12 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        let project_root = test_project_root();
+        let file = project_root.join("src/main.rs");
+        let mut index = SemanticIndex::new(project_root.clone(), DEFAULT_DIMENSION);
         index.entries.push(EmbeddingEntry {
             chunk: SemanticChunk {
-                file: PathBuf::from("/src/main.rs"),
+                file: file.clone(),
                 name: "handle_request".to_string(),
                 kind: SymbolKind::Function,
                 start_line: 10,
@@ -2555,8 +2602,8 @@ mod tests {
         index.dimension = 4;
         index
             .file_mtimes
-            .insert(PathBuf::from("/src/main.rs"), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(PathBuf::from("/src/main.rs"), 0);
+            .insert(file.clone(), SystemTime::UNIX_EPOCH);
+        index.file_sizes.insert(file, 0);
         index.set_fingerprint(SemanticIndexFingerprint {
             backend: "fastembed".to_string(),
             model: "all-MiniLM-L6-v2".to_string(),
@@ -2566,7 +2613,7 @@ mod tests {
         });
 
         let bytes = index.to_bytes();
-        let restored = SemanticIndex::from_bytes(&bytes, &test_project_root()).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, &project_root).unwrap();
 
         assert_eq!(restored.entries.len(), 1);
         assert_eq!(restored.entries[0].chunk.name, "handle_request");
@@ -3111,10 +3158,12 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let project_key = "proj";
 
-        let mut index = SemanticIndex::new(test_project_root(), DEFAULT_DIMENSION);
+        let project_root = test_project_root();
+        let file = project_root.join("src/main.rs");
+        let mut index = SemanticIndex::new(project_root.clone(), DEFAULT_DIMENSION);
         index.entries.push(EmbeddingEntry {
             chunk: SemanticChunk {
-                file: PathBuf::from("/src/main.rs"),
+                file: file.clone(),
                 name: "handle_request".to_string(),
                 kind: SymbolKind::Function,
                 start_line: 10,
@@ -3128,8 +3177,8 @@ mod tests {
         index.dimension = 3;
         index
             .file_mtimes
-            .insert(PathBuf::from("/src/main.rs"), SystemTime::UNIX_EPOCH);
-        index.file_sizes.insert(PathBuf::from("/src/main.rs"), 0);
+            .insert(file.clone(), SystemTime::UNIX_EPOCH);
+        index.file_sizes.insert(file, 0);
         index.set_fingerprint(SemanticIndexFingerprint {
             backend: "openai_compatible".to_string(),
             model: "test-embedding".to_string(),
@@ -3143,7 +3192,7 @@ mod tests {
         assert!(SemanticIndex::read_from_disk(
             storage.path(),
             project_key,
-            &test_project_root(),
+            &project_root,
             false,
             Some(&matching),
         )
@@ -3160,7 +3209,7 @@ mod tests {
         assert!(SemanticIndex::read_from_disk(
             storage.path(),
             project_key,
-            &test_project_root(),
+            &project_root,
             false,
             Some(&mismatched),
         )

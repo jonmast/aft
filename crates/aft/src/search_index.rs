@@ -719,7 +719,13 @@ impl SearchIndex {
                 let Some(file) = self.files.get(*old_id as usize) else {
                     return Err(std::io::Error::other("missing file entry for cache write"));
                 };
-                let path = relative_to_root(&self.project_root, &file.path);
+                let path =
+                    cache_relative_path(&self.project_root, &file.path).ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "refusing to cache path outside project root: {}",
+                            file.path.display()
+                        ))
+                    })?;
                 let path = path.to_string_lossy();
                 let path_len = u32::try_from(path.len())
                     .map_err(|_| std::io::Error::other("cached path too large"))?;
@@ -923,7 +929,7 @@ impl SearchIndex {
             let mut path_bytes = vec![0u8; path_len];
             postings_reader.read_exact(&mut path_bytes).ok()?;
             let relative_path = PathBuf::from(String::from_utf8(path_bytes).ok()?);
-            let full_path = project_root.join(relative_path);
+            let full_path = cached_path_under_root(&project_root, &relative_path)?;
             let file_id_u32 = u32::try_from(file_id).ok()?;
 
             files.push(FileEntry {
@@ -1001,7 +1007,7 @@ impl SearchIndex {
             postings,
             files,
             path_to_id,
-            ready: true,
+            ready: false,
             project_root,
             git_head,
             max_file_size,
@@ -1016,6 +1022,12 @@ impl SearchIndex {
 
     pub(crate) fn set_ready(&mut self, ready: bool) {
         self.ready = ready;
+    }
+
+    pub(crate) fn verify_against_disk(&mut self, current_head: Option<String>) {
+        self.git_head = current_head;
+        verify_file_mtimes(self);
+        self.ready = true;
     }
 
     pub(crate) fn rebuild_or_refresh(
@@ -1047,6 +1059,7 @@ impl SearchIndex {
                 let project_root = baseline.project_root.clone();
                 if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
                     baseline.git_head = Some(current);
+                    verify_file_mtimes(&mut baseline);
                     baseline.ready = true;
                     return baseline;
                 }
@@ -1508,6 +1521,36 @@ pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let normalized_root = normalize_path(root);
+    let normalized_path = normalize_path(path);
+    let relative = normalized_path.strip_prefix(&normalized_root).ok()?;
+    validate_cached_relative_path(relative)
+}
+
+pub(crate) fn cached_path_under_root(root: &Path, relative_path: &Path) -> Option<PathBuf> {
+    let relative = validate_cached_relative_path(relative_path)?;
+    let normalized_root = normalize_path(root);
+    let full_path = normalize_path(&normalized_root.join(relative));
+    full_path.starts_with(&normalized_root).then_some(full_path)
+}
+
+pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
 /// Sort paths newest-first by mtime, falling back to lexicographic order.
 ///
 /// Pre-v0.15.2 this called `path_modified_time(...)` directly inside the
@@ -1749,7 +1792,7 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
-    path.starts_with(search_root)
+    normalize_path(path).starts_with(normalize_path(search_root))
 }
 
 impl QueryBuild {
@@ -1986,7 +2029,7 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     let output = match Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["diff", "--name-only", &diff_range])
+        .args(["diff", "--name-status", "-M", &diff_range])
         .output()
     {
         Ok(output) => output,
@@ -1997,16 +2040,44 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
         return false;
     }
 
-    let Ok(paths) = String::from_utf8(output.stdout) else {
+    let Ok(diff) = String::from_utf8(output.stdout) else {
         return false;
     };
 
-    for relative_path in paths.lines().map(str::trim).filter(|path| !path.is_empty()) {
-        let path = root.join(relative_path);
-        if path.exists() {
-            index.update_file(&path);
-        } else {
+    for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let mut fields = line.split('\t');
+        let Some(status) = fields.next() else {
+            continue;
+        };
+
+        if status.starts_with('R') {
+            let Some(old_path) = fields
+                .next()
+                .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
+            else {
+                continue;
+            };
+            let Some(new_path) = fields
+                .next()
+                .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
+            else {
+                continue;
+            };
+            index.remove_file(&old_path);
+            index.update_file(&new_path);
+            continue;
+        }
+
+        let Some(path) = fields
+            .next()
+            .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
+        else {
+            continue;
+        };
+        if status.starts_with('D') || !path.exists() {
             index.remove_file(&path);
+        } else {
+            index.update_file(&path);
         }
     }
 
@@ -2174,6 +2245,103 @@ mod tests {
         assert!(loaded
             .postings
             .contains_key(&pack_trigram(b'a', b'b', b'c')));
+    }
+
+    #[test]
+    fn cache_path_helpers_reject_absolute_and_parent_paths() {
+        let root = PathBuf::from("/tmp/aft-project");
+
+        assert_eq!(
+            cache_relative_path(&root, &root.join("src/lib.rs")),
+            Some(PathBuf::from("src/lib.rs"))
+        );
+        assert!(cache_relative_path(&root, Path::new("/tmp/outside.rs")).is_none());
+        assert!(cached_path_under_root(&root, Path::new("../outside.rs")).is_none());
+        assert!(cached_path_under_root(&root, Path::new("/tmp/outside.rs")).is_none());
+        assert_eq!(
+            cached_path_under_root(&root, Path::new("src/./lib.rs")),
+            Some(root.join("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn refresh_after_head_change_removes_renames_and_detects_local_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        fs::write(project.join("old.txt"), "old token\n").expect("write old");
+        fs::write(project.join("unchanged.txt"), "before\n").expect("write unchanged");
+
+        Command::new("git")
+            .arg("init")
+            .arg(&project)
+            .status()
+            .expect("git init");
+        for args in [
+            ["config", "user.email", "aft@example.invalid"],
+            ["config", "user.name", "AFT Test"],
+        ] {
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .expect("git config");
+        }
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["add", "."])
+            .status()
+            .expect("git add initial");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .expect("git commit initial");
+        let previous = run_git(&project, &["rev-parse", "HEAD"]).expect("previous head");
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = Some(previous.clone());
+
+        fs::rename(project.join("old.txt"), project.join("new.txt")).expect("rename file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["add", "-A"])
+            .status()
+            .expect("git add rename");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["commit", "-m", "rename"])
+            .status()
+            .expect("git commit rename");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+
+        fs::write(project.join("unchanged.txt"), "after local edit\n").expect("local edit");
+        fs::write(project.join("untracked.txt"), "untracked token\n").expect("untracked");
+
+        let refreshed = SearchIndex::rebuild_or_refresh(
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current),
+            Some(baseline),
+        );
+
+        assert!(!refreshed
+            .path_to_id
+            .contains_key(&canonical_project.join("old.txt")));
+        assert!(refreshed
+            .path_to_id
+            .contains_key(&canonical_project.join("new.txt")));
+        assert!(refreshed
+            .path_to_id
+            .contains_key(&canonical_project.join("untracked.txt")));
+        let matches =
+            refreshed.search_grep("after local edit", true, &[], &[], &canonical_project, 10);
+        assert_eq!(matches.matches.len(), 1);
     }
 
     #[test]

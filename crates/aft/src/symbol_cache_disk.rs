@@ -1,9 +1,11 @@
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::parser::SymbolCache;
+use crate::search_index::{cache_relative_path, validate_cached_relative_path};
 use crate::symbols::Symbol;
 use crate::{slog_info, slog_warn};
 
@@ -12,6 +14,45 @@ const VERSION: u32 = 2;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub struct SymbolCacheLock {
+    path: PathBuf,
+}
+
+impl SymbolCacheLock {
+    pub fn acquire(storage_dir: &Path, project_key: &str) -> std::io::Result<Self> {
+        let dir = storage_dir.join("symbols").join(project_key);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("symbols.lock");
+        for _ in 0..200 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    let _ = file.sync_all();
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "timed out acquiring symbol cache lock",
+        ))
+    }
+}
+
+impl Drop for SymbolCacheLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DiskSymbolCache {
@@ -77,11 +118,20 @@ pub fn write_to_disk(
         std::io::Error::other("symbol cache project root is not set; cannot persist relative paths")
     })?;
 
+    let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key)?;
     let dir = storage_dir.join("symbols").join(project_key);
     fs::create_dir_all(&dir)?;
 
     let data_path = dir.join("symbols.bin");
-    let tmp_path = dir.join("symbols.bin.tmp");
+    let tmp_path = dir.join(format!(
+        "symbols.bin.tmp.{}.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let write_result = write_cache_file(cache, &project_root, &tmp_path).and_then(|()| {
         fs::rename(&tmp_path, &data_path)?;
         if let Ok(dir_file) = File::open(&dir) {
@@ -132,7 +182,11 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
         if path_len > MAX_PATH_BYTES {
             return Err(format!("cached path too large: {path_len} bytes"));
         }
-        let relative_path = PathBuf::from(read_string_with_len(&mut reader, path_len)?);
+        let relative_path = validate_cached_relative_path(&PathBuf::from(read_string_with_len(
+            &mut reader,
+            path_len,
+        )?))
+        .ok_or_else(|| "cached symbol path escapes project root".to_string())?;
         let mtime_secs = read_i64(&mut reader)?;
         let mtime_nanos = read_u32(&mut reader)?;
         let size = read_u64(&mut reader)?;
@@ -173,7 +227,15 @@ fn write_cache_file(
     tmp_path: &Path,
 ) -> std::io::Result<()> {
     let mut writer = BufWriter::new(File::create(tmp_path)?);
-    let entries = cache.disk_entries();
+    let entries = cache
+        .disk_entries()
+        .into_iter()
+        .map(|(path, mtime, size, content_hash, symbols)| {
+            cache_relative_path(project_root, path)
+                .map(|relative_path| (relative_path, mtime, size, content_hash, symbols))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| std::io::Error::other("refusing to cache path outside project root"))?;
     let root = project_root.to_string_lossy();
     let root_len = u32::try_from(root.len())
         .map_err(|_| std::io::Error::other("project root too large to cache"))?;
@@ -186,11 +248,7 @@ fn write_cache_file(
     write_u32(&mut writer, entry_count)?;
     writer.write_all(root.as_bytes())?;
 
-    for (path, mtime, size, content_hash, symbols) in entries {
-        if symbols.is_empty() {
-            continue;
-        }
-        let relative_path = path.strip_prefix(project_root).unwrap_or(path.as_path());
+    for (relative_path, mtime, size, content_hash, symbols) in entries {
         let path_bytes = relative_path.to_string_lossy();
         let path_len = u32::try_from(path_bytes.len())
             .map_err(|_| std::io::Error::other("cached path too large"))?;
@@ -299,4 +357,99 @@ fn write_i64<W: Write>(writer: &mut W, value: i64) -> std::io::Result<()> {
 
 fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
     writer.write_all(&value.to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::symbols::{Range, SymbolKind};
+
+    fn test_symbol(name: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            range: Range {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 1,
+            },
+            signature: None,
+            scope_chain: Vec::new(),
+            exported: false,
+            parent: None,
+        }
+    }
+
+    fn test_cache(project: &Path, file_name: &str) -> SymbolCache {
+        let file = project.join(file_name);
+        fs::write(&file, format!("fn {file_name}() {{}}\n")).expect("write file");
+        let metadata = fs::metadata(&file).expect("metadata");
+        let content_hash = blake3::hash(&fs::read(&file).expect("read file"));
+        let mut cache = SymbolCache::new();
+        cache.set_project_root(project.to_path_buf());
+        cache.insert(
+            file,
+            metadata.modified().expect("mtime"),
+            metadata.len(),
+            content_hash,
+            vec![test_symbol(file_name)],
+        );
+        cache
+    }
+
+    #[test]
+    fn concurrent_symbol_cache_writes_do_not_share_temp_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project");
+        let storage = dir.path().join("storage");
+
+        let cache_a = test_cache(&project, "a");
+        let cache_b = test_cache(&project, "b");
+        let storage_a = storage.clone();
+        let writer_a = std::thread::spawn(move || {
+            write_to_disk(&cache_a, &storage_a, "unit-project").expect("write a");
+        });
+        let storage_b = storage.clone();
+        let writer_b = std::thread::spawn(move || {
+            write_to_disk(&cache_b, &storage_b, "unit-project").expect("write b");
+        });
+
+        writer_a.join().expect("writer a");
+        writer_b.join().expect("writer b");
+
+        let loaded = read_from_disk(&storage, "unit-project").expect("load symbol cache");
+        assert_eq!(loaded.len(), 1);
+        assert!(fs::read_dir(storage.join("symbols").join("unit-project"))
+            .expect("read symbol cache dir")
+            .all(|entry| !entry
+                .expect("cache entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
+    }
+
+    #[test]
+    fn symbol_cache_rejects_paths_outside_project_root_on_write() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project");
+        let outside = dir.path().join("outside.rs");
+        fs::write(&outside, "fn outside() {}\n").expect("write outside");
+        let metadata = fs::metadata(&outside).expect("metadata");
+
+        let mut cache = SymbolCache::new();
+        cache.set_project_root(project);
+        cache.insert(
+            outside.clone(),
+            metadata.modified().expect("mtime"),
+            metadata.len(),
+            blake3::hash(&fs::read(&outside).expect("read outside")),
+            vec![test_symbol("outside")],
+        );
+
+        let error = write_to_disk(&cache, dir.path(), "escape-project").expect_err("reject escape");
+        assert!(error.to_string().contains("outside project root"));
+    }
 }
