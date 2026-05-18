@@ -3,6 +3,17 @@ export interface AftStatusSnapshot {
   project_root: string | null;
   canonical_root: string | null;
   cache_role: string;
+  /**
+   * True when at least one heavy AFT subsystem has been auto-disabled for
+   * the current project root. `degraded_reasons` enumerates why (e.g.
+   * `["home_root"]`, `["search_too_many_files:20000"]`). The sidebar / TUI
+   * dialog surface this so users know `aft_search`, `aft_navigate` etc.
+   * won't return results from this session and can choose to open a
+   * project subdirectory instead.
+   */
+  degraded: boolean;
+  /** Machine-readable degraded-mode reasons. Empty when `degraded === false`. */
+  degraded_reasons: string[];
   features: {
     format_on_edit: boolean;
     validate_on_edit: string;
@@ -112,6 +123,10 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     project_root: readNullableString(response.project_root),
     canonical_root: readNullableString(response.canonical_root),
     cache_role: readString(response.cache_role, "not_initialized"),
+    degraded: readBoolean(response.degraded),
+    degraded_reasons: Array.isArray(response.degraded_reasons)
+      ? response.degraded_reasons.filter((r): r is string => typeof r === "string")
+      : [],
     features: {
       format_on_edit: readBoolean(features.format_on_edit),
       validate_on_edit: readString(features.validate_on_edit, "off"),

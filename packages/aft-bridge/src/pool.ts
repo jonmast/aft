@@ -9,19 +9,22 @@ const DEFAULT_MAX_POOL_SIZE = 8;
 const CLEANUP_INTERVAL_MS = 60 * 1000; // check every minute
 
 /**
- * Error thrown when {@link BridgePool.getBridge} is called with a project root
- * that resolves to the user's home directory.
+ * Historical error class — kept for backwards-compatible imports.
  *
- * Note #65: when OpenCode Desktop / Pi launches from `~` and a session has no
- * stored project directory, the resolver hands the plugin the home dir as the
- * "project root". Configuring an aft bridge against `$HOME` walks 100k–10M
- * files (entire user home), times out the 30s configure budget, gets killed
- * by the bridge timeout, and silently retries on every reload — wasting one
- * full bridge spawn per restart with no agent-visible benefit.
+ * **No longer thrown by `BridgePool.getBridge()`.** Prior versions refused
+ * to spawn a bridge when `project_root` resolved to `$HOME`, but that was
+ * too restrictive: legitimate migration tasks (e.g. shell config sweeps,
+ * dotfile maintenance) need to operate from `$HOME` directly. The Rust
+ * `handle_configure` now auto-disables heavy subsystems
+ * (`search_index`, `semantic_search`) and records `degraded_reasons:
+ * ["home_root"]` on the status snapshot, so the bridge spawns fast,
+ * `read`/`write`/`edit`/`bash` work, and the sidebar / `/aft-status`
+ * surfaces the degraded state. See `crates/aft/src/commands/configure.rs`
+ * for the full reasoning.
  *
- * Callers should detect this and decline to call `getBridge()` for `$HOME`.
- * The pool throws as a defense-in-depth check so any future regression is
- * loud rather than silent.
+ * Plugins still skip *eager* configure on `$HOME` (Desktop launches from
+ * `~` shouldn't auto-warm a bridge no one asked for), but lazy configure
+ * on the first real tool call works in degraded mode.
  */
 export class HomeProjectRootError extends Error {
   constructor(public readonly projectRoot: string) {
@@ -155,16 +158,13 @@ export class BridgePool {
   getBridge(projectRoot: string): BinaryBridge {
     const key = normalizeKey(projectRoot);
 
-    // Defense-in-depth: refuse to spawn a bridge when the resolved project
-    // root is the user's home directory. Configuring on `$HOME` walks the
-    // entire user home tree (often hundreds of thousands of files), times
-    // out the configure budget, gets killed, then silently retries on every
-    // reload. Callers should detect this case BEFORE getBridge() and skip
-    // (e.g. eager configure logs and continues), but throwing here makes
-    // any future regression loud rather than silent.
-    if (isHomeDirectoryRoot(key)) {
-      throw new HomeProjectRootError(key);
-    }
+    // `$HOME`-rooted spawns are no longer refused here. The Rust
+    // `handle_configure` auto-disables heavy subsystems (search_index,
+    // semantic_search) for `$HOME` and records the state on the status
+    // snapshot. Plugins still skip *eager* configure on `$HOME` (Desktop
+    // launches from `~` shouldn't auto-warm a bridge no one asked for),
+    // but lazy configure on the first real tool call now works in
+    // degraded mode — see HomeProjectRootError doc-comment above.
 
     const existing = this.bridges.get(key);
     if (existing) {

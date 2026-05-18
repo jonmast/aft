@@ -27,6 +27,15 @@ use crate::{slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+const MAX_SEARCH_INDEX_FILES: usize = 20_000;
+
+fn resolve_home_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    Some(std::fs::canonicalize(&raw).unwrap_or(raw))
+}
+
 fn create_project_watcher(
     root_path: PathBuf,
     tx: mpsc::Sender<notify::Result<notify::Event>>,
@@ -974,6 +983,31 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // walker's depth/filter_entry settings in `rebuild_gitignore`.
     ctx.rebuild_gitignore();
 
+    // Detect "this is not really a project root" scenarios and prepare to
+    // auto-disable the heavy subsystems (search/semantic) so the bridge stays
+    // useful for read/write/edit/bash without burning CPU/RAM indexing the
+    // user's home tree. The decision is recorded on `AppContext` as a list
+    // of `degraded_reasons` strings; status / sidebar surfaces it, and we
+    // override `config.search_index` and `config.semantic_search` below
+    // before they're read by the subsystem builders.
+    //
+    // Two checks here:
+    //   1. Canonical path == `$HOME` — the original "Desktop launched from
+    //      `~` and SDK fell back to home" case. Subdirs of `$HOME` do NOT
+    //      match (a real project that lives under `~/Work/...` is fine).
+    //      Note we use the canonical path, so a symlink chain that resolves
+    //      to `$HOME` (e.g. weird stow setups, container chroots where
+    //      `~/.dotfiles -> /home/user`) also trips this — exactly what the
+    //      user reported for the `~/.dotfiles` case.
+    //   2. File-count threshold checks (search >20k, semantic >10k) happen
+    //      LATER inside the build threads with their respective caps; those
+    //      are skip-with-status rather than configure-time decisions.
+    let mut degraded_reasons: Vec<String> = Vec::new();
+    let home_match = resolve_home_dir().is_some_and(|home| home == canonical_cache_root);
+    if home_match {
+        degraded_reasons.push("home_root".to_string());
+    }
+
     // Optional feature flags from plugin config
     // Optional feature flags from plugin config
     if let Some(v) = params.get("format_on_edit").and_then(|v| v.as_bool()) {
@@ -1213,17 +1247,63 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     //
     // The cap-bounded count below uses `take(max + 1)` so it costs O(cap),
     // not O(project) — fast enough to compute synchronously even on huge
-    // trees, and only used as a hint about callgraph viability.
+    // trees, and used for two distinct decisions:
+    //   1. Call-graph viability (cap = `max_callgraph_files`, default 5_000)
+    //   2. Search index auto-disable (cap = `MAX_SEARCH_INDEX_FILES`, 20_000)
+    //
+    // We use the larger of the two as the walk bound so one O(cap) walk
+    // answers both checks. Counting up to 20_001 takes a few hundred ms even
+    // on a 2M-file `$HOME` (limited by directory traversal latency, not by
+    // the cap itself); still well under configure's budget.
     let max_callgraph_files = ctx.config().max_callgraph_files;
+    let walk_limit = max_callgraph_files.max(MAX_SEARCH_INDEX_FILES) + 1;
     let source_file_count = crate::callgraph::walk_project_files(&root_path)
-        .take(max_callgraph_files + 1)
+        .take(walk_limit)
         .count();
     let exceeds = source_file_count > max_callgraph_files;
+    let exceeds_search_threshold = source_file_count > MAX_SEARCH_INDEX_FILES;
     if exceeds {
         slog_warn!(
             "project has >{} source files. Call-graph operations (callers, trace_to, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
             max_callgraph_files
         );
+    }
+    if exceeds_search_threshold && ctx.config().search_index {
+        slog_warn!(
+            "project has >{} source files. Search index auto-disabled — open a project subdirectory for grep/aft_search.",
+            MAX_SEARCH_INDEX_FILES
+        );
+        ctx.config_mut().search_index = false;
+        degraded_reasons.push(format!("search_too_many_files:{}", MAX_SEARCH_INDEX_FILES));
+    }
+
+    // Apply degraded-mode overrides BEFORE snapshotting the flags below.
+    // Heavy subsystems disabled when the resolved project root is `$HOME`:
+    //   - `search_index`: would otherwise trigram-index everything under
+    //     `~/Documents`, `~/Downloads`, `~/Library`, etc. Useless for any
+    //     real agent task and burns memory + disk + time.
+    //   - `semantic_search`: same logic; the model walk also has memory
+    //     cost via 200MB-ish embedding state.
+    // Callgraph naturally degrades through the existing `max_callgraph_files`
+    // refusal when source-file count exceeds the cap, so no manual override
+    // is needed there.
+    if home_match {
+        if ctx.config().search_index {
+            ctx.config_mut().search_index = false;
+            slog_warn!(
+                "search_index auto-disabled: project root is the user home directory \
+                 ({}). Open a project subdirectory for full features.",
+                canonical_cache_root.display()
+            );
+        }
+        if ctx.config().semantic_search {
+            ctx.config_mut().semantic_search = false;
+            slog_warn!(
+                "semantic_search auto-disabled: project root is the user home directory \
+                 ({}). Open a project subdirectory for full features.",
+                canonical_cache_root.display()
+            );
+        }
     }
 
     let search_index = ctx.config().search_index;
@@ -1259,6 +1339,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_index_rx().borrow_mut() = None;
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
     *ctx.semantic_embedding_model().borrow_mut() = None;
+
+    // Snapshot accumulated degraded reasons on the context so status /
+    // sidebar / future tool calls all see the same state. Reasons emitted
+    // synchronously so far: `home_root` and `search_too_many_files:N`.
+    // The semantic-build thread may push its own "skipped — too many files"
+    // status downstream; we don't yet thread that back into the persistent
+    // reasons list because semantic auto-skip is already surfaced through
+    // `SemanticIndexStatus::Failed`. If that ever becomes inconsistent UX
+    // we can wire it through a channel; for now status snapshot sources
+    // semantic state from the live SemanticIndexStatus, not the reasons.
+    ctx.set_degraded_reasons(degraded_reasons.clone());
 
     let storage_dir = ctx.config().storage_dir.clone();
     let mut search_index_cache_reused = false;
@@ -1791,6 +1882,126 @@ mod tests {
             std::fs::canonicalize(temp.path()).unwrap()
         );
         assert_eq!(ctx.cache_role(), "main");
+    }
+
+    /// Shared mutex serializing the home-root tests below. Both tests
+    /// mutate process-global `HOME` / `USERPROFILE` env vars, and `cargo
+    /// test` runs unit tests concurrently within the same process — without
+    /// serialization a parallel `set_var("HOME", X)` in test A can race
+    /// `resolve_home_dir()` in test B and produce flaky failures.
+    fn home_env_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn handle_configure_enters_degraded_mode_when_project_root_is_home() {
+        let _guard = home_env_mutex().lock().unwrap();
+        // Simulate the Desktop-launches-from-`~` case by pointing `HOME` at a
+        // tempdir and using that same tempdir as `project_root`. The
+        // canonical-equality check inside `handle_configure` is the same
+        // mechanism that catches real `$HOME` regardless of HOME mutation.
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(temp.path()).unwrap();
+
+        // Save + restore HOME so we don't pollute other tests in the
+        // same process (Rust runs tests in parallel by default but env
+        // mutation is process-global). For Windows, USERPROFILE is the
+        // var `resolve_home_dir` checks after HOME.
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        // SAFETY: env mutation is sound here — this is single-threaded test
+        // setup. The matching restore at the bottom runs even on assertion
+        // failure because Rust's panic path executes drop order, but we make
+        // the env writes explicit for clarity.
+        unsafe {
+            std::env::set_var("HOME", &canonical);
+            std::env::set_var("USERPROFILE", &canonical);
+        }
+
+        let ctx = test_context();
+        ctx.config_mut().search_index = true;
+        ctx.config_mut().semantic_search = true;
+        let req = configure_request(json!(temp.path()));
+        let response = super::handle_configure(&req, &ctx);
+
+        // Restore env immediately so a later assertion failure doesn't leak.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+
+        assert!(response.success);
+        assert!(ctx.is_degraded(), "expected degraded mode for HOME root");
+        assert!(
+            ctx.degraded_reasons().contains(&"home_root".to_string()),
+            "expected `home_root` reason, got {:?}",
+            ctx.degraded_reasons()
+        );
+        // Heavy subsystems must have been force-disabled regardless of user config.
+        assert!(
+            !ctx.config().search_index,
+            "search_index must be auto-disabled at HOME root"
+        );
+        assert!(
+            !ctx.config().semantic_search,
+            "semantic_search must be auto-disabled at HOME root"
+        );
+    }
+
+    #[test]
+    fn handle_configure_stays_full_featured_for_subdirectory_of_home() {
+        let _guard = home_env_mutex().lock().unwrap();
+        // A real subdirectory of `$HOME` (the legitimate case: most projects
+        // live under `~/Work`, `~/Documents`, etc.) must NOT trip the
+        // degraded gate. We point HOME at a tempdir and configure against a
+        // nested subdir to confirm subdirs pass through.
+        let temp = tempfile::tempdir().unwrap();
+        let subdir = temp.path().join("project");
+        std::fs::create_dir(&subdir).unwrap();
+        let canonical_home = std::fs::canonicalize(temp.path()).unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", &canonical_home);
+            std::env::set_var("USERPROFILE", &canonical_home);
+        }
+
+        let ctx = test_context();
+        ctx.config_mut().search_index = true;
+        let req = configure_request(json!(subdir));
+        let response = super::handle_configure(&req, &ctx);
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+
+        assert!(response.success);
+        assert!(
+            !ctx.is_degraded(),
+            "subdirectories of $HOME must not enter degraded mode"
+        );
+        assert!(
+            ctx.degraded_reasons().is_empty(),
+            "expected no degraded reasons, got {:?}",
+            ctx.degraded_reasons()
+        );
+        // User config preserved.
+        assert!(ctx.config().search_index);
     }
 
     #[cfg(unix)]

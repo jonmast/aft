@@ -226,6 +226,28 @@ const SidebarContent = (props: {
   const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
   const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
 
+  // Degraded-mode reason → human-readable hint. Distinct strings per reason
+  // because the UX direction is different: "home_root" tells the user to
+  // open a real project subdirectory, "search_too_many_files" tells them the
+  // tree is too big for full indexing.
+  const degradedReasonLabel = (reason: string): string => {
+    if (reason === "home_root") {
+      return "project root is your home directory";
+    }
+    if (reason.startsWith("search_too_many_files:")) {
+      const threshold = reason.split(":")[1] ?? "20000";
+      return `project exceeds ${threshold} files`;
+    }
+    return reason; // unknown reason — surface verbatim so users can grep logs
+  };
+  const degradedSummary = () => {
+    const snap = s();
+    if (!snap?.degraded) return null;
+    const reasons = snap.degraded_reasons ?? [];
+    if (reasons.length === 0) return null;
+    return reasons.map(degradedReasonLabel).join("; ");
+  };
+
   return (
     <box
       width="100%"
@@ -237,15 +259,38 @@ const SidebarContent = (props: {
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: AFT badge + binary version */}
+      {/* Header: AFT badge + binary version + degraded badge (when active) */}
       <box flexDirection="row" justifyContent="space-between" alignItems="center">
-        <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
-          <text fg={props.theme.background}>
-            <b>AFT</b>
-          </text>
+        <box flexDirection="row" alignItems="center">
+          <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
+            <text fg={props.theme.background}>
+              <b>AFT</b>
+            </text>
+          </box>
+          {s()?.degraded && (
+            <box
+              paddingLeft={1}
+              paddingRight={1}
+              marginLeft={1}
+              backgroundColor={props.theme.warning}
+            >
+              <text fg={props.theme.background}>
+                <b>DEGRADED</b>
+              </text>
+            </box>
+          )}
         </box>
         <text fg={props.theme.textMuted}>v{s()?.version ?? props.pluginVersion}</text>
       </box>
+
+      {/* Degraded reason — explains why heavy tools (aft_search, aft_navigate)
+          are disabled. Surface this prominently so users know to open a real
+          project subdirectory if they want full features. */}
+      {s()?.degraded && degradedSummary() && (
+        <box marginTop={1} width="100%">
+          <text fg={props.theme.warning}>⚠ {degradedSummary()}</text>
+        </box>
+      )}
 
       {/* Search index */}
       <SectionHeader theme={props.theme} title="Search Index" />

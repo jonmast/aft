@@ -147,11 +147,23 @@ impl AppContext {
         let session_checkpoints = self.checkpoint().borrow().list(session_id).len();
         let session_tracked_files = self.backup().borrow().tracked_files(session_id).len();
 
+        // Degraded-mode reasons recorded by `handle_configure` when the
+        // project root doesn't look like a real project (`home_root`) or the
+        // file count exceeds the search-index threshold
+        // (`search_too_many_files:N`). Heavy subsystems are auto-disabled in
+        // these modes; the plugin / TUI sidebar surface the reasons so users
+        // know why and can decide whether to open a project subdirectory.
+        // Empty list = full-featured mode.
+        let degraded_reasons = self.degraded_reasons();
+        let degraded = !degraded_reasons.is_empty();
+
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
             "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
             "cache_role": self.cache_role(),
+            "degraded": degraded,
+            "degraded_reasons": degraded_reasons,
             "features": {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),

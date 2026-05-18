@@ -284,6 +284,14 @@ pub struct AppContext {
     canonical_cache_root: RefCell<Option<PathBuf>>,
     is_worktree_bridge: RefCell<bool>,
     git_common_dir: RefCell<Option<PathBuf>>,
+    /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
+    /// current project root. Populated by `handle_configure` based on the
+    /// canonical project root and synchronous file count. Each reason is a
+    /// stable machine-readable string suffix (`"home_root"`,
+    /// `"search_too_many_files:N"`, etc.) so the plugin can render distinct
+    /// degraded-mode UI states without re-deriving the reason locally.
+    /// Empty when the project is healthy / full-featured.
+    degraded_reasons: RefCell<Vec<String>>,
     callgraph: RefCell<Option<CallGraph>>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
@@ -349,6 +357,7 @@ impl AppContext {
             canonical_cache_root: RefCell::new(None),
             is_worktree_bridge: RefCell::new(false),
             git_common_dir: RefCell::new(None),
+            degraded_reasons: RefCell::new(Vec::new()),
             callgraph: RefCell::new(None),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
@@ -651,6 +660,25 @@ impl AppContext {
 
     pub fn is_worktree_bridge(&self) -> bool {
         *self.is_worktree_bridge.borrow()
+    }
+
+    /// Replace the current degraded-mode reasons. Empty vec = full-featured
+    /// mode (no degradation). Called by `handle_configure` after deciding
+    /// which subsystems to disable for this project root.
+    pub fn set_degraded_reasons(&self, reasons: Vec<String>) {
+        *self.degraded_reasons.borrow_mut() = reasons;
+    }
+
+    /// Snapshot of current degraded-mode reasons. Order is stable
+    /// (insertion order from `set_degraded_reasons`) so UI rendering and
+    /// snapshot diffs are deterministic.
+    pub fn degraded_reasons(&self) -> Vec<String> {
+        self.degraded_reasons.borrow().clone()
+    }
+
+    /// True iff at least one degraded reason is recorded.
+    pub fn is_degraded(&self) -> bool {
+        !self.degraded_reasons.borrow().is_empty()
     }
 
     pub fn cache_role(&self) -> &'static str {
