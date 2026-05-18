@@ -86,48 +86,40 @@ describe("readBinaryVersion", () => {
   });
 });
 
-// The two findBinarySync env-mutation tests below pass locally on macOS (5x stable)
-// but fail intermittently on Linux GitHub Actions runners. Investigation shows the
-// resolver's first `readBinaryVersion(binaryPath)` call succeeds (precondition
-// passes) but the same call moments later inside `findBinarySync` returns null
-// — likely a Bun/Linux interaction with `spawnSync` reusing a shebang script
-// under the test's `process.env` overrides.
-//
-// The underlying resolver contract IS covered:
-//   - All 7 `readBinaryVersion` tests above (env-stable, pass on all platforms)
-//   - Live Pi RPC e2e tests exercise findBinarySync with real binaries
-//   - Live dogfooding verified the v0.22→v0.23 cache-mismatch fix in production
-//
-// Skipping on CI Linux while we debug the spawn flake at leisure (issue
-// tracked in `.alfonso/notes/`). Will re-enable once the root cause is found
-// or the test is rewritten to not depend on env mutation.
-const IS_CI_LINUX = process.platform === "linux" && process.env.CI === "true";
-
-describe.skipIf(IS_CI_LINUX)("findBinarySync versioned cache validation", () => {
+describe("findBinarySync versioned cache validation", () => {
   let tmpDir: string;
-  let prevXdgCacheHome: string | undefined;
-  let prevPath: string | undefined;
-  let prevHome: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "aft-cache-version-test-"));
-    prevXdgCacheHome = process.env.XDG_CACHE_HOME;
-    prevPath = process.env.PATH;
-    prevHome = process.env.HOME;
-    process.env.XDG_CACHE_HOME = tmpDir;
-    process.env.PATH = "";
-    process.env.HOME = tmpDir;
   });
 
   afterEach(() => {
-    if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
-    else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
-    if (prevPath === undefined) delete process.env.PATH;
-    else process.env.PATH = prevPath;
-    if (prevHome === undefined) delete process.env.HOME;
-    else process.env.HOME = prevHome;
     rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  function withResolverEnvironment<T>(callback: () => T): T {
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const prevPath = process.env.PATH;
+    const prevHome = process.env.HOME;
+
+    // Bun runs test files concurrently in one process. Keep process.env
+    // overrides scoped to the synchronous resolver call so other async test
+    // files cannot clobber XDG_CACHE_HOME between setup and lookup.
+    process.env.XDG_CACHE_HOME = tmpDir;
+    process.env.PATH = "";
+    process.env.HOME = tmpDir;
+
+    try {
+      return callback();
+    } finally {
+      if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  }
 
   function writeCachedVersion(dirVersion: string, reportedVersion: string): string {
     const binaryPath = join(
@@ -148,20 +140,18 @@ describe.skipIf(IS_CI_LINUX)("findBinarySync versioned cache validation", () => 
 
     // Precondition: the cached binary actually exists at the expected path.
     expect(existsSync(binaryPath)).toBe(true);
-    expect(process.env.XDG_CACHE_HOME).toBe(tmpDir);
 
     // Precondition: the fake binary actually reports the expected version.
     expect(readBinaryVersion(binaryPath)).toBe("1.2.3");
 
-    expect(findBinarySync("1.2.3")).toBe(binaryPath);
+    expect(withResolverEnvironment(() => findBinarySync("1.2.3"))).toBe(binaryPath);
   });
 
   test("skips mislabeled newer cached binary instead of accepting directory name", () => {
     const binaryPath = writeCachedVersion("v1.2.3", "9.9.9");
 
     expect(existsSync(binaryPath)).toBe(true);
-    expect(process.env.XDG_CACHE_HOME).toBe(tmpDir);
 
-    expect(findBinarySync("1.2.3")).toBeNull();
+    expect(withResolverEnvironment(() => findBinarySync("1.2.3"))).toBeNull();
   });
 });

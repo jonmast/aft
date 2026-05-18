@@ -4,8 +4,10 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log, warn } from "./active-logger.js";
-import { ensureBinary, getCacheDir, getCachedBinaryPath } from "./downloader.js";
+import { ensureBinary, getCacheDir } from "./downloader.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
+
+type ResolverEnv = typeof process.env;
 
 /**
  * Read the version string from an `aft` binary by invoking it with
@@ -82,6 +84,25 @@ function normalizeBareVersion(version: string): string {
   return version.startsWith("v") ? version.slice(1) : version;
 }
 
+function homeDirFromEnv(env: ResolverEnv): string {
+  return (process.platform === "win32" ? env.USERPROFILE || env.HOME : env.HOME) || homedir();
+}
+
+function cacheDirFromEnv(env: ResolverEnv): string {
+  if (process.platform === "win32") {
+    const base = env.LOCALAPPDATA || env.APPDATA || join(homeDirFromEnv(env), "AppData", "Local");
+    return join(base, "aft", "bin");
+  }
+
+  const base = env.XDG_CACHE_HOME || join(homeDirFromEnv(env), ".cache");
+  return join(base, "aft", "bin");
+}
+
+function cachedBinaryPathFromEnv(version: string, env: ResolverEnv, ext: string): string | null {
+  const binaryPath = join(cacheDirFromEnv(env), version, `aft${ext}`);
+  return existsSync(binaryPath) ? binaryPath : null;
+}
+
 function isExpectedCachedBinary(binaryPath: string, expectedVersion: string): boolean {
   const expected = normalizeBareVersion(expectedVersion);
   const actual = readBinaryVersion(binaryPath);
@@ -138,6 +159,7 @@ export function platformKey(
  */
 export function findBinarySync(expectedVersion?: string): string | null {
   const ext = process.platform === "win32" ? ".exe" : "";
+  const env = { ...process.env };
 
   // 1. Check versioned cache for the requested version (or this package's own
   // version as a fallback so direct callers without a host still benefit from
@@ -154,7 +176,7 @@ export function findBinarySync(expectedVersion?: string): string | null {
     })();
   if (pluginVersion) {
     const tag = pluginVersion.startsWith("v") ? pluginVersion : `v${pluginVersion}`;
-    const versionCached = getCachedBinaryPath(tag);
+    const versionCached = cachedBinaryPathFromEnv(tag, env, ext);
     if (versionCached && isExpectedCachedBinary(versionCached, pluginVersion)) return versionCached;
   }
 
@@ -196,6 +218,7 @@ export function findBinarySync(expectedVersion?: string): string | null {
     const whichCmd = process.platform === "win32" ? "where aft" : "which aft";
     const result = execSync(whichCmd, {
       encoding: "utf-8",
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
     if (result) return result;
@@ -204,7 +227,7 @@ export function findBinarySync(expectedVersion?: string): string | null {
   }
 
   // 4. Check ~/.cargo/bin/aft
-  const cargoPath = join(homedir(), ".cargo", "bin", `aft${ext}`);
+  const cargoPath = join(homeDirFromEnv(env), ".cargo", "bin", `aft${ext}`);
   if (existsSync(cargoPath)) return cargoPath;
 
   return null;
