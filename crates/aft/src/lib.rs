@@ -71,6 +71,7 @@ pub mod language;
 pub mod log_ctx;
 pub mod lsp;
 pub mod lsp_hints;
+pub mod migrate_storage;
 pub mod parser;
 pub mod protocol;
 pub mod query_shape;

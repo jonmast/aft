@@ -18,6 +18,23 @@ fn main() {
         return;
     }
 
+    if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match aft::migrate_storage::parse_cli_args(args) {
+            Ok(args) => {
+                let status = aft::migrate_storage::run_with_options(
+                    args,
+                    aft::migrate_storage::Options::default(),
+                );
+                std::process::exit(i32::from(status.code()));
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             use std::io::Write;
