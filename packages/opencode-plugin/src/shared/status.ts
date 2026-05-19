@@ -57,6 +57,14 @@ export interface AftStatusSnapshot {
     tracked_files: number;
     checkpoints: number;
   };
+  /**
+   * Human-readable explanation for a synthetic snapshot (e.g.
+   * `cache_role === "not_initialized"`). When the plugin returns a placeholder
+   * because no bridge has been spawned yet, this message tells the user what
+   * to expect; the TUI dialog renders it instead of an empty grid of zeros.
+   * Empty string when the snapshot is real bridge data.
+   */
+  message: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -170,6 +178,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       tracked_files: readNumber(session.tracked_files),
       checkpoints: readNumber(session.checkpoints),
     },
+    message: readString(response.message, ""),
   };
 }
 

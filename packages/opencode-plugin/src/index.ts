@@ -9,7 +9,6 @@ import {
   ensureOnnxRuntime,
   findBinary,
   getManualInstallHint,
-  isHomeDirectoryRoot,
   isOrtAutoDownloadSupported,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
@@ -500,68 +499,22 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     );
   }
 
-  // Eager async configure: fire-and-forget a status request so the bridge
-  // for `input.directory` warms up (spawns the binary, runs configure,
-  // pre-loads disk-backed indexes) before the agent's first tool call.
+  // Bridge spawn is lazy: the first tool call routed through `callBridge()`
+  // (see `tools/_shared.ts`) creates the bridge on demand. Plugin init used
+  // to fire-and-forget an eager configure here, but on OpenCode Desktop the
+  // user typically has many projects open in the sidebar and only actively
+  // uses one or two per session. Eager warmup spawned an `aft` process plus
+  // watcher, LSP manager, and index loaders for every project at startup,
+  // even ones the user never tool-touched — multiplying memory, CPU, and
+  // file-watcher load by 10x or more for no benefit.
   //
-  // We send `status` rather than `configure` because `bridge.send()` runs
-  // configure lazily on the first non-{configure,version} command, and
-  // status is the cheapest valid request that triggers that path. Errors
-  // are swallowed — if configure fails on init, the next real tool call
-  // will surface a proper error to the agent.
-  //
-  // When semantic_search is enabled with the fastembed backend, we MUST
-  // wait for ONNX Runtime resolution before spawning the eager bridge.
-  // Otherwise the bridge starts without ORT_DYLIB_PATH in its env, and the
-  // subsequent setConfigureOverride('_ort_dylib_dir', ...) call on the pool
-  // only affects bridges spawned after that — but the eager bridge is
-  // already running. Result: that first bridge tries to load semantic and
-  // fails with `ONNX Runtime not found`, which surfaces as the
-  // "Semantic Index status: failed" the user sees in the TUI sidebar even
-  // though ONNX downloaded successfully.
-  void (async () => {
-    try {
-      // Note #65: skip eager configure when OpenCode launched the plugin
-      // from the user's home directory. Configuring on `$HOME` walks 100k–10M
-      // files (entire user home), times out the 30s configure budget, gets
-      // killed, then silently retries on every reload. Subsequent real tool
-      // calls will still arrive with proper per-session project roots and
-      // get their own bridges; the eager warmup just doesn't help here.
-      if (isHomeDirectoryRoot(input.directory)) {
-        log(
-          `Eager configure skipped: input.directory=${input.directory} is the user home directory. ` +
-            `The first real tool call from a session will warm the correct project bridge.`,
-        );
-        return;
-      }
-      if (onnxRuntimePromise) {
-        // Await ONNX resolution so _ort_dylib_dir is set on the pool BEFORE
-        // we spawn the bridge. Cap at 60s so a slow/broken download doesn't
-        // permanently block the eager warm path; the bridge still spawns
-        // without ORT after the cap and semantic just fails (matching the
-        // pre-fix behavior, which is no worse than today).
-        await Promise.race([
-          onnxRuntimePromise,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 60_000)),
-        ]);
-      }
-      const bridge = pool.getBridge(input.directory);
-      // No session_id: this runs before any user session exists; the
-      // resulting configure threads will log with no [ses_xxx] prefix
-      // (correct behavior for plugin-init activity).
-      const response = await bridge.send("status", {}, { configureWarningClient: input.client });
-      // Seed the plugin-side cache so the TUI sidebar's first poll after
-      // spawn finds a warm snapshot instead of racing into bridge.send and
-      // hitting the 5s client timeout while the bridge dispatch loop is
-      // still finishing configure. Push frames will overwrite this with
-      // fresh data on every state transition (1s debounce).
-      if (response.success !== false) {
-        bridge.cacheStatusSnapshot(response as Parameters<typeof bridge.cacheStatusSnapshot>[0]);
-      }
-    } catch (err) {
-      log(`eager configure failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  })();
+  // ONNX Runtime resolution still happens in the background (kicked off
+  // above). The `.then(...)` handler at line ~485 pushes `_ort_dylib_dir`
+  // into the pool's configure overrides as soon as the download finishes,
+  // so any bridge spawned later (including the first lazy spawn) picks it
+  // up automatically. If a tool call lands before ONNX finishes, semantic
+  // is unavailable on that specific bridge — same behavior as today on
+  // first install, and a small price for skipping the eager wait.
 
   // Start RPC server for TUI plugin communication
   const rpcServer = new AftRpcServer(configOverrides.storage_dir as string, input.directory);
@@ -608,8 +561,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       return {
         success: true,
         status: "not_initialized",
-        message:
-          "AFT bridge has not been initialized for this project yet. Status will populate after the first tool call.",
+        message: "Waiting for first tool call to populate",
       };
     }
     const cached = bridge.getCachedStatus();

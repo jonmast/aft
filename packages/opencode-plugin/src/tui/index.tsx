@@ -178,8 +178,21 @@ const StatusDialog = (props: StatusDialogProps) => {
         </box>
       ) : null}
 
+      {/* Lazy-bridge placeholder: when no bridge has spawned for this project
+          yet (because the user has not made any tool call since opening
+          OpenCode), the RPC server returns a synthetic snapshot with
+          cache_role === "not_initialized". Show the explanatory message
+          instead of an empty grid of zeros and "unknown" rows. */}
+      {status()?.cache_role === "not_initialized" ? (
+        <box width="100%" marginTop={1} justifyContent="center">
+          <text fg={t().textMuted}>
+            {status()!.message || "Waiting for first tool call to populate"}
+          </text>
+        </box>
+      ) : null}
+
       {/* Header rows — paths span full width since they can be long */}
-      {status() ? (
+      {status() && status()!.cache_role !== "not_initialized" ? (
         <box flexDirection="column" width="100%" marginBottom={1}>
           <R
             theme={t()}

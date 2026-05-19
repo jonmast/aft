@@ -292,6 +292,21 @@ const SidebarContent = (props: {
         </box>
       )}
 
+      {/* Lazy-bridge placeholder. AFT skips spawning the `aft` binary at
+          plugin init to keep memory/CPU low on OpenCode Desktop sessions
+          that have many projects pinned in the sidebar. The RPC server
+          returns a synthetic `cache_role === "not_initialized"` snapshot
+          until the first tool call routes through `callBridge()` and warms
+          the bridge. Show the explanatory message instead of empty status
+          rows so users understand why metrics are blank. */}
+      {s()?.cache_role === "not_initialized" && (
+        <box marginTop={1} width="100%">
+          <text fg={props.theme.textMuted}>
+            {s()!.message || "Waiting for first tool call to populate"}
+          </text>
+        </box>
+      )}
+
       {/* Search index */}
       <SectionHeader theme={props.theme} title="Search Index" />
       <StatRow
