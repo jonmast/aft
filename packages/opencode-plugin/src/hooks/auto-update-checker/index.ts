@@ -27,6 +27,11 @@ type ResolvedAutoUpdateCheckerOptions = Required<
 
 const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_INIT_DELAY_MS = 5_000;
+// v0.27 commit 11 deferral: the legacy `last-update-check.json` file is read at
+// plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
+// 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
+// spawn at every plugin init. Deferred to a future version that decides whether
+// to accept that trade-off; this path stays on direct legacy-file access.
 const TIMESTAMP_FILENAME = "last-update-check.json";
 
 /**

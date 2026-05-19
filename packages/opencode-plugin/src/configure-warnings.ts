@@ -20,6 +20,7 @@
  * from this file directly.
  */
 
+import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { warn } from "./logger.js";
 import { type ConfigureWarning, deliverConfigureWarnings } from "./notifications.js";
 
@@ -50,6 +51,7 @@ export async function handleConfigureWarningsForSession(context: {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
+  bridge: Pick<BinaryBridge, "send">;
   warnings: unknown[];
   fallbackClient: unknown;
   storageDir: string;
@@ -74,6 +76,7 @@ export async function handleConfigureWarningsForSession(context: {
     {
       client: context.client ?? context.fallbackClient,
       sessionId: context.sessionId,
+      bridge: context.bridge,
       storageDir: context.storageDir,
       pluginVersion: context.pluginVersion,
       projectRoot: context.projectRoot,

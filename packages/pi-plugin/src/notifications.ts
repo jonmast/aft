@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { log, sessionLog } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
 const FEATURE_MARKER = "🔧 AFT: ✨";
-const WARNED_TOOLS_FILE = "warned_tools.json";
 
 export interface ConfigureWarning {
   kind: "formatter_not_installed" | "checker_not_installed" | "lsp_binary_missing";
@@ -18,6 +18,7 @@ export interface ConfigureWarning {
 export interface ConfigureWarningOptions {
   client: unknown;
   sessionId: string;
+  bridge: Pick<BinaryBridge, "send">;
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
@@ -45,59 +46,41 @@ function sendIgnoredMessage(client: unknown, sessionId: string, text: string): b
   }
 }
 
-function readWarnedTools(storageDir: string): Record<string, string> {
+async function readWarnedTools(
+  bridge: Pick<BinaryBridge, "send">,
+): Promise<Record<string, unknown>> {
   try {
-    const warnedToolsPath = join(storageDir, WARNED_TOOLS_FILE);
-    if (!existsSync(warnedToolsPath)) return {};
+    const resp = await bridge.send("db_get_state", { key: "warned_tools" });
+    if (resp.success === false) return {};
 
-    const parsed = JSON.parse(readFileSync(warnedToolsPath, "utf-8")) as unknown;
+    const value = (resp.data as { value?: unknown } | undefined)?.value;
+    if (typeof value !== "string") return {};
+
+    const parsed = JSON.parse(value) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-
-    const warned: Record<string, string> = {};
-    for (const [key, version] of Object.entries(parsed)) {
-      if (typeof version === "string") {
-        warned[key] = version;
-      }
-    }
-    return warned;
+    return parsed as Record<string, unknown>;
   } catch {
     return {};
   }
 }
 
-function writeWarnedTools(storageDir: string, warned: Record<string, string>): void {
+async function hasWarnedFor(bridge: Pick<BinaryBridge, "send">, key: string): Promise<boolean> {
+  const warned = await readWarnedTools(bridge);
+  return warned[key] === true || typeof warned[key] === "string";
+}
+
+async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
+  const warned = await readWarnedTools(bridge);
+  warned[key] = true;
+
   try {
-    mkdirSync(storageDir, { recursive: true });
-    const warnedToolsPath = join(storageDir, WARNED_TOOLS_FILE);
-    const tmpPath = join(
-      storageDir,
-      `${WARNED_TOOLS_FILE}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
-    );
-    writeFileSync(tmpPath, `${JSON.stringify(warned, null, 2)}\n`);
-    renameSync(tmpPath, warnedToolsPath);
+    await bridge.send("db_set_state", {
+      key: "warned_tools",
+      value: JSON.stringify(warned),
+    });
   } catch {
     // best-effort
   }
-}
-
-async function withWarnedToolsLock<T>(storageDir: string, fn: () => Promise<T>): Promise<T | null> {
-  const lockDir = join(storageDir, "warned_tools.lock");
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      mkdirSync(storageDir, { recursive: true });
-      mkdirSync(lockDir, { mode: 0o700 });
-      try {
-        return await fn();
-      } finally {
-        rmSync(lockDir, { recursive: true, force: true });
-      }
-    } catch (err) {
-      const code = (err as { code?: string }).code;
-      if (code !== "EEXIST") return null;
-      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
-    }
-  }
-  return null;
 }
 
 function warningKey(warning: ConfigureWarning, projectRoot?: string): string {
@@ -143,34 +126,18 @@ export async function deliverConfigureWarnings(
 ): Promise<void> {
   if (warnings.length === 0) return;
 
-  const deliveredWithLock = await withWarnedToolsLock(opts.storageDir, async () => {
-    const warned = readWarnedTools(opts.storageDir);
-    let changed = false;
-
-    for (const warning of warnings) {
-      const key = warningKey(warning, opts.projectRoot);
-      if (Object.hasOwn(warned, key)) continue;
-
-      if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) {
-        continue;
-      }
-
-      warned[key] = opts.pluginVersion;
-      changed = true;
-    }
-
-    if (changed) {
-      const merged = { ...readWarnedTools(opts.storageDir), ...warned };
-      writeWarnedTools(opts.storageDir, merged);
-    }
-    return true;
-  });
-  if (deliveredWithLock) return;
-
-  // If the lock is contended or unavailable, still emit the warning. Losing
-  // persistence under contention is acceptable; dropping the warning is not.
+  // `warned_tools` now persists through the bridge DB state API. This loses the
+  // old file-lock read-modify-write mutex, so two same-process concurrent
+  // recordWarning calls could race and drop one key. Configure warnings are
+  // delivered sequentially in normal plugin flow; if this becomes observable,
+  // add a bridge-side atomic update command rather than reviving file locks.
   for (const warning of warnings) {
-    sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning));
+    const key = warningKey(warning, opts.projectRoot);
+    if (await hasWarnedFor(opts.bridge, key)) continue;
+
+    if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
+
+    await recordWarning(opts.bridge, key);
   }
 }
 
@@ -179,6 +146,12 @@ export function sendFeatureAnnouncement(
   features: string[],
   storageDir: string,
 ): void {
+  // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
+  // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
+  // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
+  // spawn at every plugin init. Deferred to a future version that decides whether
+  // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
+  // other writer; this file stays in sync via direct legacy-file writes.
   const versionFile = join(storageDir, "last_announced_version");
   try {
     if (existsSync(versionFile)) {

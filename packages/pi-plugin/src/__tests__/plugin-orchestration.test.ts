@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __test__ } from "../index.js";
 
+const bridge = {
+  send: async (command: string, params: Record<string, unknown>) => {
+    if (command === "db_get_state") return { success: true, data: { value: null } };
+    if (command === "db_set_state") return { success: true, data: params };
+    return { success: false };
+  },
+};
+
 describe("Pi Lane G plugin orchestration regressions", () => {
   test("eager configure warnings buffer and flush exactly once on first session-bound call", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-pi-eager-warnings-"));
@@ -20,6 +28,7 @@ describe("Pi Lane G plugin orchestration regressions", () => {
       await __test__.handleConfigureWarningsForSession({
         projectRoot: "/repo-pi-eager",
         warnings: [warning],
+        bridge,
         storageDir: root,
         pluginVersion: "1.0.0",
       });
@@ -29,6 +38,7 @@ describe("Pi Lane G plugin orchestration regressions", () => {
         projectRoot: "/repo-pi-eager",
         sessionId: "session-1",
         client,
+        bridge,
         warnings: [],
         storageDir: root,
         pluginVersion: "1.0.0",
@@ -37,6 +47,7 @@ describe("Pi Lane G plugin orchestration regressions", () => {
         projectRoot: "/repo-pi-eager",
         sessionId: "session-1",
         client,
+        bridge,
         warnings: [],
         storageDir: root,
         pluginVersion: "1.0.0",

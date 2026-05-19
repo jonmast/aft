@@ -428,17 +428,24 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       versionUpgradePromises.set(minVersion, upgradePromise);
       return upgradePromise;
     },
-    onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
+    onConfigureWarnings: ({ projectRoot, sessionId, client, warnings }) => {
+      const bridge = pool.getActiveBridgeForRoot(projectRoot);
+      if (!bridge) return;
       const pendingWarnings = sessionId ? drainPendingEagerWarnings(projectRoot) : [];
-      await handleConfigureWarningsForSession({
-        projectRoot,
-        sessionId,
-        client,
-        warnings: [...pendingWarnings, ...warnings],
-        fallbackClient: input.client,
-        storageDir: configOverrides.storage_dir as string,
-        pluginVersion: PLUGIN_VERSION,
-      });
+      // Avoid re-entering bridge.send() from the synchronous configure callback
+      // before aft-bridge marks the lazy-spawned bridge configured.
+      setTimeout(() => {
+        void handleConfigureWarningsForSession({
+          projectRoot,
+          sessionId,
+          client,
+          bridge,
+          warnings: [...pendingWarnings, ...warnings],
+          fallbackClient: input.client,
+          storageDir: configOverrides.storage_dir as string,
+          pluginVersion: PLUGIN_VERSION,
+        });
+      }, 0);
     },
     onBashCompletion: (completion) => {
       // Prefer the cached session directory; fall back to plugin-init cwd
@@ -587,6 +594,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       return { show: false };
     }
     if (storageDir) {
+      // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
+      // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
+      // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
+      // spawn at every plugin init. Deferred to a future version that decides whether
+      // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
+      // other writer; this file stays in sync via direct legacy-file writes.
       const versionFile = join(storageDir, "last_announced_version");
       try {
         if (existsSync(versionFile)) {

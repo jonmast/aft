@@ -9,6 +9,14 @@ import { handleConfigureWarningsForSession } from "../configure-warnings.js";
 import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 
+const bridge = {
+  send: async (command: string, params: Record<string, unknown>) => {
+    if (command === "db_get_state") return { success: true, data: { value: null } };
+    if (command === "db_set_state") return { success: true, data: params };
+    return { success: false };
+  },
+};
+
 describe("Lane G plugin orchestration regressions", () => {
   test("eager configure warnings buffer and flush exactly once on first session-bound call", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-eager-warnings-"));
@@ -29,6 +37,7 @@ describe("Lane G plugin orchestration regressions", () => {
       await handleConfigureWarningsForSession({
         projectRoot: "/repo-eager",
         warnings: [warning],
+        bridge,
         fallbackClient: client,
         storageDir: root,
         pluginVersion: "1.0.0",
@@ -39,6 +48,7 @@ describe("Lane G plugin orchestration regressions", () => {
         projectRoot: "/repo-eager",
         sessionId: "session-1",
         client,
+        bridge,
         warnings: [],
         fallbackClient: client,
         storageDir: root,
@@ -48,6 +58,7 @@ describe("Lane G plugin orchestration regressions", () => {
         projectRoot: "/repo-eager",
         sessionId: "session-1",
         client,
+        bridge,
         warnings: [],
         fallbackClient: client,
         storageDir: root,

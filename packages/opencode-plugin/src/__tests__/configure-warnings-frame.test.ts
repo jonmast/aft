@@ -26,6 +26,14 @@ function createClient() {
   return { client, messages };
 }
 
+const bridge = {
+  send: async (command: string, params: Record<string, unknown>) => {
+    if (command === "db_get_state") return { success: true, data: { value: null } };
+    if (command === "db_set_state") return { success: true, data: params };
+    return { success: false };
+  },
+};
+
 function baseWarning() {
   return {
     kind: "formatter_not_installed",
@@ -51,6 +59,7 @@ describe("configure_warnings push-frame handler", () => {
       projectRoot: "/repo",
       sessionId: "session-1",
       client,
+      bridge,
       fallbackClient: { unused: true },
       warnings: [baseWarning()],
       storageDir,
@@ -71,6 +80,7 @@ describe("configure_warnings push-frame handler", () => {
         projectRoot: "/repo",
         sessionId: null,
         client,
+        bridge,
         fallbackClient: client,
         warnings: [baseWarning()],
         storageDir,

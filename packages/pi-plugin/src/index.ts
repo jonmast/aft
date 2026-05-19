@@ -225,6 +225,7 @@ async function handleConfigureWarningsForSession(context: {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
+  bridge: Pick<import("@cortexkit/aft-bridge").BinaryBridge, "send">;
   warnings: unknown[];
   storageDir: string;
   pluginVersion: string;
@@ -254,6 +255,7 @@ async function handleConfigureWarningsForSession(context: {
     {
       client: context.client,
       sessionId: context.sessionId,
+      bridge: context.bridge,
       storageDir: context.storageDir,
       pluginVersion: context.pluginVersion,
       projectRoot: context.projectRoot,
@@ -532,16 +534,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     errorPrefix: "[aft-pi]",
     minVersion: PLUGIN_VERSION,
     onVersionMismatch: createVersionMismatchHandler(() => pool),
-    onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
+    onConfigureWarnings: ({ projectRoot, sessionId, client, warnings }) => {
+      const bridge = pool.getActiveBridgeForRoot(projectRoot);
+      if (!bridge) return;
       const pendingWarnings = sessionId ? drainPendingEagerWarnings(projectRoot) : [];
-      await handleConfigureWarningsForSession({
-        projectRoot,
-        sessionId,
-        client,
-        warnings: [...pendingWarnings, ...warnings],
-        storageDir,
-        pluginVersion: PLUGIN_VERSION,
-      });
+      // Avoid re-entering bridge.send() from the synchronous configure callback
+      // before aft-bridge marks the lazy-spawned bridge configured.
+      setTimeout(() => {
+        void handleConfigureWarningsForSession({
+          projectRoot,
+          sessionId,
+          client,
+          bridge,
+          warnings: [...pendingWarnings, ...warnings],
+          storageDir,
+          pluginVersion: PLUGIN_VERSION,
+        });
+      }, 0);
     },
     onBashCompletion: (completion) => {
       void handlePushedBgCompletion(
