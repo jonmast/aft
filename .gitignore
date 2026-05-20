@@ -71,3 +71,4 @@ packages/opencode-plugin/src/__tests__/e2e/fixtures/aft-bin
 # packages/*/src/__tests__/e2e/; the throwaway smoke files don't ship.
 smoke-tests/
 .aft-windows-vm
+benchmarks/aft-search/.bench/

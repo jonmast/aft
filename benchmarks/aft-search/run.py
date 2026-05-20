@@ -14,6 +14,7 @@ import os
 import select
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -32,10 +33,17 @@ class AftProtocolError(RuntimeError):
 
 
 class AftClient:
-    def __init__(self, binary: Path, project_root: Path, ready_timeout_secs: float) -> None:
+    def __init__(
+        self,
+        binary: Path,
+        project_root: Path,
+        ready_timeout_secs: float,
+        storage_dir: Optional[Path] = None,
+    ) -> None:
         self.binary = binary
         self.project_root = project_root
         self.ready_timeout_secs = ready_timeout_secs
+        self.storage_dir = storage_dir or Path(tempfile.mkdtemp(prefix="aft-search-"))
         self.proc = subprocess.Popen(
             [str(binary)],
             stdin=subprocess.PIPE,
@@ -61,8 +69,12 @@ class AftClient:
             "configure",
             {
                 "project_root": str(self.project_root),
+                "harness": "opencode",
                 "search_index": True,
                 "semantic_search": True,
+                "experimental_search_index": True,
+                "experimental_semantic_search": True,
+                "storage_dir": str(self.storage_dir),
             },
             timeout_secs=60.0,
         )
@@ -71,20 +83,25 @@ class AftClient:
         return response
 
     def wait_for_semantic_ready(self) -> JsonObject:
+        status = self.wait_for_indexes(require_search=False)
+        return status.get("semantic_index", {})
+
+    def wait_for_indexes(self, require_search: bool = True) -> JsonObject:
         deadline = time.time() + self.ready_timeout_secs
         last_status: JsonObject = {}
         while time.time() < deadline:
             response = self.call("status", timeout_secs=30.0)
+            last_status = response
             semantic = response.get("semantic_index")
-            if isinstance(semantic, dict):
-                last_status = semantic
-                status = semantic.get("status")
-                if status == "ready":
-                    return semantic
-                if status == "failed":
-                    raise AftProtocolError(f"semantic index failed: {semantic}")
+            search = response.get("search_index")
+            semantic_status = semantic.get("status") if isinstance(semantic, dict) else None
+            search_status = search.get("status") if isinstance(search, dict) else None
+            if semantic_status == "failed":
+                raise AftProtocolError(f"semantic index failed: {semantic}")
+            if semantic_status == "ready" and (not require_search or search_status == "ready"):
+                return response
             time.sleep(0.5)
-        raise TimeoutError(f"semantic index did not become ready: {last_status}")
+        raise TimeoutError(f"indexes did not become ready: {last_status}")
 
     def semantic_search(self, query: str, top_k: int = TOP_K) -> Tuple[JsonObject, float]:
         start = time.perf_counter()
@@ -151,7 +168,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         nargs="?",
         help="Baseline JSON to compare against when --mode compare is used.",
     )
-    parser.add_argument("--binary", required=True, help="Path to the aft binary to measure.")
+    parser.add_argument("--binary", default="../../target/release/aft", help="Path to the aft binary to measure.")
     parser.add_argument(
         "--project-root",
         default="../..",

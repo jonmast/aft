@@ -1,95 +1,119 @@
 # AFT search eval harness
 
-Manual retrieval baseline for the AFT search overhaul PR series. This is **not**
-part of `release.yml` and is intentionally run by hand before retrieval-changing
-work lands. PR 2 freezes the current semantic-only behavior in `baseline.json`;
-PR 3 runs this same harness against hybrid retrieval and compares the result.
+Manual retrieval benchmarks for `aft_search`. The original in-tree fixture suite
+still measures AFT on this repository. The external suite adds Vera's published
+21-task corpus so we can report Recall@1/5/10, MRR@10, and nDCG@10 against the
+same pinned repos Vera uses.
 
-The harness is implemented in Python, matching the existing `benchmarks/`
-tooling and the council decision (`bg_7ea22ecf`) that selected Python for this
-manual eval. The canonical implementation spec is
-`.alfonso/plans/aft-search-overhaul-v6.md` §4.3.
+## Setup
 
-## Metrics
-
-- **Per-shape P@5**: for each query shape, the average of a binary per-fixture
-  win/loss: `1` when any returned top-5 file is in `expected_top_files`, else
-  `0`.
-- **Per-shape MRR**: reciprocal rank of the first expected file in the top 5,
-  averaged by query shape.
-- **p50 / p95 query latency**: wall-clock time from sending `semantic_search` to
-  receiving the response, summarized per shape and overall.
-- **Embedding-cache hit rate**: currently reported as unavailable (`null`). The
-  PR 2 baseline binary has no query-embedding cache counter to scrape; PR 3 can
-  populate this once the cache/counter exists in the Rust search path.
-
-## Running
-
-From this directory:
+Build the release binary first:
 
 ```bash
-python3 run.py --binary ../../target/release/aft --project-root ../..
+cargo build --release -p agent-file-tools
 ```
 
-Or from the repository root:
+Clone the Vera-compatible corpus from this directory:
 
 ```bash
-python3 benchmarks/aft-search/run.py \
-  --binary target/release/aft \
-  --project-root . \
-  --out benchmarks/aft-search/baseline.json
+cd benchmarks/aft-search
+uv run python setup_corpus.py
 ```
 
-The runner starts the `aft` binary in stdin/stdout protocol mode, sends
-`configure` with `semantic_search=true`, waits for the semantic index to report
-`ready`, then evaluates every fixture with `semantic_search(top_k=5)`.
+`setup_corpus.py` reads `corpus/corpus.toml`, clones each repo into
+`.bench/repos/<name>/`, hard-resets it to the pinned commit, prints file/byte
+sizes, and is idempotent. `.bench/` is ignored by git and must not be committed.
+If a repo cannot be cloned, the script reports it and continues with the rest.
 
-Compare a candidate binary against the committed baseline:
+## In-tree benchmark
+
+The existing AFT fixtures are unchanged in `fixtures.json` and still use
+file-path expected results (`expected_top_files`). From `benchmarks/aft-search`:
 
 ```bash
-python3 run.py \
-  --mode compare baseline.json \
+uv run python run.py
+```
+
+Equivalent explicit invocation:
+
+```bash
+uv run python run.py \
   --binary ../../target/release/aft \
-  --project-root ../..
+  --project-root ../.. \
+  --out baseline.json
 ```
 
-## Updating `baseline.json`
+The runner starts `aft`, sends `configure` with search and semantic search
+enabled, waits for the semantic index to be ready, runs `semantic_search(top_k=5)`
+for every fixture, and writes the baseline-shaped JSON report.
 
-Only update the baseline when intentionally freezing a new release line or a new
-retrieval design point:
+## External Vera-comparable benchmark
 
-1. Build the release binary to measure, for example
-   `cargo build --release -p agent-file-tools`.
-2. Run the harness with `--out baseline.json` from `benchmarks/aft-search/`.
-3. Review the stdout report and the JSON metadata (`aft` version, binary path,
-   project git rev, fixture count).
-4. Re-run to a temporary output and diff it against `baseline.json` to verify
-   deterministic retrieval results:
+After setup, run:
 
-   ```bash
-   python3 run.py --binary ../../target/release/aft --project-root ../.. --out /tmp/test-baseline.json
-   diff /tmp/test-baseline.json baseline.json
-   ```
+```bash
+uv run python run_external.py
+```
 
-Latency is measured during every run and printed in the report. To keep the
-committed baseline reproducible with plain `diff`, a run that writes to a
-different output path reuses the committed baseline's volatile latency and run
-metadata fields when the fixture/query results match.
+To write the committed baseline path explicitly:
 
-## Fixture scope
+```bash
+uv run python run_external.py --out results/aft-vera-suite-baseline.json
+```
 
-`fixtures.json` targets this repository (`opencode-aft`) only, so no external
-checkout is required. The set includes the dogfood failure shapes from the plan:
-identifier-shaped queries (`useState`, `aft_safety_history`, `subagent_type`), a
-generic file-role query for `index.ts`, and an error-message query for process
-group termination, plus broader mixed, natural-language, path, and generic-file
-coverage.
+The external runner:
 
-## Embedding cache deferral
+1. Reads `corpus/corpus.toml` and `external-fixtures.json`.
+2. Starts one `aft` process per corpus repo with `project_root` set to that clone.
+3. Configures `search_index`, `semantic_search`, `experimental_search_index`, and
+   `experimental_semantic_search` with a per-run temporary `storage_dir`.
+4. Waits up to 600 seconds for the search and semantic indexes to report `ready`.
+5. Runs `semantic_search(top_k=10)` for each task in that repo.
+6. Scores results with line-range overlap by default.
+7. Writes `results/aft-vera-suite-<timestamp>.json` unless `--out` is supplied.
 
-PR 2 does not add the optional in-process query-embedding cache. In the current
-code, query embedding is performed in `commands/semantic_search.rs`, while the
-optional cache was constrained to stay inside `semantic_index.rs`; exposing a hit
-rate would also require response/API plumbing. That crosses the PR 2 harness-only
-boundary, so the baseline reports `embedding_cache_hit_rate: null` and leaves the
-cache/counter for PR 3.
+Use `--relevance-mode file-only` only when you intentionally want Vera's
+file-path-only mode. The committed baseline uses the stricter default
+`line-overlap` mode.
+
+## Metrics and result JSON
+
+`metrics.py` supports both fixture formats:
+
+- In-tree fixtures: file-path match against `expected_top_files`.
+- Vera fixtures: `ground_truth[{file_path,line_start,line_end,relevance}]` with a
+  prediction relevant only when the file matches and the returned line range
+  overlaps the ground-truth range by at least one line.
+
+External result files mirror Vera's report shape at the top level:
+
+- `tool_name`, `timestamp`, `version_info`: reproducibility metadata, including
+  binary SHA, repo SHAs, top-k, relevance mode, and reranker status.
+- `per_task`: one row per task with ground truth, top results, latency,
+  `zero_results`, and `retrieval_metrics`.
+- `per_category`: category aggregates for intent, symbol lookup, cross-file,
+  disambiguation, and config tasks.
+- `aggregate`: overall retrieval metrics and latency p50/p95.
+
+Primary numbers to compare are Recall@1, Recall@5, Recall@10, MRR@10 (`mrr` in
+the JSON), nDCG@10, and latency p50/p95.
+
+## What Vera reports vs what we report
+
+| System | Corpus | Reranker | Comparable MRR@10 |
+| --- | --- | --- | --- |
+| Vera v0.7.0 hybrid | Vera 21-task suite | Cross-encoder reranker on | 0.91 |
+| Vera hybrid no-rerank | Vera 21-task suite | Off | 0.34 |
+| AFT `aft_search` | Same pinned 21-task suite | Off | See `aggregate.retrieval.mrr` |
+
+Vera's default published number includes a cross-encoder reranker; AFT currently
+reports hybrid lexical+semantic retrieval without a reranker. For a fair product
+comparison, use Vera's no-reranker baseline from
+`Vera/benchmarks/results/final-suite/vera_hybrid_norerank_results.json`.
+
+## Attribution
+
+The external task definitions in `external-fixtures.json` are vendored from
+Vera's `eval/tasks/*.json` corpus. The metric formulas in `metrics.py` mirror
+Vera's `eval/src/metrics.rs` and are reimplemented independently here rather
+than copied wholesale.
