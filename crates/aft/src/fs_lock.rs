@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -412,15 +412,31 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
+// Per-thread counter that disambiguates temp lockfile paths for callers
+// inside the same process. `now_nanos()` alone is not unique enough on
+// Windows when two threads race to acquire the same lock (caught by the
+// `acquire_serializes_concurrent_callers` test): two threads sampling the
+// nanosecond clock within the same scheduler quantum produce identical
+// timestamps, both write to the same `.lock.tmp.<pid>.<nanos>` file, one
+// thread's `fs::remove_file(&tmp_path)` cleanup deletes the file before
+// the other thread's `fs::hard_link(&tmp_path, ...)` runs, and the loser
+// panics with `Io(Os { code: 2, NotFound })`.
+//
+// `AtomicU64` shared across threads makes every temp path unique within
+// the process regardless of clock resolution or scheduling races.
+static TEMP_LOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temp_path_for_lock(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("lock");
+    let seq = TEMP_LOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
     path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{}",
+        ".{file_name}.tmp.{}.{}.{}",
         std::process::id(),
-        now_nanos()
+        now_nanos(),
+        seq
     ))
 }
 
