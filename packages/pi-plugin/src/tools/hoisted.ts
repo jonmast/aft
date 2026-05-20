@@ -51,8 +51,17 @@ async function assertExternalDirectoryPermission(
   extCtx: { cwd: string; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } },
   target: string,
   action = "modify",
+  restrictToProjectRoot = true,
 ): Promise<void> {
   if (!target) return;
+  // When the user has explicitly opted out of project-root restriction
+  // (aft.jsonc: `restrict_to_project_root: false`), skip the external-
+  // directory prompt entirely. The flag's documented intent is "don't gate
+  // operations on project membership"; surfacing a per-call confirm dialog
+  // anyway defeats that purpose and forces users to acknowledge every
+  // out-of-project access. The Rust-side path validation still applies
+  // when the flag is true.
+  if (!restrictToProjectRoot) return;
   const absoluteTarget = isAbsolute(target) ? target : resolve(extCtx.cwd, target);
   if (containsPath(extCtx.cwd, absoluteTarget)) return;
 
@@ -114,6 +123,13 @@ export interface ToolSurfaceFlags {
   hoistWrite: boolean;
   hoistEdit: boolean;
   hoistGrep: boolean;
+  /**
+   * Mirrors the Rust-side `restrict_to_project_root` config flag. When false
+   * (the Pi default), hoisted tools skip the external-directory confirm
+   * prompt and accept absolute/external paths the user explicitly passes.
+   * When true, every out-of-cwd access triggers a `ui.confirm` dialog.
+   */
+  restrictToProjectRoot: boolean;
 }
 
 /** Details surfaced to both renderer and agent message stream. */
@@ -219,7 +235,12 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath);
+        await assertExternalDirectoryPermission(
+          extCtx,
+          params.filePath,
+          "modify",
+          surface.restrictToProjectRoot,
+        );
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const response = await callBridge(
           bridge,
@@ -264,7 +285,12 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        await assertExternalDirectoryPermission(extCtx, params.filePath);
+        await assertExternalDirectoryPermission(
+          extCtx,
+          params.filePath,
+          "modify",
+          surface.restrictToProjectRoot,
+        );
         const bridge = bridgeFor(ctx, extCtx.cwd);
 
         // Append mode: explicitly route through the Rust `append` op, which
@@ -324,7 +350,12 @@ export function registerHoistedTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { pattern: params.pattern };
         if (params.path) {
-          await assertExternalDirectoryPermission(extCtx, params.path, "search");
+          await assertExternalDirectoryPermission(
+            extCtx,
+            params.path,
+            "search",
+            surface.restrictToProjectRoot,
+          );
           req.path = await resolvePathArg(extCtx.cwd, params.path);
         }
         if (params.include) req.include = splitIncludeGlobs(params.include);

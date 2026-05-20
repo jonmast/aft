@@ -194,6 +194,10 @@ export async function createHarness(
     lspDiagnostics: true,
     structure: true,
     refactor: true,
+    // E2E surface defaults to restricted mode so the existing tests that
+    // expect ui.confirm prompts for external paths keep working. The new
+    // regression test in hoisted.test.ts toggles this flag explicitly.
+    restrictToProjectRoot: true,
   };
 
   registerHoistedTools(api, ctx, surface);

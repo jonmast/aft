@@ -293,11 +293,19 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   lspDiagnostics: boolean;
   structure: boolean;
   refactor: boolean;
+  restrictToProjectRoot: boolean;
 } {
   const surface = config.tool_surface ?? "recommended";
   const disabled = new Set(config.disabled_tools ?? []);
   const ok = (name: string): boolean => !disabled.has(name);
   const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
+  // Mirror the default applied at index.ts:435 when forwarding to Rust
+  // configure (Pi default is `false` for parity with Pi's built-in tools,
+  // which never gate on project membership). When the user explicitly sets
+  // `restrict_to_project_root: false`, hoisted edit/write/grep skip the
+  // external-directory confirm prompt entirely; the prompt only fires when
+  // the user opts INTO project-root restriction by setting true.
+  const restrictToProjectRoot = config.restrict_to_project_root ?? false;
 
   if (surface === "minimal") {
     return {
@@ -320,6 +328,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
       lspDiagnostics: false,
       structure: false,
       refactor: false,
+      restrictToProjectRoot,
     };
   }
 
@@ -344,6 +353,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
     lspDiagnostics: ok("lsp_diagnostics"),
     structure: false,
     refactor: false,
+    restrictToProjectRoot,
   };
 
   if (surface === "all") {
