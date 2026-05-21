@@ -500,14 +500,29 @@ impl BgTaskRegistry {
         }
 
         let canonical_project = project_root.map(canonicalized_path);
+        // Replay strategy: DB is the post-v0.27 source of truth. Disk
+        // fallback handles pre-v0.27 tasks that haven't been migrated and
+        // the cold-start `__default__` namespace (configure runs before any
+        // user session exists, so plugin-init triggers a session-less DB
+        // lookup that will be empty until a real session writes a task).
+        //
+        // We deliberately keep the empty-DB / empty-disk path silent — it's
+        // the normal startup case and would otherwise fire on every configure
+        // (see GitHub user report against v0.27.0). INFO-level logs only when
+        // disk actually returned tasks (real migration signal); WARN when the
+        // DB lookup itself errored.
         let tasks = match self.replay_session_from_db(session_id) {
             Some(Ok(tasks)) if !tasks.is_empty() => tasks,
             Some(Ok(_)) => {
-                crate::slog_info!(
-                    "bash task replay DB miss for session {}; falling back to disk",
-                    session_id
-                );
-                self.replay_session_from_disk(storage_dir, session_id)?
+                let disk_tasks = self.replay_session_from_disk(storage_dir, session_id)?;
+                if !disk_tasks.is_empty() {
+                    crate::slog_info!(
+                        "bash task replay: 0 in DB for session {}, {} from disk fallback",
+                        session_id,
+                        disk_tasks.len()
+                    );
+                }
+                disk_tasks
             }
             Some(Err(error)) => {
                 crate::slog_warn!(
@@ -518,10 +533,7 @@ impl BgTaskRegistry {
                 self.replay_session_from_disk(storage_dir, session_id)?
             }
             None => {
-                crate::slog_info!(
-                    "bash task replay DB unavailable for session {}; falling back to disk",
-                    session_id
-                );
+                // DB pool unconfigured — common in tests + before harness is set.
                 self.replay_session_from_disk(storage_dir, session_id)?
             }
         };
