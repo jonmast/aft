@@ -583,13 +583,80 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         .and_then(|ext| ext.to_str())
         .unwrap_or_default();
 
-    builtin_servers()
+    resolved_servers(config)
         .into_iter()
-        .chain(config.lsp_servers.iter().filter_map(custom_server))
         .filter(|server| !is_disabled(server, config))
         .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
         .filter(|server| server.matches_extension(extension))
         .collect()
+}
+
+/// Resolve the full server set after applying user overrides.
+///
+/// When a user-defined server's `id` matches a built-in server's `id_str()`
+/// (e.g. `lsp.servers.clangd`), the user entry REPLACES the built-in entry
+/// rather than registering alongside it. Fields the user left at their
+/// default value (empty array, empty string, empty map, None) are inherited
+/// from the built-in so users only have to specify what they actually want
+/// to override.
+///
+/// User-defined servers whose `id` does not match any built-in are appended
+/// as `ServerKind::Custom(id)` with no merging — they're standalone.
+fn resolved_servers(config: &Config) -> Vec<ServerDef> {
+    let mut servers = builtin_servers();
+    for user in &config.lsp_servers {
+        if user.disabled {
+            // Disabled user override means "drop the matching built-in if any"
+            // — equivalent to adding the id to `lsp.disabled`. We don't include
+            // it in the result regardless of whether it matched.
+            servers.retain(|s| s.kind.id_str() != user.id);
+            continue;
+        }
+        if let Some(position) = servers.iter().position(|s| s.kind.id_str() == user.id) {
+            // Replace the built-in with a merged ServerDef. Keep the built-in
+            // `kind` so callers that match on enum variants (e.g. cap probing
+            // for `ServerKind::Go`) continue to work. Inherit any field the
+            // user left at its default value.
+            let builtin = &servers[position];
+            let merged = ServerDef {
+                kind: builtin.kind.clone(),
+                name: builtin.name.clone(),
+                extensions: if user.extensions.is_empty() {
+                    builtin.extensions.clone()
+                } else {
+                    user.extensions.clone()
+                },
+                binary: if user.binary.is_empty() {
+                    builtin.binary.clone()
+                } else {
+                    user.binary.clone()
+                },
+                args: if user.args.is_empty() {
+                    builtin.args.clone()
+                } else {
+                    user.args.clone()
+                },
+                root_markers: if user.root_markers.is_empty() {
+                    builtin.root_markers.clone()
+                } else {
+                    user.root_markers.clone()
+                },
+                env: if user.env.is_empty() {
+                    builtin.env.clone()
+                } else {
+                    user.env.clone()
+                },
+                initialization_options: user
+                    .initialization_options
+                    .clone()
+                    .or_else(|| builtin.initialization_options.clone()),
+            };
+            servers[position] = merged;
+        } else if let Some(def) = custom_server(user) {
+            servers.push(def);
+        }
+    }
+    servers
 }
 
 /// Returns true when `path` is a project configuration file whose changes can
@@ -1098,6 +1165,131 @@ mod tests {
             ids.len(),
             unique.len(),
             "duplicate server IDs in registry: {ids:?}",
+        );
+    }
+
+    #[test]
+    fn user_override_with_matching_id_replaces_builtin_not_appended() {
+        // Issue #56: setting `lsp.servers.clangd = { args: [...] }` should
+        // result in ONE clangd entry (the user-overridden one), not two.
+        let config = Config {
+            lsp_servers: vec![UserServerDef {
+                id: "clangd".to_string(),
+                args: vec!["--query-driver=/path/to/arm-none-eabi-*".to_string()],
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+
+        let cpp_servers = super::servers_for_file(Path::new("/tmp/a.cpp"), &config);
+        let clangd_entries: Vec<_> = cpp_servers
+            .iter()
+            .filter(|s| s.kind.id_str() == "clangd")
+            .collect();
+        assert_eq!(
+            clangd_entries.len(),
+            1,
+            "expected exactly one clangd server after user override; got {} ({:?})",
+            clangd_entries.len(),
+            cpp_servers.iter().map(|s| &s.kind).collect::<Vec<_>>()
+        );
+
+        // Override fields take effect.
+        let clangd = clangd_entries[0];
+        assert_eq!(clangd.args, vec!["--query-driver=/path/to/arm-none-eabi-*"],);
+
+        // Fields the user left empty (extensions, root_markers) inherit from
+        // the built-in — that's the whole point of the merge.
+        assert!(
+            !clangd.extensions.is_empty(),
+            "extensions should inherit from built-in clangd, got empty",
+        );
+        assert!(
+            !clangd.root_markers.is_empty(),
+            "root_markers should inherit from built-in clangd, got empty",
+        );
+    }
+
+    #[test]
+    fn user_override_preserves_builtin_kind_not_custom() {
+        // The merged entry must keep the built-in ServerKind variant (e.g.
+        // ServerKind::Clangd) so callers that match on the enum continue to
+        // work — including `lsp.disabled` and any kind-specific capability
+        // probing in the LSP manager.
+        let config = Config {
+            lsp_servers: vec![UserServerDef {
+                id: "clangd".to_string(),
+                root_markers: vec![".clangd".to_string()],
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+
+        let cpp_servers = super::servers_for_file(Path::new("/tmp/a.cpp"), &config);
+        let clangd = cpp_servers
+            .iter()
+            .find(|s| s.kind.id_str() == "clangd")
+            .expect("clangd entry");
+        assert!(
+            matches!(clangd.kind, ServerKind::Clangd),
+            "merged server must keep ServerKind::Clangd, got {:?}",
+            clangd.kind,
+        );
+    }
+
+    #[test]
+    fn user_override_with_non_matching_id_is_appended_as_custom() {
+        // Pre-existing behavior preserved: a user-defined id that doesn't
+        // match any built-in is registered as a Custom server alongside the
+        // built-ins. (This is the workaround issue #56 reporters were using
+        // — it must keep working.)
+        //
+        // Extensions in `lsp.servers` are matched WITHOUT a leading dot
+        // (the same convention as built-in servers — see `builtin_server()`
+        // calls). Users writing `".cpp"` in their config would silently
+        // never match; that's a separate UX gap not part of this fix.
+        let config = Config {
+            lsp_servers: vec![UserServerDef {
+                id: "custom-clangd".to_string(),
+                extensions: vec!["c".to_string(), "cpp".to_string()],
+                binary: "clangd".to_string(),
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+
+        let cpp_servers = super::servers_for_file(Path::new("/tmp/a.cpp"), &config);
+        let kinds: Vec<&ServerKind> = cpp_servers.iter().map(|s| &s.kind).collect();
+        assert!(
+            kinds.iter().any(|k| matches!(k, ServerKind::Clangd)),
+            "built-in clangd should still be present alongside custom-clangd; got {kinds:?}",
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, ServerKind::Custom(id) if id.as_ref() == "custom-clangd")),
+            "custom-clangd should be appended as Custom; got {kinds:?}",
+        );
+    }
+
+    #[test]
+    fn user_override_with_disabled_true_drops_builtin() {
+        // `lsp.servers.clangd = { disabled: true }` should be equivalent to
+        // adding `"clangd"` to `lsp.disabled`.
+        let config = Config {
+            lsp_servers: vec![UserServerDef {
+                id: "clangd".to_string(),
+                disabled: true,
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+
+        let cpp_servers = super::servers_for_file(Path::new("/tmp/a.cpp"), &config);
+        assert!(
+            !cpp_servers.iter().any(|s| s.kind.id_str() == "clangd"),
+            "disabled user override should drop the built-in; got {:?}",
+            cpp_servers.iter().map(|s| &s.kind).collect::<Vec<_>>(),
         );
     }
 
