@@ -350,3 +350,58 @@ fn bun_test_dispatch_routes_through_test_compressor_not_generic() {
     assert!(compressed.contains("1 fail"));
     assert!(compressed.contains("Ran 1 tests across 3 files. [3.00ms]"));
 }
+
+// ---------------------------------------------------------------------------
+// Chained-command output preservation (v0.29 dogfood)
+//
+// Real DB sweep showed agents frequently invoke `bun test` chained with
+// other commands: `bun test && bun run build`, `pwd && git status && bun
+// test`, `bun run typecheck && bun run lint && bun test && bun run build`,
+// etc. Before these tests, `compress_test` aggressively stripped lines
+// outside the bun-test block, silently losing any chained-command output
+// that came after `Ran N tests across M files. [Xms]`. The fix preserves
+// trailing lines unchanged so agents see all the chain's output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bun_test_pass_only_preserves_chained_command_output() {
+    // `bun test && echo done; ls -la dist/` — bun test passes, chained
+    // commands run, their output appears AFTER the `Ran ...` summary.
+    let output = "bun test v1.3.14 (0d9b296a)\n\n 12 pass\n 0 fail\n 24 expect() calls\nRan 12 tests across 1 file. [42.00ms]\ndone\ntotal 16\n-rw-r--r--  1 user  staff  4096 May 22 19:00 bundle.js\n-rw-r--r--  1 user  staff   512 May 22 19:00 styles.css\n";
+
+    let compressed = BunCompressor.compress("bun test", output);
+    // bun test header + summary preserved as before
+    assert!(compressed.contains("bun test v1.3.14"));
+    assert!(compressed.contains("12 pass"));
+    assert!(compressed.contains("Ran 12 tests across 1 file. [42.00ms]"));
+    // Chained command output (echo, ls) must survive
+    assert!(
+        compressed.contains("done"),
+        "lost chained `echo done` output"
+    );
+    assert!(
+        compressed.contains("bundle.js"),
+        "lost chained `ls -la dist/` output"
+    );
+    assert!(compressed.contains("styles.css"), "lost chained ls listing");
+}
+
+#[test]
+fn bun_test_with_failures_preserves_chained_command_output() {
+    // `bun test; echo "always runs"` — bun test fails, but `;` separator
+    // (unlike `&&`) means the chained command still runs. Failure block
+    // AND chained output both preserved.
+    let output = "bun test v1.3.14 (0d9b296a)\n\nsrc/foo.test.ts:\n11 | expect(x).toBe(y)\nerror: expect(received).toBe(expected)\n(fail) foo case [1.00ms]\n\n 0 pass\n 1 fail\n 1 expect() calls\nRan 1 tests across 1 files. [42.00ms]\nalways runs\n";
+
+    let compressed = BunCompressor.compress("bun test", output);
+    // failure block preserved
+    assert!(compressed.contains("error: expect(received).toBe(expected)"));
+    assert!(compressed.contains("(fail) foo case"));
+    // summary preserved
+    assert!(compressed.contains("Ran 1 tests across 1 files. [42.00ms]"));
+    // Chained command output after `Ran ...` preserved
+    assert!(
+        compressed.contains("always runs"),
+        "lost chained command output that runs after `bun test` (with `;` separator)"
+    );
+}

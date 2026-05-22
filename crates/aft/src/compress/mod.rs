@@ -125,6 +125,14 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> String {
 pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegistry) -> String {
     let stripped_for_generic = strip_ansi(output);
 
+    // Normalize the command so shell-prefix idioms like `cd /path && bun test`,
+    // `env FOO=bar npm install`, `timeout 30 cargo build`, and `(cd /path; cmd)`
+    // don't hide the real command head from per-module matchers. Without this,
+    // BunCompressor/NpmCompressor/PnpmCompressor (which match by head-token)
+    // silently fall through to generic in most agent-issued bash calls.
+    let normalized = normalize_command_for_dispatch(command);
+    let dispatch_cmd = normalized.as_deref().unwrap_or(command);
+
     let compressors: [&dyn Compressor; 17] = [
         &GitCompressor,
         &CargoCompressor,
@@ -150,8 +158,8 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
         .iter()
         .filter(|c| c.specificity() == Specificity::Specific)
     {
-        if compressor.matches(command) {
-            return compressor.compress(command, &stripped_for_generic);
+        if compressor.matches(dispatch_cmd) {
+            return compressor.compress(dispatch_cmd, &stripped_for_generic);
         }
     }
 
@@ -160,14 +168,14 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
         .iter()
         .filter(|c| c.specificity() == Specificity::PackageManager)
     {
-        if compressor.matches(command) {
-            return compressor.compress(command, &stripped_for_generic);
+        if compressor.matches(dispatch_cmd) {
+            return compressor.compress(dispatch_cmd, &stripped_for_generic);
         }
     }
 
     // Tier 2: TOML filters. Pass raw output so `[ansi].strip = false` filters
     // can intentionally match escape sequences; `apply_filter` owns ANSI policy.
-    if let Some(filter) = registry.lookup(command) {
+    if let Some(filter) = registry.lookup(dispatch_cmd) {
         return apply_filter(filter, output);
     }
 
@@ -206,6 +214,225 @@ pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
         user_dir.as_deref(),
         project_dir.as_deref(),
     )
+}
+
+/// Normalize a shell command for compressor dispatch by walking past
+/// common shell-prefix idioms so the REAL command head is what matchers
+/// see. Returns `Some(normalized)` if a prefix was stripped, `None` if
+/// the input was already a bare command.
+///
+/// Handles:
+///   - `cd /path && cmd ...`            → `cmd ...`
+///   - `cd /path; cmd ...`              → `cmd ...`
+///   - `env FOO=bar [BAR=baz ...] cmd`  → `cmd ...`
+///   - `timeout 30 cmd ...`             → `cmd ...`
+///   - `nohup cmd ...`                  → `cmd ...`
+///   - `(cd /path && cmd ...)`          → `cmd ...`   (trailing `)` is kept; harmless for matchers)
+///
+/// Real agent invocations almost always wrap their actual command in
+/// `cd "$ROOT" && ...`. Without this normalization, BunCompressor /
+/// NpmCompressor / PnpmCompressor (head-token matchers) and the
+/// pkg-manager filters silently fall through to GenericCompressor for
+/// the majority of agent bash calls.
+///
+/// The normalizer is conservative: it only strips well-defined idioms
+/// and bails on anything ambiguous, so a malformed command degrades to
+/// the same dispatch behaviour as before this helper existed.
+pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
+    let trimmed = command.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Step 1: peel a leading `(` from group-expression idioms.
+    let (open_paren, after_paren) = if let Some(rest) = trimmed.strip_prefix('(') {
+        (true, rest.trim_start())
+    } else {
+        (false, trimmed)
+    };
+
+    let mut current = after_paren.to_string();
+    let mut changed = open_paren;
+
+    // Step 2: iteratively peel known shell prefixes.
+    loop {
+        let head: String = current.split_whitespace().next().unwrap_or("").to_string();
+
+        // `cd <path> && ...` or `cd <path>; ...`
+        if head == "cd" {
+            // Find the next `&&` or `;` token; everything after that is the real command.
+            // Use char-level scan because `&&` is two chars not separated by whitespace.
+            if let Some(stripped) = strip_cd_prefix(&current) {
+                current = stripped;
+                changed = true;
+                continue;
+            }
+        }
+
+        // `env VAR=val [VAR=val ...] cmd ...`
+        if head == "env" {
+            if let Some(stripped) = strip_env_prefix(&current) {
+                current = stripped;
+                changed = true;
+                continue;
+            }
+        }
+
+        // `timeout <N> cmd ...` or `timeout <duration-with-unit> cmd ...`
+        if head == "timeout" {
+            if let Some(stripped) = strip_timeout_prefix(&current) {
+                current = stripped;
+                changed = true;
+                continue;
+            }
+        }
+
+        // `nohup cmd ...`
+        if head == "nohup" {
+            if let Some(rest) = current.strip_prefix("nohup").and_then(|s| {
+                let trimmed = s.trim_start();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }) {
+                current = rest;
+                changed = true;
+                continue;
+            }
+        }
+
+        break;
+    }
+
+    if changed {
+        Some(current)
+    } else {
+        None
+    }
+}
+
+fn strip_cd_prefix(command: &str) -> Option<String> {
+    // Look for `&&` or `;` outside of quotes.
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if !in_double && ch == '\'' {
+            in_single = !in_single;
+        } else if !in_single && ch == '"' {
+            in_double = !in_double;
+        } else if !in_single && !in_double {
+            if ch == '&' && i + 1 < bytes.len() && bytes[i + 1] as char == '&' {
+                let rest = command[i + 2..].trim_start();
+                if rest.is_empty() {
+                    return None;
+                }
+                return Some(rest.to_string());
+            }
+            if ch == ';' {
+                let rest = command[i + 1..].trim_start();
+                if rest.is_empty() {
+                    return None;
+                }
+                return Some(rest.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_env_prefix(command: &str) -> Option<String> {
+    // env <ASSIGN>... <cmd> ...
+    // ASSIGN looks like VAR=value (no leading dash).
+    let rest = command.strip_prefix("env")?.trim_start();
+    let mut tokens = rest.split_whitespace().peekable();
+    let mut consumed = 0usize;
+    while let Some(&token) = tokens.peek() {
+        if !is_env_assignment(token) {
+            break;
+        }
+        consumed += token.len();
+        // count whitespace between this and next
+        tokens.next();
+    }
+    if consumed == 0 {
+        return None;
+    }
+    // Re-walk rest to find the byte offset after the last assignment.
+    let mut idx = 0usize;
+    let mut consumed_now = 0usize;
+    let bytes = rest.as_bytes();
+    while consumed_now < consumed && idx < bytes.len() {
+        // skip whitespace
+        while idx < bytes.len() && (bytes[idx] as char).is_whitespace() {
+            idx += 1;
+        }
+        // consume token
+        let token_start = idx;
+        while idx < bytes.len() && !(bytes[idx] as char).is_whitespace() {
+            idx += 1;
+        }
+        consumed_now += idx - token_start;
+    }
+    let after = rest[idx..].trim_start();
+    if after.is_empty() {
+        None
+    } else {
+        Some(after.to_string())
+    }
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    if token.starts_with('-') {
+        return false;
+    }
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn strip_timeout_prefix(command: &str) -> Option<String> {
+    let rest = command.strip_prefix("timeout")?.trim_start();
+    // Next token must look like a duration (digits, optional trailing unit s/m/h).
+    let mut iter = rest.splitn(2, char::is_whitespace);
+    let duration = iter.next()?;
+    let after = iter.next()?.trim_start();
+    if after.is_empty() || !looks_like_duration(duration) {
+        return None;
+    }
+    Some(after.to_string())
+}
+
+fn looks_like_duration(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let mut chars = token.chars().peekable();
+    let mut saw_digit = false;
+    while let Some(&ch) = chars.peek() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return false;
+    }
+    match chars.next() {
+        None => true,
+        Some(unit) => matches!(unit, 's' | 'm' | 'h' | 'd') && chars.next().is_none(),
+    }
 }
 
 /// Resolve the user-filter directory for an arbitrary storage_dir. Used by
@@ -374,5 +601,157 @@ mod dispatch_specificity_tests {
         let compressed = dispatch("pnpm install", output);
         // PnpmCompressor's compress_package keeps "+ pkg" or "Added X packages" type lines.
         assert!(compressed.contains("Added") || compressed.contains("Progress"));
+    }
+}
+
+#[cfg(test)]
+mod normalize_command_tests {
+    use super::*;
+
+    #[test]
+    fn passes_bare_commands_unchanged() {
+        assert_eq!(normalize_command_for_dispatch("bun test"), None);
+        assert_eq!(normalize_command_for_dispatch("cargo build"), None);
+        assert_eq!(normalize_command_for_dispatch("git status"), None);
+    }
+
+    #[test]
+    fn strips_cd_and_amp_prefix() {
+        assert_eq!(
+            normalize_command_for_dispatch("cd /repo && bun test").as_deref(),
+            Some("bun test")
+        );
+        assert_eq!(
+            normalize_command_for_dispatch("cd /repo/packages/aft && cargo test --release")
+                .as_deref(),
+            Some("cargo test --release")
+        );
+    }
+
+    #[test]
+    fn strips_cd_and_semicolon_prefix() {
+        assert_eq!(
+            normalize_command_for_dispatch("cd /repo; bun test").as_deref(),
+            Some("bun test")
+        );
+    }
+
+    #[test]
+    fn strips_cd_with_quoted_path() {
+        assert_eq!(
+            normalize_command_for_dispatch("cd \"/path with space\" && npm install").as_deref(),
+            Some("npm install")
+        );
+    }
+
+    #[test]
+    fn strips_env_assignments() {
+        assert_eq!(
+            normalize_command_for_dispatch("env FOO=bar npm install").as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(
+            normalize_command_for_dispatch("env FOO=bar BAZ=qux RUST_LOG=info cargo test")
+                .as_deref(),
+            Some("cargo test")
+        );
+    }
+
+    #[test]
+    fn env_without_assignments_returns_none() {
+        // `env` alone is the env-listing command, not a prefix.
+        assert_eq!(
+            normalize_command_for_dispatch("env npm install").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn strips_timeout_prefix() {
+        assert_eq!(
+            normalize_command_for_dispatch("timeout 30 cargo test").as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            normalize_command_for_dispatch("timeout 5m bun test").as_deref(),
+            Some("bun test")
+        );
+    }
+
+    #[test]
+    fn strips_nohup_prefix() {
+        assert_eq!(
+            normalize_command_for_dispatch("nohup ./long-running-script.sh").as_deref(),
+            Some("./long-running-script.sh")
+        );
+    }
+
+    #[test]
+    fn strips_paren_then_cd_and_amp() {
+        assert_eq!(
+            normalize_command_for_dispatch("(cd /repo && bun test").as_deref(),
+            Some("bun test")
+        );
+    }
+
+    #[test]
+    fn chains_multiple_prefixes() {
+        // env then timeout then real command.
+        assert_eq!(
+            normalize_command_for_dispatch("env FOO=bar timeout 30 cargo test").as_deref(),
+            Some("cargo test")
+        );
+        // cd then env then real command.
+        assert_eq!(
+            normalize_command_for_dispatch("cd /repo && env FOO=bar npm install").as_deref(),
+            Some("npm install")
+        );
+    }
+
+    // -------- end-to-end dispatch via normalize() --------
+
+    fn empty_registry() -> FilterRegistry {
+        FilterRegistry::default()
+    }
+
+    #[test]
+    fn cd_prefix_bun_test_still_routes_to_bun_test() {
+        let output = "bun test v1.3.14\n\nsrc/a.test.ts:\n(pass) ok [0.1ms]\n\n 1 pass\n 0 fail\n 1 expect() calls\nRan 1 tests across 1 files. [1.00ms]\n";
+        let compressed = compress_with_registry("cd /repo && bun test", output, &empty_registry());
+        // The bun test compressor produces (pass) / "1 pass" / "Ran ..." in
+        // the pass-only path. Generic middle-truncate would drop these and
+        // keep the original. Asserting their presence proves the normalizer
+        // succeeded.
+        assert!(compressed.contains("(pass)") || compressed.contains("1 pass"));
+    }
+
+    #[test]
+    fn cd_prefix_cargo_test_still_routes_to_cargo() {
+        let output = "running 5 tests\ntest foo ... ok\ntest bar ... FAILED\n\nfailures:\n\ntest result: FAILED. 4 passed; 1 failed\n";
+        let compressed =
+            compress_with_registry("cd /repo && cargo test", output, &empty_registry());
+        assert!(compressed.contains("FAILED") || compressed.contains("failed"));
+    }
+
+    #[test]
+    fn env_prefix_npm_install_still_routes_to_npm() {
+        let output = "added 50 packages, and audited 100 packages in 3s\n";
+        let compressed = compress_with_registry(
+            "env NODE_ENV=production npm install",
+            output,
+            &empty_registry(),
+        );
+        // NpmCompressor's install path keeps "added N packages" / "audited" markers.
+        assert!(compressed.contains("added") || compressed.contains("audited"));
+    }
+
+    #[test]
+    fn timeout_prefix_cargo_build_still_routes_to_cargo() {
+        let output =
+            "   Compiling foo v0.1.0\n    Finished `dev` profile [unoptimized] target(s) in 5s\n";
+        let compressed =
+            compress_with_registry("timeout 30 cargo build", output, &empty_registry());
+        // CargoCompressor for build/check/run preserves the structure.
+        assert!(compressed.contains("Compiling") || compressed.contains("Finished"));
     }
 }

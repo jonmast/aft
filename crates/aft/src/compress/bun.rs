@@ -117,9 +117,21 @@ fn compress_test(output: &str) -> String {
     let mut failures_kept = 0usize;
     let mut failures_dropped = 0usize;
     let mut index = 0usize;
+    let mut saw_ran_summary = false;
 
     while index < lines.len() {
         let line = lines[index];
+
+        if saw_ran_summary {
+            // Past the `Ran N tests across M files. [Xms]` line, output
+            // belongs to a chained command (`; next_cmd`). Pass through
+            // so chains don't silently lose the next command's output.
+            // (Note: `&&` short-circuits on test failure so this is mainly
+            // relevant for `;` separators or `|| fallback_cmd`.)
+            result.push(line.to_string());
+            index += 1;
+            continue;
+        }
 
         // Bun version header — always keep.
         if is_bun_test_header(line) {
@@ -151,6 +163,13 @@ fn compress_test(output: &str) -> String {
         // Summary tail — always keep.
         if is_summary_line(line) {
             result.push(line.to_string());
+            // The `Ran N tests across M files. [Xms]` line marks the
+            // boundary between bun-test output and any chained-command
+            // output that follows. (Bun uses `file. [` singular when
+            // M == 1 and `files. [` plural otherwise.)
+            if is_ran_summary_line(line) {
+                saw_ran_summary = true;
+            }
             index += 1;
             continue;
         }
@@ -209,13 +228,36 @@ fn compress_test(output: &str) -> String {
 /// All-pass `bun test` output: keep version header + summary + drop the
 /// rest. Bun in default mode doesn't print per-test pass markers, but
 /// `--verbose` does, so we explicitly preserve only header + summary.
+///
+/// IMPORTANT: when `bun test` is part of a shell chain like
+/// `bun test && bun run build`, anything AFTER the
+/// `Ran N tests across M files. [Xms]` line is the chained command's
+/// output. We preserve those trailing lines unchanged so chains don't
+/// silently lose the next command's output. The chained command itself
+/// is generic content from our perspective (we have no signal about
+/// what it is from the bun-test compressor's POV) so we pass it through
+/// verbatim and let the inline cap handle excess size.
 fn compress_test_pass_only(lines: &[&str]) -> String {
     let mut result: Vec<String> = Vec::new();
+    let mut saw_ran_summary = false;
+
     for line in lines {
+        if saw_ran_summary {
+            // Everything from here on is chained-command output. Pass through.
+            result.push((*line).to_string());
+            continue;
+        }
         if is_bun_test_header(line) || is_summary_line(line) {
             result.push((*line).to_string());
+            // The `Ran N tests across M files. [Xms]` line is the LAST line
+            // bun emits for the test run itself. Everything after must be
+            // from a chained command (`&& other_cmd`).
+            if is_ran_summary_line(line) {
+                saw_ran_summary = true;
+            }
         }
     }
+
     if result.is_empty() {
         return GenericCompressor::compress_output(&lines.join("\n"));
     }
@@ -282,6 +324,16 @@ fn is_bun_test_code_pointer(line: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|char| char.is_ascii_digit())
+}
+
+/// Detects the `Ran N tests across M files. [Xms]` final line that bun
+/// emits to mark the end of its own output. Accepts both the singular
+/// (`file. [`) and plural (`files. [`) forms.
+fn is_ran_summary_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("Ran ")
+        && trimmed.contains(" tests")
+        && (trimmed.contains(" files. [") || trimmed.contains(" file. ["))
 }
 
 fn is_summary_line(line: &str) -> bool {
