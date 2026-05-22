@@ -12,6 +12,7 @@ import {
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
+import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
 import { runOnnxFix } from "../lib/onnx-fix.js";
 import { intro, log, note, outro, selectMany, text } from "../lib/prompts.js";
@@ -522,6 +523,10 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
+  // Build per-harness log sections (last 200 lines each) AND scan a wider
+  // window (last 4000 lines per harness, deduped/sanitized) for error-
+  // shaped lines that survive even when the main log tail needs heavy
+  // truncation to fit GitHub's 64KB body limit.
   const logSections = adapters
     .map((adapter) => {
       const path = adapter.getLogFile();
@@ -529,6 +534,23 @@ async function runIssueFlow(argv: string[]): Promise<number> {
       return `#### ${adapter.displayName} log (${path})\n\n\`\`\`\n${tail || "<no log output>"}\n\`\`\`\n`;
     })
     .join("\n");
+
+  // Wider scan (4000 lines per harness) so a flood of recent debug noise
+  // doesn't push the actual error out of view. Each harness's wide tail
+  // is sanitized independently (sanitizeContent walks the whole string;
+  // running it twice on the same content is a no-op), then we extract
+  // the 20 most-recent ERROR-shaped lines from the merged result.
+  const errorScanWindow = adapters
+    .map((adapter) => {
+      const path = adapter.getLogFile();
+      return sanitizeContent(tailLogFile(path, 4000));
+    })
+    .join("\n");
+  const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
+  const recentErrorsSection =
+    recentErrorLines.length === 0
+      ? "_No error-shaped log lines found in recent history._"
+      : ["```", recentErrorLines.join("\n"), "```"].join("\n");
 
   const rawBody = [
     "## Description",
@@ -543,11 +565,21 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     "## Diagnostics",
     renderDiagnosticsMarkdown(report),
     "",
+    "## Recent errors (last 20, sanitized)",
+    recentErrorsSection,
+    "",
     "## Logs (last 200 lines per harness)",
     logSections,
     "_Usernames and home paths have been stripped from this report._",
   ].join("\n");
-  const body = sanitizeContent(rawBody);
+
+  // Sanitize the entire body (catches any path leakage from sections that
+  // weren't already passed through sanitizeContent — diagnostics markdown,
+  // description, etc.) and then cap it to GitHub's ~64KB issue-body
+  // limit. The cap only shrinks the main `## Logs (last...` block, so
+  // the Description/Environment/Diagnostics/Recent errors sections are
+  // preserved intact.
+  const body = capBodyToGithubLimit(sanitizeContent(rawBody));
 
   const title = sanitizeContent(`AFT issue: ${description.slice(0, 72)}`);
   const outPath = join(process.cwd(), `aft-issue-${Date.now()}.md`);
