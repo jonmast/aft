@@ -146,6 +146,17 @@ pub(crate) struct BgTaskState {
     pub(crate) metadata: PersistedTask,
     pub(crate) child: Option<Child>,
     pub(crate) detached: bool,
+    /// True once `reap_child` has observed the direct child handle's exit
+    /// via `try_wait()`. Used by the two-pass watchdog to skip the racy
+    /// `is_process_alive(child_pid)` probe on the second pass — we already
+    /// have authoritative evidence that the child is dead, no need to
+    /// re-verify via PID liveness which is unreliable on Windows where
+    /// PIDs can be recycled within seconds.
+    ///
+    /// Remains `false` on replay-restored tasks (those have a `child_pid`
+    /// but never observed exit via this process's `try_wait()`), so those
+    /// continue to fall through to the `is_process_alive` probe path.
+    pub(crate) child_exit_observed: bool,
     pub(crate) buffer: BgBuffer,
 }
 
@@ -366,6 +377,7 @@ impl BgTaskRegistry {
                 metadata,
                 child: Some(child),
                 detached: false,
+                child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
             }),
         });
@@ -460,6 +472,7 @@ impl BgTaskRegistry {
                 metadata,
                 child: Some(child),
                 detached: false,
+                child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
             }),
         });
@@ -1224,19 +1237,36 @@ impl BgTaskRegistry {
                 // visible to this watchdog pass yet.
                 //
                 // Drop the handle and mark the task detached so a later pass
-                // uses the PID-dead path below. That second observation is
-                // strong enough to fail if the marker is still absent, while a
-                // marker that lands in the meantime is finalized by poll_task.
+                // declares failure if the marker is still absent. Record
+                // `child_exit_observed=true` so that later pass can trust
+                // this `try_wait()` evidence directly — Windows PIDs get
+                // recycled fast enough that `is_process_alive(child_pid)`
+                // can return true for an unrelated process by then.
                 state.child = None;
                 state.detached = true;
+                state.child_exit_observed = true;
             }
-        } else if state.detached
-            && state
-                .metadata
-                .child_pid
-                .is_some_and(|pid| !is_process_alive(pid))
-        {
-            self.fail_without_exit_marker_if_needed(task, &mut state);
+        } else if state.detached {
+            // Second pass. The child handle is gone and we're monitoring by
+            // PID. Two cases produce this shape:
+            //
+            //   1. First reap of this process observed `try_wait() == Some`
+            //      and set `child_exit_observed=true`. We already know the
+            //      child is dead — no need to re-verify via PID liveness
+            //      (unreliable on Windows due to PID recycling).
+            //
+            //   2. The task was restored from disk by replay logic — we
+            //      have `child_pid` from a previous AFT process but never
+            //      observed exit in this one. Probe `is_process_alive` to
+            //      confirm dead-ness before declaring failure.
+            let child_known_dead = state.child_exit_observed
+                || state
+                    .metadata
+                    .child_pid
+                    .is_some_and(|pid| !is_process_alive(pid));
+            if child_known_dead {
+                self.fail_without_exit_marker_if_needed(task, &mut state);
+            }
         }
     }
 
@@ -1297,6 +1327,13 @@ impl BgTaskRegistry {
                 metadata,
                 child: None,
                 detached,
+                // Replay path: we never observed the child handle's exit
+                // in this process (the previous AFT process did, but its
+                // observation didn't survive restart). Leave this false so
+                // the second-pass reap falls through to the
+                // `is_process_alive(child_pid)` probe rather than declaring
+                // failure based on stale evidence.
+                child_exit_observed: false,
                 buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
             }),
         });
