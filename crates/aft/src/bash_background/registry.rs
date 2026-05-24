@@ -908,33 +908,84 @@ impl BgTaskRegistry {
         pattern: WatchPattern,
         once: bool,
     ) -> Result<String, &'static str> {
-        let task_paths = self.task(&task_id).and_then(|task| {
+        let task = self.task(&task_id);
+        let task_paths = task.as_ref().and_then(|task| {
             task.state.lock().ok().map(|state| {
                 (
                     state.metadata.mode.clone(),
+                    state.metadata.status.is_terminal(),
                     task.paths.stdout.clone(),
                     task.paths.stderr.clone(),
                     task.paths.pty.clone(),
                 )
             })
         });
-        let mut registry = self
-            .inner
-            .watch_registry
-            .lock()
-            .map_err(|_| "watch_registry_poisoned")?;
-        let watch_id = registry.register(task_id.clone(), pattern, once)?;
-        if let Some((mode, stdout, stderr, pty)) = task_paths {
-            match mode {
-                BgMode::Pipes => {
-                    registry.prime_file_cursor(&format!("{task_id}:stdout"), &stdout);
-                    registry.prime_file_cursor(&format!("{task_id}:stderr"), &stderr);
-                }
-                BgMode::Pty => {
-                    registry.prime_file_cursor(&format!("{task_id}:pty"), &pty);
+
+        let mut terminal_matches = Vec::new();
+        let watch_id = {
+            let mut registry = self
+                .inner
+                .watch_registry
+                .lock()
+                .map_err(|_| "watch_registry_poisoned")?;
+            let watch_id = registry.register(task_id.clone(), pattern, once)?;
+            if let Some((mode, terminal, stdout, stderr, pty)) = task_paths {
+                match mode {
+                    BgMode::Pipes => {
+                        let stdout_key = format!("{task_id}:stdout");
+                        let stderr_key = format!("{task_id}:stderr");
+                        if terminal {
+                            registry.set_file_cursor(&stdout_key, 0);
+                            registry.set_file_cursor(&stderr_key, 0);
+                            terminal_matches.extend(registry.scan_file_new_bytes(
+                                &stdout_key,
+                                &task_id,
+                                &stdout,
+                            ));
+                            terminal_matches.extend(registry.scan_file_new_bytes(
+                                &stderr_key,
+                                &task_id,
+                                &stderr,
+                            ));
+                        } else {
+                            registry.prime_file_cursor(&stdout_key, &stdout);
+                            registry.prime_file_cursor(&stderr_key, &stderr);
+                        }
+                    }
+                    BgMode::Pty => {
+                        let pty_key = format!("{task_id}:pty");
+                        if terminal {
+                            registry.set_file_cursor(&pty_key, 0);
+                            terminal_matches
+                                .extend(registry.scan_file_new_bytes(&pty_key, &task_id, &pty));
+                        } else {
+                            registry.prime_file_cursor(&pty_key, &pty);
+                        }
+                    }
                 }
             }
+            watch_id
+        };
+
+        if let Some(task) = task.as_ref() {
+            if task.is_terminal() {
+                let completion = self.remove_pending_completion(&task_id).or_else(|| {
+                    self.completion_snapshot_for_task(task, BG_COMPLETION_PREVIEW_BYTES)
+                });
+                if terminal_matches.is_empty() {
+                    if let Some(completion) = completion.as_ref() {
+                        self.emit_bash_watch_exit(completion);
+                    }
+                } else {
+                    for pattern_match in terminal_matches {
+                        self.emit_bash_pattern_match(&task.session_id, pattern_match);
+                    }
+                }
+                let _ = task.set_completion_delivered(true, self);
+                self.clear_task_watch_state(&task_id);
+            }
         }
+
         Ok(watch_id)
     }
 
@@ -1502,6 +1553,51 @@ impl BgTaskRegistry {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn remove_pending_completion(&self, task_id: &str) -> Option<BgCompletion> {
+        let mut completions = self.inner.completions.lock().ok()?;
+        let idx = completions
+            .iter()
+            .position(|completion| completion.task_id == task_id)?;
+        completions.remove(idx)
+    }
+
+    fn completion_snapshot_for_task(
+        &self,
+        task: &Arc<BgTask>,
+        preview_bytes: usize,
+    ) -> Option<BgCompletion> {
+        let snapshot = task.snapshot(preview_bytes);
+        if !snapshot.info.status.is_terminal() {
+            return None;
+        }
+        let output_preview = if snapshot.info.mode == BgMode::Pty {
+            String::new()
+        } else {
+            let compressed = task
+                .state
+                .lock()
+                .map(|state| state.metadata.compressed)
+                .unwrap_or(true);
+            if compressed {
+                self.compress_output(&snapshot.info.command, snapshot.output_preview)
+            } else {
+                snapshot.output_preview
+            }
+        };
+        Some(BgCompletion {
+            task_id: snapshot.info.task_id,
+            session_id: task.session_id.clone(),
+            status: snapshot.info.status,
+            exit_code: snapshot.exit_code,
+            command: snapshot.info.command,
+            output_preview,
+            output_truncated: snapshot.output_truncated,
+            original_tokens: None,
+            compressed_tokens: None,
+            tokens_skipped: false,
+        })
     }
 
     pub fn detach(&self) {
@@ -2703,6 +2799,13 @@ impl BgTask {
                     || (state.metadata.mode == BgMode::Pty
                         && state.metadata.status == BgTaskStatus::Killing)
             })
+            .unwrap_or(false)
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.metadata.status.is_terminal())
             .unwrap_or(false)
     }
 

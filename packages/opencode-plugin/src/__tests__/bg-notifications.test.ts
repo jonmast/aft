@@ -498,6 +498,35 @@ describe("OpenCode background notifications", () => {
     expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
   });
 
+  test("late async watch renders one notify and suppresses default completion on drain", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "echo READY")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "echo READY"),
+    );
+    markExplicitControl("s1", "task-1", false);
+    markExplicitControl("s1", "task-1");
+
+    const output = { output: "watch registered" };
+    await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
+
+    expect(output.output).toContain("[BG BASH NOTIFY]");
+    expect(output.output).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(output.output?.match(/- task task-1 exited:/g)).toHaveLength(1);
+  });
+
   test("push completion lands in pending and wakes after the spawn turn is idle", async () => {
     trackBgTask("s1", "task-1");
     const send = mock(async () => ({

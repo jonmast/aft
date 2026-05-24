@@ -116,6 +116,10 @@ impl WatchRegistry {
         self.scan_cursors.insert(cursor_key.to_string(), len);
     }
 
+    pub fn set_file_cursor(&mut self, cursor_key: &str, offset: u64) {
+        self.scan_cursors.insert(cursor_key.to_string(), offset);
+    }
+
     pub fn scan_file_new_bytes(
         &mut self,
         cursor_key: &str,

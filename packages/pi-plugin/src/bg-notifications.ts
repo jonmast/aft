@@ -220,7 +220,7 @@ export function markExplicitControl(
   if (idx >= 0) {
     const completion = state.pendingCompletions[idx];
     state.pendingCompletions.splice(idx, 1);
-    state.pendingPatternMatches.push(completionToExitPattern(completion));
+    queuePendingPatternMatch(state, completionToExitPattern(completion));
     state.wakeDeferredTaskIds.delete(taskId);
   }
 }
@@ -229,22 +229,48 @@ export function unmarkExplicitControl(sessionID: string | undefined, taskId: str
   stateFor(sessionID).explicitControlTasks.delete(taskId);
 }
 
+function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntry): void {
+  const normalized: PatternMatchEntry = entry.reason
+    ? entry
+    : { ...entry, reason: "pattern_match" };
+  const existingIdx = state.pendingPatternMatches.findIndex(
+    (match) => match.task_id === normalized.task_id,
+  );
+  if (existingIdx >= 0) {
+    const existing = state.pendingPatternMatches[existingIdx];
+    if (existing.reason !== "pattern_match" && normalized.reason === "pattern_match") {
+      state.pendingPatternMatches[existingIdx] = normalized;
+    }
+    return;
+  }
+  state.pendingPatternMatches.push(normalized);
+}
+
+function routeExplicitControlCompletions(state: SessionBgState): void {
+  if (state.pendingCompletions.length === 0) return;
+  const remaining: BgCompletion[] = [];
+  for (const completion of state.pendingCompletions) {
+    if (
+      state.explicitControlTasks.has(completion.task_id) ||
+      state.pendingPatternMatches.some((match) => match.task_id === completion.task_id)
+    ) {
+      state.outstandingTaskIds.delete(completion.task_id);
+      state.explicitControlTasks.delete(completion.task_id);
+      state.wakeDeferredTaskIds.delete(completion.task_id);
+      queuePendingPatternMatch(state, completionToExitPattern(completion));
+    } else {
+      remaining.push(completion);
+    }
+  }
+  state.pendingCompletions = remaining;
+}
+
 export async function handlePushedPatternMatch(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   frame: PatternMatchEntry,
 ): Promise<void> {
   const state = stateFor(drainContext.sessionID);
-  // Dedup: see OpenCode equivalent. pattern_match beats task_exit; same
-  // reason: first wins.
-  const existingIdx = state.pendingPatternMatches.findIndex((m) => m.task_id === frame.task_id);
-  if (existingIdx >= 0) {
-    const existing = state.pendingPatternMatches[existingIdx];
-    if (existing.reason !== "pattern_match" && frame.reason === "pattern_match") {
-      state.pendingPatternMatches[existingIdx] = frame;
-    }
-  } else {
-    state.pendingPatternMatches.push(frame);
-  }
+  queuePendingPatternMatch(state, frame);
   await triggerWakeIfPending(drainContext, true);
 }
 
@@ -268,7 +294,7 @@ export function ingestBgCompletions(
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
       state.explicitControlTasks.delete(completion.task_id);
-      state.pendingPatternMatches.push(completionToExitPattern(completion));
+      queuePendingPatternMatch(state, completionToExitPattern(completion));
       continue;
     }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
@@ -326,6 +352,7 @@ export async function appendToolResultBgCompletions(
   if (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted) {
     await drainCompletions(drainContext);
   }
+  routeExplicitControlCompletions(state);
   if (
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0 &&
@@ -387,6 +414,7 @@ async function triggerWakeIfPending(
   if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
     await drainCompletions(drainContext);
   }
+  routeExplicitControlCompletions(state);
   if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
 
   scheduleWake(
@@ -696,7 +724,7 @@ function ingestDrainedBgCompletions(
     state.outstandingTaskIds.delete(completion.task_id);
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.explicitControlTasks.delete(completion.task_id);
-      state.pendingPatternMatches.push(completionToExitPattern(completion));
+      queuePendingPatternMatch(state, completionToExitPattern(completion));
       continue;
     }
     // Suppress completions for tasks already consumed inline by a

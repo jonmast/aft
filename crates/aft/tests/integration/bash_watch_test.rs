@@ -193,3 +193,74 @@ fn watch_controlled_exit_emits_exit_safety_net_not_completion() {
     );
     assert!(aft.shutdown().success());
 }
+
+#[test]
+fn registering_watch_after_completion_removes_completion_and_emits_one_watch_frame() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+    let task_id = spawn(&mut aft, "printf READY-AFTER-COMPLETE");
+
+    let started = Instant::now();
+    loop {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            if frame["task_id"] == task_id {
+                assert_eq!(
+                    frame["type"], "bash_completed",
+                    "task should first complete normally before watch registration: {frame:?}"
+                );
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "timed out waiting for completion frame before watch registration"
+        );
+    }
+
+    let response = notify(
+        &mut aft,
+        &task_id,
+        json!({ "pattern": "READY-AFTER-COMPLETE" }),
+    );
+    assert_eq!(response["success"], true, "notify failed: {response:?}");
+
+    let mut task_frames = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(1) || task_frames.is_empty() {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(100)) {
+            if frame["task_id"] == task_id {
+                task_frames.push(frame);
+            }
+        }
+        if started.elapsed() > Duration::from_secs(6) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        task_frames.len(),
+        1,
+        "watch-after-completion should emit exactly one task frame: {task_frames:?}"
+    );
+    assert_eq!(task_frames[0]["type"], "bash_pattern_match");
+    assert_eq!(task_frames[0]["reason"], "pattern_match");
+    assert_eq!(task_frames[0]["match_text"], "READY-AFTER-COMPLETE");
+
+    let drained = aft.send(
+        &json!({
+            "id": "drain-after-late-watch",
+            "command": "bash_drain_completions"
+        })
+        .to_string(),
+    );
+    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    assert!(
+        drained["bg_completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|completion| completion["task_id"] != task_id),
+        "late watch should remove queued normal completion: {drained:?}"
+    );
+    assert!(aft.shutdown().success());
+}

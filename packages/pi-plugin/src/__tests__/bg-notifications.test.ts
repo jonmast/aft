@@ -110,6 +110,33 @@ describe("Pi background notifications", () => {
     expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
   });
 
+  test("late async watch renders one notify and suppresses default completion on drain", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "echo READY")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedBgCompletion(
+      { ctx, directory: "/tmp/project", sessionID: "s1", runtime: { sendUserMessage } },
+      completion("task-1", "echo READY"),
+    );
+    markExplicitControl("s1", "task-1", false);
+    markExplicitControl("s1", "task-1");
+
+    const content = await appendToolResultBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      [{ type: "text", text: "watch registered" }],
+    );
+
+    const reminder = content?.[1]?.type === "text" ? content[1].text : "";
+    expect(reminder).toContain("[BG BASH NOTIFY]");
+    expect(reminder).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(reminder.match(/- task task-1 exited:/g)).toHaveLength(1);
+  });
+
   test("tool_result mutation appends a reminder text block", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({
