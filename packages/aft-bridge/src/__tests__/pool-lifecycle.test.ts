@@ -16,6 +16,74 @@ function makeLogger() {
 }
 
 describe("BridgePool lifecycle", () => {
+  test("forwards bash pattern match handler into created bridges", () => {
+    const onBashPatternMatch = () => {};
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity, onBashPatternMatch });
+
+    const bridge = pool.getBridge("/project/pattern-match");
+
+    expect((bridge as unknown as { onBashPatternMatch: unknown }).onBashPatternMatch).toBe(
+      onBashPatternMatch,
+    );
+  });
+
+  test("replaceBinary keeps old bridges reachable for cleanup and shutdown", async () => {
+    const pool = new BridgePool("/fake/old-aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/stale-bridge");
+    let shutdownCalls = 0;
+    (bridge as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      shutdownCalls += 1;
+    };
+
+    await pool.replaceBinary("/fake/new-aft");
+
+    const internals = pool as unknown as {
+      bridges: Map<string, unknown>;
+      staleBridges: Set<unknown>;
+      cleanup(): void;
+    };
+    expect(internals.bridges.size).toBe(0);
+    expect(internals.staleBridges.has(bridge)).toBe(true);
+
+    internals.cleanup();
+    await Promise.resolve();
+    expect(shutdownCalls).toBe(1);
+    expect(internals.staleBridges.size).toBe(0);
+
+    await pool.shutdown();
+    expect(shutdownCalls).toBe(1);
+  });
+
+  test("shutdown drains pending stale bridges left by replaceBinary", async () => {
+    const pool = new BridgePool("/fake/old-aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/pending-stale-bridge");
+    let shutdownCalls = 0;
+    (
+      bridge as unknown as {
+        pending: Map<string, unknown>;
+        shutdown: () => Promise<void>;
+      }
+    ).pending.set("1", {});
+    (bridge as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      shutdownCalls += 1;
+    };
+
+    await pool.replaceBinary("/fake/new-aft");
+
+    const internals = pool as unknown as {
+      staleBridges: Set<unknown>;
+      cleanup(): void;
+    };
+    internals.cleanup();
+    await Promise.resolve();
+    expect(shutdownCalls).toBe(0);
+    expect(internals.staleBridges.has(bridge)).toBe(true);
+
+    await pool.shutdown();
+    expect(shutdownCalls).toBe(1);
+    expect(internals.staleBridges.size).toBe(0);
+  });
+
   test("cleanup skips idle bridges with pending requests", () => {
     const pool = new BridgePool("/fake/aft", { idleTimeoutMs: 1 });
     const bridge = pool.getBridge("/project/pending-cleanup");

@@ -84,6 +84,33 @@ describe("fetchUrlToTempFile", () => {
     expect((outcome as Error).message).toMatch(/stalled|aborted|Failed to fetch/i);
   }, 25_000);
 
+  test("concurrent same-URL cache misses use independent temp files", async () => {
+    const body = "# concurrent\n\nbody\n";
+    let fetches = 0;
+    const fetchImpl = async () => {
+      fetches += 1;
+      return new Response(body, {
+        headers: { "content-type": "text/markdown" },
+      });
+    };
+
+    const [first, second] = await Promise.all([
+      fetchUrlToTempFile("http://example.com/concurrent", storageDir, {
+        allowPrivate: true,
+        fetchImpl,
+      }),
+      fetchUrlToTempFile("http://example.com/concurrent", storageDir, {
+        allowPrivate: true,
+        fetchImpl,
+      }),
+    ]);
+
+    expect(first).toBe(second);
+    expect(fetches).toBe(2);
+    const { readFileSync } = await import("node:fs");
+    expect(readFileSync(first, "utf8")).toBe(body);
+  });
+
   test("legitimate body completes normally even with multiple chunks", async () => {
     // Make sure the per-chunk timeout doesn't break the happy path.
     const body = "# heading\n\nbody paragraph with several words to span chunks\n";

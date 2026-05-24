@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import {
   existsSync,
@@ -519,7 +519,8 @@ export async function fetchUrlToTempFile(
   // Write content and meta atomically
   const body = Buffer.concat(chunks);
   const contentFile = contentPath(storageDir, hash, extension);
-  const tmpContent = `${contentFile}.tmp-${process.pid}`;
+  const nonce = randomBytes(8).toString("hex");
+  const tmpContent = `${contentFile}.tmp-${process.pid}-${nonce}`;
   writeFileSync(tmpContent, body);
   const { renameSync } = await import("node:fs");
   renameSync(tmpContent, contentFile);
@@ -530,7 +531,7 @@ export async function fetchUrlToTempFile(
     extension,
     fetchedAt: Date.now(),
   };
-  const tmpMeta = `${metaFile}.tmp-${process.pid}`;
+  const tmpMeta = `${metaFile}.tmp-${process.pid}-${nonce}`;
   writeFileSync(tmpMeta, JSON.stringify(meta));
   renameSync(tmpMeta, metaFile);
 

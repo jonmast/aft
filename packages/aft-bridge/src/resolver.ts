@@ -1,10 +1,10 @@
-import { execSync, spawnSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log, warn } from "./active-logger.js";
-import { ensureBinary, getCacheDir } from "./downloader.js";
+import { ensureBinary, getCacheDir, readBinaryVersion } from "./downloader.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 type EnsureBinary = typeof ensureBinary;
@@ -17,31 +17,7 @@ export function __setEnsureBinaryForTests(impl: EnsureBinary | null): void {
 
 type ResolverEnv = typeof process.env;
 
-/**
- * Read the version string from an `aft` binary by invoking it with
- * `--version`. Returns the bare version (e.g. `"0.22.1"`) without the
- * leading `v` or the `aft` prefix, or `null` if the invocation fails.
- *
- * Exported so tests and the resolver can use it for version-match checks
- * before deciding to return a candidate binary.
- */
-export function readBinaryVersion(binaryPath: string): string | null {
-  try {
-    const result = spawnSync(binaryPath, ["--version"], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5000,
-    });
-    const stdoutVersion = result.stdout?.trim();
-    const stderrVersion = result.stderr?.trim();
-    const rawVersion = stdoutVersion || stderrVersion;
-    if (!rawVersion) return null;
-    // `aft --version` outputs "aft 0.9.0" — extract just the version number
-    return rawVersion.replace(/^aft\s+/, "");
-  } catch {
-    return null;
-  }
-}
+export { readBinaryVersion };
 
 /**
  * Copy an npm platform binary to the versioned cache so we never run from
@@ -119,6 +95,32 @@ function isExpectedCachedBinary(binaryPath: string, expectedVersion: string): bo
     `Cached binary at ${binaryPath} reports ${actual ?? "no version"}, expected ${expected}; skipping cache candidate`,
   );
   return false;
+}
+
+function probeBinaryCandidate(
+  binaryPath: string,
+  source: string,
+  expectedVersion?: string,
+): string | null {
+  const actual = readBinaryVersion(binaryPath);
+  if (actual === null) {
+    warn(`${source} binary at ${binaryPath} did not report a version; skipping`);
+    return null;
+  }
+  if (expectedVersion && actual !== normalizeBareVersion(expectedVersion)) {
+    warn(
+      `${source} binary at ${binaryPath} reports ${actual}, expected ${normalizeBareVersion(expectedVersion)}; skipping`,
+    );
+    return null;
+  }
+  return binaryPath;
+}
+
+function parsePathLookupOutput(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((candidate) => candidate.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -229,17 +231,27 @@ export function findBinarySync(expectedVersion?: string): string | null {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
-    if (result) return result;
+    for (const candidate of parsePathLookupOutput(result)) {
+      const usable = probeBinaryCandidate(candidate, "PATH", expectedVersion);
+      if (usable) return usable;
+    }
   } catch {
     // not in PATH
   }
 
   // 4. Check ~/.cargo/bin/aft
   const cargoPath = join(homeDirFromEnv(env), ".cargo", "bin", `aft${ext}`);
-  if (existsSync(cargoPath)) return cargoPath;
+  if (existsSync(cargoPath)) {
+    const usable = probeBinaryCandidate(cargoPath, "cargo", expectedVersion);
+    if (usable) return usable;
+  }
 
   return null;
 }
+
+export const __test__ = {
+  parsePathLookupOutput,
+};
 
 /**
  * Locate the `aft` binary, with auto-download as a last resort.

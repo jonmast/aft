@@ -53,7 +53,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
@@ -349,14 +349,23 @@ function cleanupAbandonedOnnxAttempts(onnxBaseDir: string, ortDir: string): void
  */
 const REQUIRED_ORT_MAJOR = 1;
 const REQUIRED_ORT_MIN_MINOR = 20;
+const INVALID_ORT_VERSION = "<invalid>";
+
+function parseOnnxVersionFromPath(value: string): string | null {
+  const name = basename(value);
+  const semverish = name.match(/\.(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\.dylib)?$/);
+  if (semverish) return semverish[1].split(/[-+]/, 1)[0];
+  return /\d+\.\d+\.\d+/.test(name) ? INVALID_ORT_VERSION : null;
+}
 
 /**
  * Detect the version of an ONNX Runtime install by walking the directory's
  * library-file suffixes. Microsoft ships `libonnxruntime.so.1.24.4` and
  * symlinks the bare `libonnxruntime.so` at it; on macOS the pattern is
- * `libonnxruntime.1.24.4.dylib`. Returns null when the version cannot be
- * inferred (treat as compatible to avoid false negatives on unconventional
- * installs).
+ * `libonnxruntime.1.24.4.dylib`. Returns null only when no version-shaped
+ * suffix is present (treat as compatible to avoid false negatives on
+ * unconventional installs). Malformed version-shaped suffixes return an invalid
+ * sentinel so the system install is rejected instead of silently accepted.
  */
 function detectOnnxVersion(libDir: string, libName: string): string | null {
   try {
@@ -371,23 +380,23 @@ function detectOnnxVersion(libDir: string, libName: string): string | null {
     const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");
     for (const entry of entries) {
       if (!entry.startsWith(barePrefix)) continue;
-      const match = entry.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
-      if (match) return match[1];
+      const version = parseOnnxVersionFromPath(entry);
+      if (version) return version;
     }
     // Symlink fallback: bare libonnxruntime.so -> libonnxruntime.so.1.24.4
     const base = join(libDir, libName);
     if (existsSync(base)) {
       try {
         const real = realpathSync(base);
-        const m = real.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
-        if (m) return m[1];
+        const version = parseOnnxVersionFromPath(real);
+        if (version) return version;
       } catch {
         // ignore
       }
       try {
         const target = readlinkSync(base);
-        const m = target.match(/\.(\d+\.\d+\.\d+)(?:\.dylib)?$/);
-        if (m) return m[1];
+        const version = parseOnnxVersionFromPath(target);
+        if (version) return version;
       } catch {
         // not a symlink
       }
@@ -961,6 +970,7 @@ export const __test__ = {
   ORT_VERSION,
   ONNX_INSTALLED_META_FILE,
   detectOnnxVersion,
+  parseOnnxVersionFromPath,
   isOnnxVersionCompatible,
   findSystemOnnxRuntime,
   REQUIRED_ORT_MAJOR,

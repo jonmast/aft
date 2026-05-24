@@ -19,8 +19,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { findBinarySync, readBinaryVersion } from "../resolver.js";
+import { dirname, join } from "node:path";
+import { findBinarySync, readBinaryVersion, __test__ as resolverTest } from "../resolver.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
 // On the Ubuntu GitHub Actions runner Bun's `spawnSync` reproducibly returns
@@ -34,6 +34,7 @@ import { acquireEnv } from "./test-utils/env-guard.js";
 // macOS + Windows + local runs for the coverage; the v0.27.1 follow-up
 // should diagnose the root cause and re-enable.
 const skipLinuxCi = process.platform === "linux" && process.env.CI === "true";
+const skipShellFixture = skipLinuxCi || process.platform === "win32";
 
 describe.skipIf(skipLinuxCi)("readBinaryVersion", () => {
   let tmpDir: string;
@@ -152,5 +153,52 @@ describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => 
     expect(existsSync(binaryPath)).toBe(true);
 
     expect(findBinarySync("1.2.3")).toBeNull();
+  });
+});
+
+describe("findBinarySync PATH lookup parsing", () => {
+  test("splits CRLF-separated Windows where output into individual candidates", () => {
+    expect(
+      resolverTest.parsePathLookupOutput("C:\\tools\\aft.exe\r\nC:\\other\\aft.exe\r\n"),
+    ).toEqual(["C:\\tools\\aft.exe", "C:\\other\\aft.exe"]);
+  });
+});
+
+describe.skipIf(skipShellFixture)("findBinarySync PATH/cargo validation", () => {
+  let tmpDir: string;
+  let releaseEnv: (() => void) | undefined;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "aft-path-version-test-"));
+    const pathDir = join(tmpDir, "path-bin");
+    mkdirSync(pathDir, { recursive: true });
+    releaseEnv = await acquireEnv({
+      XDG_CACHE_HOME: join(tmpDir, "cache"),
+      PATH: `${pathDir}:${process.env.PATH ?? ""}`,
+      HOME: join(tmpDir, "home"),
+    });
+  });
+
+  afterEach(() => {
+    releaseEnv?.();
+    releaseEnv = undefined;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeFakeAft(path: string, reportedVersion: string): void {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `#!/bin/sh\necho "aft ${reportedVersion}"\n`);
+    chmodSync(path, 0o755);
+  }
+
+  test("skips mismatched PATH candidate and falls through to matching cargo binary", () => {
+    const pathBinary = join(tmpDir, "path-bin", "aft");
+    const cargoBinary = join(tmpDir, "home", ".cargo", "bin", "aft");
+    writeFakeAft(pathBinary, "9.9.9");
+    writeFakeAft(cargoBinary, "1.2.3");
+
+    expect(readBinaryVersion(pathBinary)).toBe("9.9.9");
+    expect(readBinaryVersion(cargoBinary)).toBe("1.2.3");
+    expect(findBinarySync("1.2.3")).toBe(cargoBinary);
   });
 });

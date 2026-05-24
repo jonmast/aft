@@ -261,6 +261,7 @@ export interface BridgeRequestOptions {
 interface SendOptions extends BridgeRequestOptions {
   timeoutMs?: number;
   configureWarningClient?: unknown;
+  markConfiguredOnSuccess?: boolean;
 }
 
 /**
@@ -491,6 +492,18 @@ export class BinaryBridge {
         this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
       }
 
+      // Per-op timeout override: tool wrappers can pass longer budgets for
+      // commands that legitimately need them (callers, trace_to, grep on big
+      // repos). Defaults to the bridge-wide timeout otherwise.
+      const effectiveTimeoutMs =
+        options?.transportTimeoutMs ?? options?.timeoutMs ?? this.timeoutMs;
+      const implicitTransportOptions: SendOptions = {
+        ...(options?.transportTimeoutMs !== undefined || options?.timeoutMs !== undefined
+          ? { transportTimeoutMs: effectiveTimeoutMs }
+          : {}),
+        markConfiguredOnSuccess: false,
+      };
+
       // Auto-configure project root + plugin config on first command, then check version.
       // configured is set AFTER success to prevent skipping configuration on failure (#18).
       // When multiple parallel calls arrive before configure completes, they all await
@@ -510,11 +523,15 @@ export class BinaryBridge {
               typeof params.session_id === "string" ? (params.session_id as string) : undefined;
             this._configurePromise = (async () => {
               try {
-                const configResult = await this.send("configure", {
-                  project_root: this.cwd,
-                  ...this.configOverrides,
-                  ...(sessionIdForConfigure ? { session_id: sessionIdForConfigure } : {}),
-                });
+                const configResult = await this.send(
+                  "configure",
+                  {
+                    project_root: this.cwd,
+                    ...this.configOverrides,
+                    ...(sessionIdForConfigure ? { session_id: sessionIdForConfigure } : {}),
+                  },
+                  implicitTransportOptions,
+                );
                 if (configResult.success === false) {
                   throw new Error(
                     `${this.errorPrefix} Configure failed: ${configResult.message ?? "unknown error"}`,
@@ -524,7 +541,7 @@ export class BinaryBridge {
                 // and relayed through stderr → plugin log. No need to re-log here
                 // (doing so would just duplicate the same line in aft-plugin.log).
                 await this.deliverConfigureWarnings(configResult, params, options);
-                await this.checkVersion();
+                await this.checkVersion(implicitTransportOptions);
                 // Re-check liveness after version check — checkVersion() swallows
                 // errors as best-effort, so the bridge may have died without throwing.
                 if (!this.isAlive()) {
@@ -569,15 +586,9 @@ export class BinaryBridge {
       }
       const line = `${JSON.stringify(request)}\n`;
 
-      // Per-op timeout override: tool wrappers can pass longer budgets for
-      // commands that legitimately need them (callers, trace_to, grep on big
-      // repos). Defaults to the bridge-wide timeout otherwise.
-      const effectiveTimeoutMs =
-        options?.transportTimeoutMs ?? options?.timeoutMs ?? this.timeoutMs;
-
       const keepBridgeOnTimeout = options?.keepBridgeOnTimeout === true;
 
-      return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           const restartSuffix = keepBridgeOnTimeout ? "" : " — restarting bridge";
@@ -623,6 +634,16 @@ export class BinaryBridge {
           }
         });
       });
+
+      if (
+        command === "configure" &&
+        response.success === true &&
+        options?.markConfiguredOnSuccess !== false
+      ) {
+        this.configured = true;
+      }
+
+      return response;
     } catch (err) {
       if (
         err instanceof BridgeReplacedDuringVersionCheck &&
@@ -749,10 +770,10 @@ export class BinaryBridge {
   // ---- Internal ----
 
   /** Query binary version and compare against minVersion. Calls onVersionMismatch if outdated. */
-  private async checkVersion(): Promise<void> {
+  private async checkVersion(options?: SendOptions): Promise<void> {
     if (!this.minVersion) return;
     try {
-      const resp = await this.send("version");
+      const resp = await this.send("version", {}, options);
       if (resp.success === false) {
         throw new Error(
           `Binary version check failed: ${String(resp.code ?? "unknown")} — likely too old`,

@@ -87,6 +87,22 @@ describe("detectOnnxVersion", () => {
     expect(detectOnnxVersion(workDir, "libonnxruntime.dylib")).toBe("1.24.4");
   });
 
+  test("extracts prerelease suffixes and compares the base version", () => {
+    writeFileSync(join(workDir, "libonnxruntime.so.1.19.0-rc1"), "binary");
+    const version = detectOnnxVersion(workDir, "libonnxruntime.so");
+
+    expect(version).toBe("1.19.0");
+    expect(isOnnxVersionCompatible(version!)).toBe(false);
+  });
+
+  test("malformed version-shaped suffixes are incompatible instead of unknown", () => {
+    writeFileSync(join(workDir, "libonnxruntime.so.1.19.0_rc1"), "binary");
+    const version = detectOnnxVersion(workDir, "libonnxruntime.so");
+
+    expect(version).not.toBeNull();
+    expect(isOnnxVersionCompatible(version!)).toBe(false);
+  });
+
   test("follows symlink from bare lib name to versioned target", () => {
     writeFileSync(join(workDir, "libonnxruntime.so.1.9.0"), "binary");
     symlinkSync("libonnxruntime.so.1.9.0", join(workDir, "libonnxruntime.so"));

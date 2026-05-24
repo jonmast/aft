@@ -105,6 +105,84 @@ process.stdin.resume();
     }
   });
 
+  test("caller transport timeout applies to implicit configure and version RPCs", async () => {
+    const script = writeExecutable(
+      "slow-cold-start.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+function reply(req, body, delay) {
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify({ id: req.id, ...body }) + "\\n");
+  }, delay);
+}
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      reply(req, { success: true, warnings: [] }, 120);
+    } else if (req.command === "version") {
+      reply(req, { success: true, version: "1.0.0" }, 120);
+    } else {
+      reply(req, { success: true, command: req.command }, 0);
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, {
+      timeoutMs: 50,
+      maxRestarts: 0,
+      minVersion: "1.0.0",
+    });
+
+    try {
+      const response = await bridge.send("ping", {}, { transportTimeoutMs: 1_000 });
+      expect(response).toMatchObject({ success: true, command: "ping" });
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("explicit configure success marks bridge configured", async () => {
+    const script = writeExecutable(
+      "explicit-configure.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+let configureCount = 0;
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      configureCount += 1;
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, command: req.command, configureCount }) + "\\n");
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+
+    try {
+      await bridge.send("configure", { project_root: workDir });
+      const response = await bridge.send("ping");
+      expect(response).toMatchObject({ success: true, command: "ping", configureCount: 1 });
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("version RPC success:false rejects when minVersion is set", async () => {
     const bridge = new BinaryBridge("/fake/aft", workDir, { minVersion: "1.0.0" });
     const testBridge = bridge as unknown as {

@@ -11,7 +11,8 @@
  * Cache dir respects XDG_CACHE_HOME on Linux/macOS and LOCALAPPDATA on Windows.
  */
 
-import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -19,10 +20,12 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
   unlinkSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +40,46 @@ const LATEST_TAG_TIMEOUT_MS = 30_000;
 const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 const DOWNLOAD_LOCK_TIMEOUT_MS = 120_000;
 const DOWNLOAD_LOCK_STALE_MS = 10 * 60_000;
+
+/**
+ * Read the version string from an `aft` binary by invoking it with
+ * `--version`. Returns the bare version (e.g. `"0.22.1"`) without the
+ * leading `v` or the `aft` prefix, or `null` if the invocation fails.
+ *
+ * Shared by the downloader and resolver so both cache hot-paths validate the
+ * binary itself instead of trusting directory names.
+ */
+export function readBinaryVersion(binaryPath: string): string | null {
+  try {
+    const result = spawnSync(binaryPath, ["--version"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 5000,
+    });
+    const stdoutVersion = result.stdout?.trim();
+    const stderrVersion = result.stderr?.trim();
+    const rawVersion = stdoutVersion || stderrVersion;
+    if (!rawVersion) return null;
+    // `aft --version` outputs "aft 0.9.0" — extract just the version number
+    return rawVersion.replace(/^aft\s+/, "");
+  } catch {
+    return null;
+  }
+}
+
+function expectedVersionFromTag(tag: string): string {
+  return tag.startsWith("v") ? tag.slice(1) : tag;
+}
+
+function isExpectedCachedBinary(binaryPath: string, tag: string): boolean {
+  const expected = expectedVersionFromTag(tag);
+  const actual = readBinaryVersion(binaryPath);
+  if (actual === expected) return true;
+  warn(
+    `Cached binary at ${binaryPath} reports ${actual ?? "no version"}, expected ${expected}; refreshing cache entry`,
+  );
+  return false;
+}
 
 /** Get the cache directory, respecting XDG_CACHE_HOME / LOCALAPPDATA. */
 export function getCacheDir(): string {
@@ -105,8 +148,10 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   const binaryName = getBinaryName();
   const binaryPath = join(versionedCacheDir, binaryName);
 
-  // Already cached for this version
-  if (existsSync(binaryPath)) {
+  // Already cached for this version. Probe the binary itself before trusting
+  // the cache directory name; stale hot-swap entries can otherwise shadow a
+  // freshly requested compatible version forever.
+  if (existsSync(binaryPath) && isExpectedCachedBinary(binaryPath, tag)) {
     return binaryPath;
   }
 
@@ -132,7 +177,9 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     releaseLock = await acquireDownloadLock(lockPath);
 
     // Another process may have completed the same version while we waited.
-    if (existsSync(binaryPath)) {
+    // Re-probe here too because a stale owner might have left a mismatched
+    // binary in the versioned directory before this process acquired the lock.
+    if (existsSync(binaryPath) && isExpectedCachedBinary(binaryPath, tag)) {
       return binaryPath;
     }
 
@@ -273,7 +320,7 @@ export async function ensureBinary(version?: string): Promise<string | null> {
     // Do NOT fall back to legacy flat cache — it may contain a different version,
     // causing an infinite spawn-check-replace loop.
     const versionCached = getCachedBinaryPath(tag);
-    if (versionCached) {
+    if (versionCached && isExpectedCachedBinary(versionCached, tag)) {
       log(`Found cached binary for ${tag}: ${versionCached}`);
       return versionCached;
     }
@@ -289,7 +336,9 @@ async function acquireDownloadLock(lockPath: string): Promise<() => void> {
   const startedAt = Date.now();
   while (true) {
     try {
+      const owner = `${process.pid}:${Date.now()}:${randomUUID()}`;
       const fd = openSync(lockPath, "wx");
+      writeSync(fd, owner);
       return () => {
         try {
           closeSync(fd);
@@ -297,9 +346,11 @@ async function acquireDownloadLock(lockPath: string): Promise<() => void> {
           // already closed — ignore
         }
         try {
-          rmSync(lockPath, { force: true });
+          if (readFileSync(lockPath, "utf-8") === owner) {
+            rmSync(lockPath, { force: true });
+          }
         } catch {
-          // best-effort lock cleanup
+          // best-effort lock cleanup; missing or reclaimed locks are fine
         }
       };
     } catch (err) {
@@ -361,3 +412,7 @@ async function fetchLatestTag(): Promise<string | null> {
     clearTimeout(timeout);
   }
 }
+
+export const __test__ = {
+  acquireDownloadLock,
+};
