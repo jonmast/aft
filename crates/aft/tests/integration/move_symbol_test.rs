@@ -335,6 +335,155 @@ fn move_symbol_aliased_import() {
     aft.shutdown();
 }
 
+#[test]
+fn move_symbol_rewrites_source_file_when_remaining_code_uses_moved_symbol() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("helpers.ts");
+
+    write_file(
+        &source,
+        "export function helper(): string {
+  return 'ok';
+}
+
+export function useHelper(): string {
+  return helper();
+}
+",
+    );
+    write_file(
+        &dest,
+        "export const existing = true;
+",
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"source-consumer","command":"move_symbol","file":"{}","symbol":"helper","destination":"{}"}}"#,
+        source.display(),
+        dest.display()
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert!(
+        resp["consumers_updated"].as_u64().unwrap() >= 1,
+        "source file should count as an updated consumer: {resp:?}"
+    );
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        source_content.contains("import { helper } from './helpers';"),
+        "source should import the moved helper from destination:
+{source_content}"
+    );
+    assert!(
+        source_content.contains("return helper();"),
+        "remaining source code should still call helper:
+{source_content}"
+    );
+    assert!(
+        !source_content.contains("export function helper"),
+        "helper declaration should be removed from source:
+{source_content}"
+    );
+
+    let dest_content = std::fs::read_to_string(&dest).expect("read dest");
+    assert!(
+        dest_content.contains("export function helper"),
+        "destination should contain moved helper:
+{dest_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_preserves_default_import_shape_and_alias() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let old = tmp.path().join("old.ts");
+    let dest = tmp.path().join("new_home.ts");
+    let consumer_foo = tmp.path().join("consumer_foo.ts");
+    let consumer_bar = tmp.path().join("consumer_bar.ts");
+
+    write_file(
+        &old,
+        "export default function Foo(): string {
+  return 'foo';
+}
+
+export function keep(): string {
+  return 'keep';
+}
+",
+    );
+    write_file(
+        &dest,
+        "export const existing = true;
+",
+    );
+    write_file(
+        &consumer_foo,
+        "import Foo from './old';
+
+export const value = Foo();
+",
+    );
+    write_file(
+        &consumer_bar,
+        "import Bar from './old';
+
+export const value = Bar();
+",
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"default-imports","command":"move_symbol","file":"{}","symbol":"Foo","destination":"{}"}}"#,
+        old.display(),
+        dest.display()
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let foo_content = std::fs::read_to_string(&consumer_foo).expect("read consumer_foo");
+    assert!(
+        foo_content.contains("import Foo from './new_home';"),
+        "default import should stay default for Foo local name:
+{foo_content}"
+    );
+    assert!(
+        !foo_content.contains("import { Foo }"),
+        "default import must not become named import:
+{foo_content}"
+    );
+
+    let bar_content = std::fs::read_to_string(&consumer_bar).expect("read consumer_bar");
+    assert!(
+        bar_content.contains("import Bar from './new_home';"),
+        "default import alias Bar should be preserved:
+{bar_content}"
+    );
+    assert!(
+        !bar_content.contains("import { Foo }"),
+        "aliased default must not become named import:
+{bar_content}"
+    );
+
+    let dest_content = std::fs::read_to_string(&dest).expect("read dest");
+    assert!(
+        dest_content.contains("export default function Foo"),
+        "destination should preserve default export:
+{dest_content}"
+    );
+
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint tests
 // ---------------------------------------------------------------------------

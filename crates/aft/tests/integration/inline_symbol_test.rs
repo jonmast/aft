@@ -343,3 +343,170 @@ fn inline_symbol_matches_multiline_call_starting_on_target_line() {
 
     aft.shutdown();
 }
+
+#[test]
+fn inline_symbol_preserves_nested_multiline_indentation() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("nested_indent.ts");
+    std::fs::write(
+        &file,
+        r#"function helper(items: number[]): void {
+  for (const item of items) {
+    if (item > 0) {
+      console.log(item);
+    }
+  }
+}
+
+const values = [1, 2];
+
+export function main() {
+  helper(values);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"nested-indent","command":"inline_symbol","file":"{}","symbol":"helper","call_site_line":12}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    let expected =
+        "  for (const item of values) {\n    if (item > 0) {\n      console.log(item);\n    }\n  }";
+    assert!(
+        content.contains(expected),
+        "nested relative indentation should be preserved:\n{content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_standalone_return_expression_becomes_expression_statement() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("standalone_return.ts");
+    std::fs::write(
+        &file,
+        r#"function helper(): number {
+  audit();
+  return sideEffect();
+}
+
+function audit(): void {}
+function sideEffect(): number { return 1; }
+
+export function main() {
+  helper();
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"standalone-return","command":"inline_symbol","file":"{}","symbol":"helper","call_site_line":10}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("  audit();\n  sideEffect();"),
+        "return expression should be kept as an expression statement:\n{content}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_maps_destructured_default_and_rest_parameters() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("params.ts");
+    std::fs::write(
+        &file,
+        r#"type Point = { x: number; y: number };
+
+function describe({ x, y }: Point, [first, second]: number[], label = 'pt', ...rest: string[]): string {
+  return `${label}:${x + y}:${first + second}:${rest.join(',')}`;
+}
+
+const point = { x: 1, y: 2 };
+const pair = [3, 4];
+
+export function main() {
+  const result = describe(point, pair, 'p', 'a', 'b');
+  console.log(result);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"params","command":"inline_symbol","file":"{}","symbol":"describe","call_site_line":11}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("point.x + point.y"),
+        "object destructuring bindings should map to variable properties:\n{content}"
+    );
+    assert!(
+        content.contains("pair[0] + pair[1]"),
+        "array destructuring bindings should map to indexed accesses:\n{content}"
+    );
+    assert!(
+        content.contains("['a', 'b'].join(',')"),
+        "rest parameter should map to an array literal of remaining args:\n{content}"
+    );
+    assert!(
+        !content.contains("describe(point"),
+        "call should be replaced:\n{content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_refuses_destructuring_from_non_variable_argument() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("params_mismatch.ts");
+    std::fs::write(
+        &file,
+        r#"type Point = { x: number; y: number };
+
+function sumPoint({ x, y }: Point): number {
+  return x + y;
+}
+
+export function main() {
+  const result = sumPoint({ x: 1, y: 2 });
+  console.log(result);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"params-mismatch","command":"inline_symbol","file":"{}","symbol":"sumPoint","call_site_line":8}}"#,
+        file.display()
+    ));
+    assert_eq!(resp["success"], false, "inline should fail: {resp:?}");
+    assert_eq!(resp["code"], "param_mismatch", "wrong error: {resp:?}");
+
+    aft.shutdown();
+}

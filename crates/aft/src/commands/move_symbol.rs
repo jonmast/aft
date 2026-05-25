@@ -309,10 +309,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Prepare the text to add to destination: ensure it has export prefix.
     // When start_byte was extended above, the symbol_text already includes
     // `export`; prepare_exported_symbol's idempotency check leaves it alone.
+    let moved_symbol_is_default = symbol_text.trim_start().starts_with("export default");
     let dest_symbol_text = prepare_exported_symbol(symbol_text);
 
     // Prepare source with symbol removed
-    let new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
+    let mut new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
         Ok(s) => s,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
@@ -373,6 +374,24 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // `lang` already detected above for the export-keyword extension.
 
+    // If the original source still references the moved symbol after removing
+    // its declaration, it is also a consumer. Run the same import-rewrite path
+    // against the post-removal source text so those local references resolve.
+    let source_rewritten_as_consumer = if let Some(rewritten) = rewrite_consumer_imports(
+        &new_source,
+        source_path,
+        source_path,
+        dest_path,
+        symbol_name,
+        Some(source_lang),
+        moved_symbol_is_default,
+    ) {
+        new_source = rewritten;
+        true
+    } else {
+        false
+    };
+
     // --- Compute consumer rewrites ---
     let mut consumer_rewrites: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, new)
     for consumer_file in &consumer_files {
@@ -391,6 +410,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             dest_path,
             symbol_name,
             Some(source_lang),
+            moved_symbol_is_default,
         );
 
         if let Some(rewritten) = new_consumer {
@@ -531,7 +551,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // 3. Write consumer files (imports rewritten)
-    let mut consumers_updated = 0;
+    let mut consumers_updated = usize::from(source_rewritten_as_consumer);
     for (path, _original, new_content) in &consumer_rewrites {
         match edit::write_format_validate(&path, new_content, &ctx.config(), &req.params) {
             Ok(wr) => {
@@ -919,6 +939,7 @@ fn rewrite_consumer_imports(
     dest_file: &Path,
     symbol_name: &str,
     lang: Option<LangId>,
+    moved_symbol_is_default: bool,
 ) -> Option<String> {
     let lang = lang?;
 
@@ -927,13 +948,10 @@ fn rewrite_consumer_imports(
         return None;
     }
 
-    // Parse imports
-    let (_source_text, _tree, block) = match imports::parse_file_imports(consumer_file, lang) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
+    // Parse imports from the content passed in. For the source file this is
+    // the post-removal text, not the original on-disk content.
+    let (tree, block) = parse_imports_from_content(consumer_content, lang)?;
 
-    // Use the consumer_content we already read (should match source_text)
     let content = consumer_content;
 
     // Find imports from the source file that reference the moved symbol
@@ -953,65 +971,54 @@ fn rewrite_consumer_imports(
     let mut made_changes = false;
 
     for (_, imp) in &matching_imports {
-        // Match on the imported name (pre-`as`) so `import { foo as bar }`
-        // still matches when we're moving `foo`. The TS/JS specifier is
-        // stored verbatim (`"foo as bar"`); see `imports::specifier_matches`.
-        let has_moved_symbol = imp
-            .names
-            .iter()
-            .any(|n| imports::specifier_matches(n, symbol_name))
-            || imp.default_import.as_deref() == Some(symbol_name);
-
-        if !has_moved_symbol {
+        let moved_bindings = moved_bindings_for_import(imp, symbol_name, moved_symbol_is_default);
+        if moved_bindings.is_empty() {
             continue;
         }
 
         let new_import_path = compute_relative_import_path(consumer_file, dest_file);
 
-        // Check if this import has other symbols besides the moved one
+        // Check if this import has other symbols besides the moved one. Default
+        // imports are only moved when the target declaration was the default
+        // export, preserving the consumer's local alias (`import Bar ...`).
         let remaining_names: Vec<String> = imp
             .names
             .iter()
-            .filter(|n| !imports::specifier_matches(n, symbol_name))
+            .filter(|n| !moved_bindings.named.iter().any(|moved| moved == *n))
             .cloned()
             .collect();
-        let remaining_default = if imp.default_import.as_deref() == Some(symbol_name) {
+        let remaining_default = if moved_bindings.default_import.is_some() {
             None
         } else {
             imp.default_import.clone()
         };
+        let remaining_namespace = if moved_bindings.namespace_import.is_some() {
+            None
+        } else {
+            imp.namespace_import.clone()
+        };
 
         let type_only = imp.kind == imports::ImportKind::Type;
+        let moved_import =
+            generate_import_for_bindings(lang, &new_import_path, &moved_bindings, type_only);
 
         // Build the replacement text
-        if remaining_names.is_empty() && remaining_default.is_none() {
-            // All symbols in this import are moving — replace entire import with new path
-            // Preserve the original import structure but change the path
-            let new_import = generate_import_with_alias(
-                &imp.raw_text,
-                symbol_name,
-                &new_import_path,
-                type_only,
-                lang,
-            );
-            edits.push((imp.byte_range.clone(), new_import));
+        if remaining_names.is_empty()
+            && remaining_default.is_none()
+            && remaining_namespace.is_none()
+        {
+            // All symbols in this import are moving — replace entire import with
+            // a same-kind import from the new path.
+            edits.push((imp.byte_range.clone(), moved_import));
         } else {
-            // Some symbols remain — keep old import for remaining, add new import for moved
-            let kept_import = imports::generate_import_line(
+            // Some symbols remain — keep old import for remaining, add new import for moved.
+            let kept_import = imports::generate_import_line_with_namespace(
                 lang,
                 &imp.module_path,
                 &remaining_names,
                 remaining_default.as_deref(),
+                remaining_namespace.as_deref(),
                 type_only,
-            );
-
-            // Generate new import for the moved symbol
-            let moved_import = generate_import_with_alias(
-                &imp.raw_text,
-                symbol_name,
-                &new_import_path,
-                type_only,
-                lang,
             );
 
             let replacement = format!("{}\n{}", kept_import, moved_import);
@@ -1019,63 +1026,76 @@ fn rewrite_consumer_imports(
         }
     }
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar_for(lang)).is_ok() {
-        if let Some(tree) = parser.parse(content, None) {
-            let root = tree.root_node();
-            let mut exports = Vec::new();
-            let mut cursor = root.walk();
-            if cursor.goto_first_child() {
-                loop {
-                    let node = cursor.node();
-                    if node.kind() == "export_statement"
-                        && export_path_matches_file(content, &node, consumer_file, source_file)
-                    {
-                        exports.push(node);
-                    }
-                    if !cursor.goto_next_sibling() {
-                        break;
-                    }
+    {
+        let root = tree.root_node();
+        let mut exports = Vec::new();
+        let mut cursor = root.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let node = cursor.node();
+                if node.kind() == "export_statement"
+                    && export_path_matches_file(content, &node, consumer_file, source_file)
+                {
+                    exports.push(node);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
                 }
             }
+        }
 
-            exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
-            for node in exports {
-                if export_statement_has_wildcard(content, &node) {
-                    // TODO: safely rewrite `export * from "..."` once moved-symbol
-                    // provenance can distinguish which names are provided by the star.
-                    crate::slog_warn!(
-                        "move_symbol: leaving wildcard re-export unchanged in {}",
-                        consumer_file.display()
-                    );
-                    continue;
-                }
-                if !export_statement_contains_name(content, &node, symbol_name) {
-                    continue;
-                }
-                let Some(module_range) = export_module_string_range(content, &node) else {
-                    continue;
-                };
-                let Some((moved_specs, remaining_specs)) =
-                    partition_export_specifiers(content, &node, symbol_name)
-                else {
-                    continue;
-                };
-                let new_import_path = compute_relative_import_path(consumer_file, dest_file);
-                if remaining_specs.is_empty() {
-                    edits.push((module_range, new_import_path));
-                } else {
-                    let old_path = &content[module_range];
-                    let replacement = format!(
-                        "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
-                        remaining_specs.join(", "),
-                        old_path,
-                        moved_specs.join(", "),
-                        new_import_path
-                    );
-                    edits.push((node.byte_range(), replacement));
-                }
+        exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
+        for node in exports {
+            if export_statement_has_wildcard(content, &node) {
+                // TODO: safely rewrite `export * from "..."` once moved-symbol
+                // provenance can distinguish which names are provided by the star.
+                crate::slog_warn!(
+                    "move_symbol: leaving wildcard re-export unchanged in {}",
+                    consumer_file.display()
+                );
+                continue;
             }
+            if !export_statement_contains_name(content, &node, symbol_name) {
+                continue;
+            }
+            let Some(module_range) = export_module_string_range(content, &node) else {
+                continue;
+            };
+            let Some((moved_specs, remaining_specs)) =
+                partition_export_specifiers(content, &node, symbol_name)
+            else {
+                continue;
+            };
+            let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+            if remaining_specs.is_empty() {
+                edits.push((module_range, new_import_path));
+            } else {
+                let old_path = &content[module_range];
+                let replacement = format!(
+                    "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
+                    remaining_specs.join(", "),
+                    old_path,
+                    moved_specs.join(", "),
+                    new_import_path
+                );
+                edits.push((node.byte_range(), replacement));
+            }
+        }
+    }
+
+    if paths_equivalent(consumer_file, source_file)
+        && content_references_identifier(content, lang, symbol_name)
+    {
+        if let Some(insert_edit) = build_add_moved_import_edit(
+            content,
+            &block,
+            consumer_file,
+            dest_file,
+            symbol_name,
+            lang,
+            moved_symbol_is_default,
+        ) {
+            edits.push(insert_edit);
         }
     }
 
@@ -1178,37 +1198,158 @@ fn partition_export_specifiers(
     Some((moved, remaining))
 }
 
-/// Generate an import statement preserving any alias from the original import text.
-///
-/// If the original import has `{ X as Y }`, the new import preserves the alias.
-fn generate_import_with_alias(
-    original_raw: &str,
-    symbol_name: &str,
-    new_module_path: &str,
-    type_only: bool,
-    _lang: LangId,
-) -> String {
-    // Check if the original import uses an alias for this symbol
-    // Pattern: `X as Y` inside braces
-    let alias = extract_alias(original_raw, symbol_name);
+#[derive(Debug, Default)]
+struct MovedImportBindings {
+    named: Vec<String>,
+    default_import: Option<String>,
+    namespace_import: Option<String>,
+}
 
-    let names = if let Some(alias_name) = &alias {
-        vec![format!("{} as {}", symbol_name, alias_name)]
+impl MovedImportBindings {
+    fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.default_import.is_none() && self.namespace_import.is_none()
+    }
+}
+
+fn moved_bindings_for_import(
+    imp: &imports::ImportStatement,
+    symbol_name: &str,
+    moved_symbol_is_default: bool,
+) -> MovedImportBindings {
+    let named = if moved_symbol_is_default {
+        Vec::new()
+    } else {
+        imp.names
+            .iter()
+            .filter(|n| imports::specifier_matches(n, symbol_name))
+            .cloned()
+            .collect()
+    };
+
+    let default_import = if moved_symbol_is_default {
+        imp.default_import.clone()
+    } else {
+        None
+    };
+
+    MovedImportBindings {
+        named,
+        default_import,
+        namespace_import: None,
+    }
+}
+
+fn generate_import_for_bindings(
+    lang: LangId,
+    module_path: &str,
+    bindings: &MovedImportBindings,
+    type_only: bool,
+) -> String {
+    imports::generate_import_line_with_namespace(
+        lang,
+        module_path,
+        &bindings.named,
+        bindings.default_import.as_deref(),
+        bindings.namespace_import.as_deref(),
+        type_only,
+    )
+}
+
+fn parse_imports_from_content(
+    content: &str,
+    lang: LangId,
+) -> Option<(tree_sitter::Tree, imports::ImportBlock)> {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content.as_bytes(), None)?;
+    let block = imports::parse_imports(content, &tree, lang);
+    Some((tree, block))
+}
+
+fn build_add_moved_import_edit(
+    content: &str,
+    block: &imports::ImportBlock,
+    consumer_file: &Path,
+    dest_file: &Path,
+    symbol_name: &str,
+    lang: LangId,
+    moved_symbol_is_default: bool,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+    let names = if moved_symbol_is_default {
+        Vec::new()
     } else {
         vec![symbol_name.to_string()]
     };
+    let default_import = moved_symbol_is_default.then_some(symbol_name);
 
-    let type_prefix = if type_only { "type " } else { "" };
-    let names_str = names.join(", ");
-    format!(
-        "import {}{{ {} }} from '{}';",
-        type_prefix, names_str, new_module_path
-    )
+    if imports::is_duplicate(block, &new_import_path, &names, default_import, false) {
+        return None;
+    }
+
+    let group = imports::classify_group(lang, &new_import_path);
+    let (insert_offset, needs_blank_before, needs_blank_after) =
+        imports::find_insertion_point(content, block, group, &new_import_path, false);
+    let import_line =
+        imports::generate_import_line(lang, &new_import_path, &names, default_import, false);
+
+    let mut insert_text = String::new();
+    if needs_blank_before {
+        insert_text.push('\n');
+    }
+    insert_text.push_str(&import_line);
+    insert_text.push('\n');
+    if needs_blank_after {
+        insert_text.push('\n');
+    }
+
+    Some((insert_offset..insert_offset, insert_text))
+}
+
+fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str) -> bool {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(content.as_bytes(), None) else {
+        return false;
+    };
+    node_references_identifier(&tree.root_node(), content, symbol_name)
+}
+
+fn node_references_identifier(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    if matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "jsx_identifier"
+    ) && node_text_matches(content, node, symbol_name)
+    {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if node_references_identifier(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn node_text_matches(content: &str, node: &tree_sitter::Node, expected: &str) -> bool {
+    content
+        .get(node.byte_range())
+        .is_some_and(|text| text == expected)
 }
 
 /// Extract an alias for a symbol from an import statement's raw text.
 ///
 /// Looks for `symbol_name as alias` pattern in the import text.
+#[cfg(test)]
 fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
     // Look for `symbolName as aliasName` pattern
     let pattern = format!("{} as ", symbol_name);
