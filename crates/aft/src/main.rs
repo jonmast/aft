@@ -559,7 +559,9 @@ fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()
 }
 
 /// Source file extensions that the call graph supports.
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "rs", "go"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "pyi", "rs", "go",
+];
 
 /// Drain pending file watcher events and invalidate changed source files
 /// in the call graph.

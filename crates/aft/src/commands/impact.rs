@@ -92,28 +92,14 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // Build file data first to check if the symbol exists
-    match graph.build_file(&file_path) {
-        Ok(data) => {
-            let has_symbol = data.calls_by_symbol.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string())
-                || data.symbol_metadata.contains_key(symbol);
-            if !has_symbol {
-                return Response::error(
-                    &req.id,
-                    "symbol_not_found",
-                    format!("impact: symbol '{}' not found in {}", symbol, file),
-                );
-            }
-        }
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    }
+    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
+        Ok(symbol) => symbol,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
 
     let max_files = ctx.config().max_callgraph_files;
 
-    match graph.impact(&file_path, symbol, depth, max_files) {
+    match graph.impact(&file_path, &symbol, depth, max_files) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)

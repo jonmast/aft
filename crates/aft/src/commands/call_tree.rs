@@ -64,26 +64,35 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(resp) => return resp,
     };
 
-    // Build file data first to check if the symbol exists
-    match graph.build_file(&file_path) {
-        Ok(data) => {
-            // Check if the symbol exists in the file, even when it is a private leaf.
-            let has_symbol = data.symbol_metadata.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string());
-            if !has_symbol {
-                return Response::error(
-                    &req.id,
-                    "symbol_not_found",
-                    format!("call_tree: symbol '{}' not found in {}", symbol, file),
-                );
-            }
-        }
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
+    let project_root = ctx.config().project_root.clone();
+    if let Some(project_root) = project_root {
+        let canonical_root = std::fs::canonicalize(&project_root).unwrap_or(project_root.clone());
+        let input_for_resolution = if file_path.is_relative() {
+            project_root.join(&file_path)
+        } else {
+            file_path.clone()
+        };
+        let canonical_input =
+            std::fs::canonicalize(&input_for_resolution).unwrap_or(input_for_resolution);
+        if !canonical_input.starts_with(&canonical_root) {
+            return Response::error(
+                &req.id,
+                "path_outside_project_root",
+                format!(
+                    "Callgraph operations require paths inside project_root. Got: {} (project_root: {})",
+                    file_path.display(),
+                    project_root.display(),
+                ),
+            );
         }
     }
 
-    match graph.forward_tree(&file_path, symbol, depth) {
+    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
+        Ok(symbol) => symbol,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
+
+    match graph.forward_tree(&file_path, &symbol, depth) {
         Ok(tree) => {
             let tree_json = serde_json::to_value(&tree).unwrap_or_default();
             Response::success(&req.id, tree_json)

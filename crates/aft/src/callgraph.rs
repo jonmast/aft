@@ -21,7 +21,7 @@ use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
-use crate::symbols::{Range, SymbolKind};
+use crate::symbols::{Range, Symbol, SymbolKind};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -36,6 +36,83 @@ static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
+const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+const JS_TS_INDEX_FILES: &[&str] = &[
+    "index.ts",
+    "index.tsx",
+    "index.mts",
+    "index.cts",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+];
+
+fn symbol_identity(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        symbol.name.clone()
+    } else {
+        format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
+    }
+}
+
+fn symbol_unqualified_name(symbol: &str) -> &str {
+    symbol.rsplit("::").next().unwrap_or(symbol)
+}
+
+fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
+    full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
+}
+
+fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let qualified_query = symbol_name.contains("::");
+
+    let mut consider = |candidate: &str| {
+        let matches = if qualified_query {
+            candidate == symbol_name
+        } else {
+            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
+        };
+
+        if matches && seen.insert(candidate.to_string()) {
+            candidates.push(candidate.to_string());
+        }
+    };
+
+    for candidate in file_data.symbol_metadata.keys() {
+        consider(candidate);
+    }
+    for candidate in file_data.calls_by_symbol.keys() {
+        consider(candidate);
+    }
+    for candidate in &file_data.exported_symbols {
+        consider(candidate);
+    }
+
+    candidates.sort();
+    candidates
+}
+
+fn resolve_symbol_query_in_data(
+    file_data: &FileCallData,
+    file: &Path,
+    symbol_name: &str,
+) -> Result<String, AftError> {
+    let candidates = symbol_query_candidates(file_data, symbol_name);
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(AftError::SymbolNotFound {
+            name: symbol_name.to_string(),
+            file: file.display().to_string(),
+        }),
+        _ => Err(AftError::AmbiguousSymbol {
+            name: symbol_name.to_string(),
+            candidates,
+        }),
+    }
+}
 
 /// A single call site within a function body.
 #[derive(Debug, Clone)]
@@ -154,6 +231,10 @@ pub struct CallersResult {
     pub total_callers: usize,
     /// Number of files scanned to build the reverse index.
     pub scanned_files: usize,
+    /// Whether recursive caller expansion stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of caller edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 /// A node in the forward call tree.
@@ -172,6 +253,10 @@ pub struct CallTreeNode {
     pub resolved: bool,
     /// Child calls (recursive).
     pub children: Vec<CallTreeNode>,
+    /// Whether traversal below this node stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of child call edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +414,10 @@ pub struct ImpactResult {
     pub affected_files: usize,
     /// Enriched caller details.
     pub callers: Vec<ImpactCaller>,
+    /// Whether transitive impact expansion stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of caller edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -572,10 +661,17 @@ impl CallGraph {
                         if let Some(resolved_path) =
                             resolve_module_path(caller_dir, &imp.module_path)
                         {
-                            return EdgeResolution::Resolved {
-                                file: resolved_path,
-                                symbol: member.to_owned(),
-                            };
+                            if let Some(target) = resolve_reexported_symbol(
+                                &resolved_path,
+                                member,
+                                &mut file_exports_symbol,
+                                &mut file_default_export_symbol,
+                            ) {
+                                return EdgeResolution::Resolved {
+                                    file: target.file,
+                                    symbol: target.symbol,
+                                };
+                            }
                         }
                     }
                 }
@@ -690,6 +786,14 @@ impl CallGraph {
         Ok(&self.data[&canon])
     }
 
+    /// Resolve a user-provided symbol query to the unique scoped symbol identity
+    /// used internally by the call graph.
+    pub fn resolve_symbol_query(&mut self, file: &Path, symbol: &str) -> Result<String, AftError> {
+        let canon = self.canonicalize(file)?;
+        let file_data = self.build_file(&canon)?;
+        resolve_symbol_query_in_data(file_data, &canon, symbol)
+    }
+
     /// Resolve a cross-file call edge.
     ///
     /// Given a callee expression and the calling file's import block,
@@ -747,8 +851,13 @@ impl CallGraph {
         symbol: &str,
         max_depth: usize,
     ) -> Result<CallTreeNode, AftError> {
+        let canon = self.canonicalize(file)?;
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
         let mut visited = HashSet::new();
-        self.forward_tree_inner(file, symbol, max_depth, 0, &mut visited)
+        self.forward_tree_inner(&canon, &resolved_symbol, max_depth, 0, &mut visited)
     }
 
     fn forward_tree_inner(
@@ -775,6 +884,8 @@ impl CallGraph {
                 signature,
                 resolved: true,
                 children: vec![], // cycle — stop recursion
+                depth_limited: false,
+                truncated: 0,
             });
         }
 
@@ -798,6 +909,8 @@ impl CallGraph {
 
         // Build children
         let mut children = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
 
         if current_depth < max_depth {
             for call_site in &call_sites {
@@ -820,7 +933,11 @@ impl CallGraph {
                             current_depth + 1,
                             visited,
                         ) {
-                            Ok(child) => children.push(child),
+                            Ok(child) => {
+                                depth_limited |= child.depth_limited;
+                                truncated += child.truncated;
+                                children.push(child);
+                            }
                             Err(_) => {
                                 // Target file can't be parsed — mark as unresolved leaf
                                 children.push(CallTreeNode {
@@ -830,6 +947,8 @@ impl CallGraph {
                                     signature: None,
                                     resolved: false,
                                     children: vec![],
+                                    depth_limited: false,
+                                    truncated: 0,
                                 });
                             }
                         }
@@ -844,6 +963,8 @@ impl CallGraph {
                             current_depth,
                             visited,
                         )? {
+                            depth_limited |= local_child.depth_limited;
+                            truncated += local_child.truncated;
                             children.push(local_child);
                             continue;
                         }
@@ -854,10 +975,15 @@ impl CallGraph {
                             signature: None,
                             resolved: false,
                             children: vec![],
+                            depth_limited: false,
+                            truncated: 0,
                         });
                     }
                 }
             }
+        } else if !call_sites.is_empty() {
+            depth_limited = true;
+            truncated = call_sites.len();
         }
 
         visited.remove(&visit_key);
@@ -869,6 +995,8 @@ impl CallGraph {
             signature: sym_signature,
             resolved: true,
             children,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -882,26 +1010,34 @@ impl CallGraph {
         current_depth: usize,
         visited: &mut HashSet<(PathBuf, String)>,
     ) -> Result<Option<CallTreeNode>, AftError> {
-        let has_local_symbol = self
-            .lookup_file_data(canon)
-            .map(|data| data.symbol_metadata.contains_key(callee_name))
-            .unwrap_or(false);
-        if !has_local_symbol {
-            return Ok(None);
-        }
-        if callee_name == current_symbol {
+        if !is_bare_callee(&call_site.full_callee, callee_name) {
             return Ok(None);
         }
 
-        match self.forward_tree_inner(canon, callee_name, max_depth, current_depth + 1, visited) {
+        let target_symbol = match self
+            .lookup_file_data(canon)
+            .and_then(|data| resolve_symbol_query_in_data(data, canon, callee_name).ok())
+        {
+            Some(symbol) => symbol,
+            None => return Ok(None),
+        };
+
+        if target_symbol == current_symbol {
+            return Ok(None);
+        }
+
+        match self.forward_tree_inner(canon, &target_symbol, max_depth, current_depth + 1, visited)
+        {
             Ok(child) => Ok(Some(child)),
             Err(_) => Ok(Some(CallTreeNode {
-                name: callee_name.to_string(),
+                name: target_symbol,
                 file: self.relative_path(canon),
                 line: call_site.line,
                 signature: None,
                 resolved: false,
                 children: vec![],
+                depth_limited: false,
+                truncated: 0,
             })),
         }
     }
@@ -1015,7 +1151,19 @@ impl CallGraph {
                     let (target_file, target_symbol, resolved) = match edge {
                         EdgeResolution::Resolved { file, symbol } => (file, symbol, true),
                         EdgeResolution::Unresolved { callee_name } => {
-                            (canon_caller.as_ref().clone(), callee_name, false)
+                            if !is_bare_callee(&call_site.full_callee, &callee_name) {
+                                continue;
+                            }
+
+                            let Ok(target_symbol) = resolve_symbol_query_in_data(
+                                file_data,
+                                canon_caller.as_ref(),
+                                &callee_name,
+                            ) else {
+                                continue;
+                            };
+
+                            (canon_caller.as_ref().clone(), target_symbol, false)
                         }
                     };
 
@@ -1065,8 +1213,11 @@ impl CallGraph {
     ) -> Result<CallersResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built (may already be cached)
-        self.build_file(&canon)?;
+        // Ensure file is built (may already be cached) and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -1078,13 +1229,17 @@ impl CallGraph {
 
         let mut visited = HashSet::new();
         let mut all_sites: Vec<CallerSite> = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
         self.collect_callers_recursive(
             &canon,
-            symbol,
+            &resolved_symbol,
             effective_depth,
             0,
             &mut visited,
             &mut all_sites,
+            &mut depth_limited,
+            &mut truncated,
         );
 
         // Group by file
@@ -1119,11 +1274,13 @@ impl CallGraph {
         callers.sort_by(|a, b| a.file.cmp(&b.file));
 
         Ok(CallersResult {
-            symbol: symbol.to_string(),
+            symbol: resolved_symbol,
             file: self.relative_path(&canon),
             callers,
             total_callers,
             scanned_files,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -1141,8 +1298,11 @@ impl CallGraph {
     ) -> Result<TraceToResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built
-        self.build_file(&canon)?;
+        // Ensure file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -1163,15 +1323,20 @@ impl CallGraph {
         // Get line/signature for the target symbol
         let (target_line, target_sig) = self
             .lookup_file_data(&canon)
-            .map(|data| get_symbol_meta_from_data(data, symbol))
-            .unwrap_or_else(|| get_symbol_meta(&canon, symbol));
+            .map(|data| get_symbol_meta_from_data(data, &resolved_symbol))
+            .unwrap_or_else(|| get_symbol_meta(&canon, &resolved_symbol));
 
         // Check if target itself is an entry point
         let target_is_entry = self
             .lookup_file_data(&canon)
             .and_then(|fd| {
-                let meta = fd.symbol_metadata.get(symbol)?;
-                Some(is_entry_point(symbol, &meta.kind, meta.exported, fd.lang))
+                let meta = fd.symbol_metadata.get(&resolved_symbol)?;
+                Some(is_entry_point(
+                    &resolved_symbol,
+                    &meta.kind,
+                    meta.exported,
+                    fd.lang,
+                ))
             })
             .unwrap_or(false);
 
@@ -1185,7 +1350,7 @@ impl CallGraph {
         // Initial path starts at the target
         let initial: Vec<PathElem> = vec![(
             Arc::new(canon.clone()),
-            Arc::from(symbol),
+            Arc::from(resolved_symbol.as_str()),
             target_line,
             target_sig,
         )];
@@ -1327,21 +1492,21 @@ impl CallGraph {
             a_entry.cmp(b_entry).then(a.hops.len().cmp(&b.hops.len()))
         });
 
-        // Count distinct entry points
-        let mut entry_point_names: HashSet<String> = HashSet::new();
+        // Count distinct entry points by identity, not just display name.
+        let mut entry_points: HashSet<(String, String)> = HashSet::new();
         for p in &paths {
             if let Some(first) = p.hops.first() {
                 if first.is_entry_point {
-                    entry_point_names.insert(first.symbol.clone());
+                    entry_points.insert((first.file.clone(), first.symbol.clone()));
                 }
             }
         }
 
         let total_paths = paths.len();
-        let entry_points_found = entry_point_names.len();
+        let entry_points_found = entry_points.len();
 
         Ok(TraceToResult {
-            target_symbol: symbol.to_string(),
+            target_symbol: resolved_symbol,
             target_file: target_rel,
             paths,
             total_paths,
@@ -1365,8 +1530,11 @@ impl CallGraph {
     ) -> Result<ImpactResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built
-        self.build_file(&canon)?;
+        // Ensure file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -1385,7 +1553,7 @@ impl CallGraph {
                     })
                 }
             };
-            let meta = file_data.symbol_metadata.get(symbol);
+            let meta = file_data.symbol_metadata.get(&resolved_symbol);
             let sig = meta.and_then(|m| m.signature.clone());
             let lang = file_data.lang;
             let params = sig
@@ -1398,13 +1566,17 @@ impl CallGraph {
         // Collect all caller sites (transitive)
         let mut visited = HashSet::new();
         let mut all_sites: Vec<CallerSite> = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
         self.collect_callers_recursive(
             &canon,
-            symbol,
+            &resolved_symbol,
             effective_depth,
             0,
             &mut visited,
             &mut all_sites,
+            &mut depth_limited,
+            &mut truncated,
         );
 
         // Deduplicate sites by (file, symbol, line)
@@ -1473,13 +1645,15 @@ impl CallGraph {
         let affected_files = affected_file_set.len();
 
         Ok(ImpactResult {
-            symbol: symbol.to_string(),
+            symbol: resolved_symbol,
             file: self.relative_path(&canon),
             signature: target_signature,
             parameters: target_parameters,
             total_affected,
             affected_files,
             callers,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -1504,32 +1678,11 @@ impl CallGraph {
         let canon = self.canonicalize(file)?;
         let rel_file = self.relative_path(&canon);
 
-        // Ensure file data is built
-        self.build_file(&canon)?;
-
-        // Verify symbol exists
-        {
-            let fd = match self.data.get(&canon) {
-                Some(d) => d,
-                None => {
-                    return Err(AftError::InvalidRequest {
-                        message: "file data missing after build".to_string(),
-                    })
-                }
-            };
-            let has_symbol = fd.calls_by_symbol.contains_key(symbol)
-                || fd.exported_symbols.iter().any(|name| name == symbol)
-                || fd.symbol_metadata.contains_key(symbol);
-            if !has_symbol {
-                return Err(AftError::InvalidRequest {
-                    message: format!(
-                        "trace_data: symbol '{}' not found in {}",
-                        symbol,
-                        file.display()
-                    ),
-                });
-            }
-        }
+        // Ensure file data is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Bounded count: short-circuits at `max_files + 1` so oversized roots
         // reject in microseconds instead of paying the full walk/collect cost.
@@ -1547,7 +1700,7 @@ impl CallGraph {
 
         self.trace_data_inner(
             &canon,
-            symbol,
+            &resolved_symbol,
             expression,
             max_depth,
             0,
@@ -1559,7 +1712,7 @@ impl CallGraph {
         Ok(TraceDataResult {
             expression: expression.to_string(),
             origin_file: rel_file,
-            origin_symbol: symbol.to_string(),
+            origin_symbol: resolved_symbol,
             hops,
             depth_limited,
         })
@@ -1613,7 +1766,10 @@ impl CallGraph {
             Ok(symbols) => symbols,
             Err(_) => return,
         };
-        let sym_info = match symbols.iter().find(|s| s.name == symbol) {
+        let sym_info = match symbols
+            .iter()
+            .find(|s| symbol_identity(s) == symbol || s.name == symbol)
+        {
             Some(s) => s,
             None => return,
         };
@@ -2006,23 +2162,21 @@ impl CallGraph {
                 }
             }
             EdgeResolution::Unresolved { callee_name } => {
-                // Check if it's a same-file call
-                let has_local = self
-                    .data
-                    .get(file)
-                    .map(|fd| {
-                        fd.calls_by_symbol.contains_key(&callee_name)
-                            || fd.symbol_metadata.contains_key(&callee_name)
-                    })
-                    .unwrap_or(false);
+                let local_symbol = if is_bare_callee(&full_callee, &callee_name) {
+                    self.data
+                        .get(file)
+                        .and_then(|fd| resolve_symbol_query_in_data(fd, file, &callee_name).ok())
+                } else {
+                    None
+                };
 
-                if has_local {
-                    // Same-file call — get param info
+                if let Some(local_symbol) = local_symbol {
+                    // Same-file bare call — get param info
                     let (params, target_line) = {
                         let Some(fd) = self.data.get(file) else {
                             return;
                         };
-                        let meta = fd.symbol_metadata.get(&callee_name);
+                        let meta = fd.symbol_metadata.get(&local_symbol);
                         let sig = meta.and_then(|m| m.signature.clone());
                         let params = sig
                             .as_deref()
@@ -2038,7 +2192,7 @@ impl CallGraph {
                         if let Some(param_name) = params.get(*pos) {
                             hops.push(DataFlowHop {
                                 file: file_rel.clone(),
-                                symbol: callee_name.clone(),
+                                symbol: local_symbol.clone(),
                                 variable: param_name.clone(),
                                 line: target_line,
                                 flow_type: "parameter".to_string(),
@@ -2048,7 +2202,7 @@ impl CallGraph {
                             // Recurse into same-file function
                             self.trace_data_inner(
                                 file,
-                                &callee_name.clone(),
+                                &local_symbol,
                                 param_name,
                                 max_depth,
                                 current_depth + 1,
@@ -2093,14 +2247,25 @@ impl CallGraph {
         current_depth: usize,
         visited: &mut HashSet<(PathBuf, SharedStr)>,
         result: &mut Vec<CallerSite>,
+        depth_limited: &mut bool,
+        truncated: &mut usize,
     ) {
-        if current_depth >= max_depth {
-            return;
-        }
-
         // Canonicalize for consistent reverse index lookup
         let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
         let key_symbol: SharedStr = Arc::from(symbol);
+
+        if current_depth >= max_depth {
+            let omitted = self
+                .reverse_sites(&canon, key_symbol.as_ref())
+                .map(|sites| sites.len())
+                .unwrap_or(0);
+            if omitted > 0 {
+                *depth_limited = true;
+                *truncated += omitted;
+            }
+            return;
+        }
+
         if !visited.insert((canon.clone(), Arc::clone(&key_symbol))) {
             return; // cycle detection
         }
@@ -2123,7 +2288,18 @@ impl CallGraph {
                         current_depth + 1,
                         visited,
                         result,
+                        depth_limited,
+                        truncated,
                     );
+                } else {
+                    let omitted = self
+                        .reverse_sites(site.caller_file.as_ref(), site.caller_symbol.as_ref())
+                        .map(|sites| sites.len())
+                        .unwrap_or(0);
+                    if omitted > 0 {
+                        *depth_limited = true;
+                        *truncated += omitted;
+                    }
                 }
             }
         }
@@ -2246,7 +2422,7 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
             .collect();
 
         if !sites.is_empty() {
-            calls_by_symbol.insert(sym.name.clone(), sites);
+            calls_by_symbol.insert(symbol_identity(sym), sites);
         }
     }
 
@@ -2325,7 +2501,7 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
         .iter()
         .map(|s| {
             (
-                s.name.clone(),
+                symbol_identity(s),
                 SymbolMeta {
                     kind: s.kind.clone(),
                     exported: s.exported,
@@ -2528,7 +2704,7 @@ fn get_symbol_meta(path: &Path, symbol_name: &str) -> (u32, Option<String>) {
     match provider.list_symbols(path) {
         Ok(symbols) => {
             for s in &symbols {
-                if s.name == symbol_name {
+                if symbol_identity(s) == symbol_name || s.name == symbol_name {
                     return (s.range.start_line + 1, s.signature.clone());
                 }
             }
@@ -2731,10 +2907,9 @@ fn resolve_file_like_path(base: &Path) -> Option<PathBuf> {
         return Some(std::fs::canonicalize(&base).unwrap_or(base));
     }
 
-    // Try common extensions
-    let extensions = [".ts", ".tsx", ".js", ".jsx"];
-    for ext in &extensions {
-        let with_ext = base.with_extension(ext.trim_start_matches('.'));
+    // Try common extensions, including ESM/CJS TypeScript pairs used by workspaces.
+    for ext in JS_TS_EXTENSIONS {
+        let with_ext = base.with_extension(ext);
         if with_ext.is_file() {
             return Some(std::fs::canonicalize(&with_ext).unwrap_or(with_ext));
         }
@@ -3384,8 +3559,7 @@ fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<Strin
 
 /// Find an index file in a directory.
 fn find_index_file(dir: &Path) -> Option<PathBuf> {
-    let candidates = ["index.ts", "index.tsx", "index.js", "index.jsx"];
-    for name in &candidates {
+    for name in JS_TS_INDEX_FILES {
         let p = dir.join(name);
         if p.is_file() {
             return Some(std::fs::canonicalize(&p).unwrap_or(p));
@@ -3791,6 +3965,11 @@ export function funcB() {
             .unwrap();
 
         assert_eq!(tree.name, "main");
+        assert!(tree.depth_limited, "depth limit should be reported");
+        assert!(
+            tree.truncated > 0,
+            "truncated edge count should be reported"
+        );
 
         // At depth 1, children should exist (direct calls) but their children should be empty
         for child in &tree.children {
@@ -3926,6 +4105,19 @@ export function funcB() {
         let dir = TempDir::new().unwrap();
 
         fs::write(dir.path().join("main.ts"), "export function main() {}").unwrap();
+        fs::write(dir.path().join("module.mts"), "export function esm() {}").unwrap();
+        fs::write(dir.path().join("common.cts"), "export function cjs() {}").unwrap();
+        fs::write(
+            dir.path().join("runtime.mjs"),
+            "export function runtime() {}",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("legacy.cjs"),
+            "exports.legacy = function() {};",
+        )
+        .unwrap();
+        fs::write(dir.path().join("types.pyi"), "def typed() -> None: ...").unwrap();
         fs::write(dir.path().join("readme.md"), "# Hello").unwrap();
         fs::write(dir.path().join("data.json"), "{}").unwrap();
 
@@ -3936,6 +4128,19 @@ export function funcB() {
             .collect();
 
         assert!(file_names.contains(&"main.ts".to_string()));
+        for modern_ext_file in [
+            "module.mts",
+            "common.cts",
+            "runtime.mjs",
+            "legacy.cjs",
+            "types.pyi",
+        ] {
+            assert!(
+                file_names.contains(&modern_ext_file.to_string()),
+                "walker should include {modern_ext_file}, got: {:?}",
+                file_names
+            );
+        }
         assert!(
             file_names.contains(&"readme.md".to_string()),
             "Markdown is now a supported source language"
@@ -4461,6 +4666,250 @@ function testValidation() {
         assert!(
             trivial.is_some(),
             "should have a trivial path with just the entry point itself"
+        );
+    }
+
+    #[test]
+    fn namespace_import_follows_barrel_reexport_and_rejects_private_member() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            r#"import * as lib from './index';
+
+export function main() {
+    lib.helper();
+    lib.hidden();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "export { helper } from './utils';\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("utils.ts"),
+            r#"export function helper() {}
+function hidden() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let main_path = dir.path().join("main.ts");
+        let import_block = graph.build_file(&main_path).unwrap().import_block.clone();
+
+        let helper =
+            graph.resolve_cross_file_edge("lib.helper", "helper", &main_path, &import_block);
+        match helper {
+            EdgeResolution::Resolved { file, symbol } => {
+                assert!(
+                    file.ends_with("utils.ts"),
+                    "helper should resolve through barrel: {file:?}"
+                );
+                assert_eq!(symbol, "helper");
+            }
+            other => panic!("expected helper to resolve through barrel, got {other:?}"),
+        }
+
+        let hidden =
+            graph.resolve_cross_file_edge("lib.hidden", "hidden", &main_path, &import_block);
+        assert_eq!(
+            hidden,
+            EdgeResolution::Unresolved {
+                callee_name: "hidden".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_package_resolution_prefers_modern_ts_source_extensions() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let package_dir = dir.path().join("packages/lib");
+        fs::create_dir_all(package_dir.join("src")).unwrap();
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"@scope/lib","exports":{".":"./dist/index.mjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            package_dir.join("src/index.mts"),
+            "export function helper() {}\n",
+        )
+        .unwrap();
+        fs::write(package_dir.join("dist/index.mjs"), "export{};\n").unwrap();
+
+        let resolved = resolve_module_path(dir.path(), "@scope/lib").unwrap();
+        assert!(
+            resolved.ends_with("src/index.mts"),
+            "dist/index.mjs should map to src/index.mts, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_member_calls_do_not_become_same_file_callers() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            r#"function caller() {
+    db.connect();
+}
+
+function connect() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let result = graph
+            .callers_of(&dir.path().join("main.ts"), "connect", 1, usize::MAX)
+            .unwrap();
+
+        assert_eq!(
+            result.total_callers, 0,
+            "db.connect() must not call local connect"
+        );
+    }
+
+    #[test]
+    fn same_named_methods_use_scoped_symbol_identity() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("classes.ts"),
+            r#"class A {
+    run() { helperA(); }
+}
+
+class B {
+    run() { helperB(); }
+}
+
+function helperA() {}
+function helperB() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let path = dir.path().join("classes.ts");
+        let data = graph.build_file(&path).unwrap();
+
+        assert!(
+            data.symbol_metadata.contains_key("A::run"),
+            "A::run metadata missing"
+        );
+        assert!(
+            data.symbol_metadata.contains_key("B::run"),
+            "B::run metadata missing"
+        );
+        assert!(
+            data.calls_by_symbol["A::run"]
+                .iter()
+                .any(|call| call.callee_name == "helperA"),
+            "A::run calls should not be overwritten"
+        );
+        assert!(
+            data.calls_by_symbol["B::run"]
+                .iter()
+                .any(|call| call.callee_name == "helperB"),
+            "B::run calls should not be overwritten"
+        );
+
+        assert!(matches!(
+            graph.resolve_symbol_query(&path, "run"),
+            Err(AftError::AmbiguousSymbol { .. })
+        ));
+        assert_eq!(
+            graph.resolve_symbol_query(&path, "A::run").unwrap(),
+            "A::run"
+        );
+    }
+
+    #[test]
+    fn trace_to_counts_same_named_entry_points_by_file_and_symbol() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("web")).unwrap();
+        fs::create_dir_all(dir.path().join("cli")).unwrap();
+        fs::write(
+            dir.path().join("target.ts"),
+            r#"export function target() {
+    leaf();
+}
+
+function leaf() {}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("web/main.ts"),
+            r#"import { target } from '../target';
+
+export function main() {
+    target();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("cli/main.ts"),
+            r#"import { target } from '../target';
+
+export function main() {
+    target();
+}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let result = graph
+            .trace_to(&dir.path().join("target.ts"), "leaf", 10, usize::MAX)
+            .unwrap();
+
+        assert_eq!(
+            result.total_paths, 3,
+            "target plus two main entry paths expected"
+        );
+        assert_eq!(
+            result.entry_points_found, 3,
+            "same-named main entry points in different files must both count"
+        );
+    }
+
+    #[test]
+    fn callers_and_impact_report_depth_truncation() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        let callers = graph
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
+            .unwrap();
+        assert!(
+            callers.depth_limited,
+            "callers should report omitted transitive callers"
+        );
+        assert!(
+            callers.truncated > 0,
+            "callers should report truncated edge count"
+        );
+
+        let impact = graph
+            .impact(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
+            .unwrap();
+        assert!(
+            impact.depth_limited,
+            "impact should report omitted transitive callers"
+        );
+        assert!(
+            impact.truncated > 0,
+            "impact should report truncated edge count"
         );
     }
 

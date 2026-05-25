@@ -29,6 +29,8 @@ describe("navigate renderer", () => {
           name: "run",
           file: "/repo/src/a.ts",
           line: 1,
+          depth_limited: true,
+          truncated: 2,
           children: [{ name: "helper", file: "/repo/src/a.ts", line: 4, children: [] }],
         }),
         { op: "call_tree", filePath: "src/a.ts", symbol: "run" },
@@ -40,6 +42,8 @@ describe("navigate renderer", () => {
       renderNavigateResult(
         makeResult("", {
           total_callers: 1,
+          depth_limited: true,
+          truncated: 3,
           callers: [{ file: "/repo/src/a.ts", callers: [{ symbol: "caller", line: 9 }] }],
         }),
         { op: "callers", filePath: "src/a.ts", symbol: "helper" },
@@ -52,6 +56,8 @@ describe("navigate renderer", () => {
         makeResult("", {
           total_paths: 1,
           entry_points_found: 1,
+          max_depth_reached: true,
+          truncated_paths: 4,
           paths: [
             {
               hops: [
@@ -71,6 +77,8 @@ describe("navigate renderer", () => {
         makeResult("", {
           total_affected: 1,
           affected_files: 1,
+          depth_limited: true,
+          truncated: 5,
           callers: [
             {
               caller_symbol: "main",
@@ -109,9 +117,13 @@ describe("navigate renderer", () => {
     );
 
     expect(callTree).toContain("helper");
+    expect(callTree).toContain("2 truncated");
     expect(callers).toContain("caller");
+    expect(callers).toContain("3 truncated");
     expect(traceTo).toContain("Path 1");
+    expect(traceTo).toContain("4 truncated");
     expect(impact).toContain("affected call site");
+    expect(impact).toContain("5 truncated");
     expect(traceData).toContain("depth limited");
   });
 

@@ -53,6 +53,19 @@ function renderCallTreeNode(node: Record<string, unknown>, depth: number, lines:
   });
 }
 
+function depthWarning(
+  response: Record<string, unknown>,
+  theme: Theme,
+  depthField = "depth_limited",
+  truncatedField = "truncated",
+): string {
+  const limited = asBoolean(response[depthField]);
+  const truncated = asNumber(response[truncatedField]) ?? 0;
+  if (!limited && truncated === 0) return "";
+  const detail = truncated > 0 ? `, ${truncated} truncated` : "";
+  return theme.fg("warning", `(depth limited${detail})`);
+}
+
 function renderTracePath(path: Record<string, unknown>, index: number, lines: string[]): void {
   lines.push(`Path ${index + 1}`);
   asRecords(path.hops).forEach((hop, hopIndex) => {
@@ -81,13 +94,16 @@ export function buildNavigateSections(
   if (args.op === "call_tree") {
     const lines: string[] = [];
     renderCallTreeNode(response, 0, lines);
+    const warning = depthWarning(response, theme);
+    if (warning) lines.push(warning);
     return lines.length > 0 ? lines : [theme.fg("muted", "No call tree available.")];
   }
 
   if (args.op === "callers") {
     const groups = asRecords(response.callers);
+    const warning = depthWarning(response, theme);
     const sections = [
-      `${theme.fg("success", `${asNumber(response.total_callers) ?? 0} caller${(asNumber(response.total_callers) ?? 0) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${groups.length} file group${groups.length === 1 ? "" : "s"}`)}`,
+      `${theme.fg("success", `${asNumber(response.total_callers) ?? 0} caller${(asNumber(response.total_callers) ?? 0) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${groups.length} file group${groups.length === 1 ? "" : "s"}`)} ${warning}`.trim(),
     ];
     groups.forEach((group) => {
       const file = shortenPath(asString(group.file) ?? "(unknown file)");
@@ -104,8 +120,9 @@ export function buildNavigateSections(
 
   if (args.op === "trace_to") {
     const paths = asRecords(response.paths);
+    const warning = depthWarning(response, theme, "max_depth_reached", "truncated_paths");
     const sections = [
-      `${theme.fg("success", `${asNumber(response.total_paths) ?? paths.length} path${(asNumber(response.total_paths) ?? paths.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.entry_points_found) ?? 0} entry point${(asNumber(response.entry_points_found) ?? 0) === 1 ? "" : "s"}`)}`,
+      `${theme.fg("success", `${asNumber(response.total_paths) ?? paths.length} path${(asNumber(response.total_paths) ?? paths.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.entry_points_found) ?? 0} entry point${(asNumber(response.entry_points_found) ?? 0) === 1 ? "" : "s"}`)} ${warning}`.trim(),
     ];
     if (paths.length === 0) sections.push(theme.fg("muted", "No entry paths found."));
     paths.forEach((path, index) => {
@@ -118,8 +135,9 @@ export function buildNavigateSections(
 
   if (args.op === "impact") {
     const callers = asRecords(response.callers);
+    const warning = depthWarning(response, theme);
     const sections = [
-      `${theme.fg("warning", `${asNumber(response.total_affected) ?? callers.length} affected call site${(asNumber(response.total_affected) ?? callers.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.affected_files) ?? 0} file${(asNumber(response.affected_files) ?? 0) === 1 ? "" : "s"}`)}`,
+      `${theme.fg("warning", `${asNumber(response.total_affected) ?? callers.length} affected call site${(asNumber(response.total_affected) ?? callers.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.affected_files) ?? 0} file${(asNumber(response.affected_files) ?? 0) === 1 ? "" : "s"}`)} ${warning}`.trim(),
     ];
     if (callers.length === 0) sections.push(theme.fg("muted", "No impacted callers found."));
     callers.forEach((caller) => {

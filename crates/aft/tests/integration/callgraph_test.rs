@@ -199,6 +199,31 @@ fn callgraph_depth_limit_truncates() {
     aft.shutdown();
 }
 
+/// `call_tree` rejects files outside project_root even when generic path validation is relaxed.
+#[test]
+fn callgraph_call_tree_rejects_path_outside_project_root() {
+    let mut aft = AftProcess::spawn();
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::write(
+        outside.path().join("outside.ts"),
+        "export function main() {}\n",
+    )
+    .unwrap();
+
+    configure_project(&mut aft, root.path());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"call_tree","file":"{}","symbol":"main"}}"#,
+        outside.path().join("outside.ts").display()
+    ));
+
+    assert_eq!(resp["success"], false, "outside path should fail: {resp:?}");
+    assert_eq!(resp["code"], "path_outside_project_root");
+
+    aft.shutdown();
+}
+
 /// `call_tree` for an unknown symbol returns error.
 #[test]
 fn callgraph_unknown_symbol_error() {
