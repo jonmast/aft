@@ -359,7 +359,11 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
         )
         .unwrap();
     let _snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    // Watchdog wake-channel completion must be far faster than the periodic
+    // watchdog poll (5s). 500ms is too tight on loaded CI runners — bumped
+    // to 2500ms which still proves the wake channel fired rather than the
+    // periodic poll, while absorbing GitHub Linux runner load variance.
+    assert!(started.elapsed() < Duration::from_millis(2500));
 }
 
 #[test]
