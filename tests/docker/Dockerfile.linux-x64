@@ -89,13 +89,13 @@ RUN echo '{ \
 # Pre-install the AFT plugin + platform binary
 RUN mkdir -p /root/.cache/opencode/packages && \
     cd /root/.cache/opencode/packages && \
-    npm install @cortexkit/aft-opencode@latest @cortexkit/aft-linux-x64@latest 2>/dev/null || true
+    npm install @cortexkit/aft-opencode@latest @cortexkit/aft-linux-x64@latest
 
 # Inject locally-built AFT binary (overrides npm binary for testing local changes)
 # Build this binary first: docker build -t aft-build-linux -f tests/docker/Dockerfile.build-linux .
 # Then extract: docker cp $(docker create aft-build-linux true):/build/target/release/aft /tmp/aft-linux-x64
 COPY tests/docker/fixtures/aft-linux-x64 /tmp/aft-local-binary
-RUN AFT_VER=$(cat /root/.cache/opencode/packages/node_modules/@cortexkit/aft-opencode/package.json 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version": *"//;s/".*//' || echo "0.11.2") && \
+RUN AFT_VER=$(node -p "require('/root/.cache/opencode/packages/node_modules/@cortexkit/aft-opencode/package.json').version") && \
     mkdir -p /root/.cache/aft/bin/v${AFT_VER} && \
     cp /tmp/aft-local-binary /root/.cache/aft/bin/v${AFT_VER}/aft && \
     chmod +x /root/.cache/aft/bin/v${AFT_VER}/aft && \
@@ -105,9 +105,8 @@ RUN AFT_VER=$(cat /root/.cache/opencode/packages/node_modules/@cortexkit/aft-ope
 # This ensures TypeScript-side fixes (like onnx-runtime.ts) are tested too
 COPY packages/opencode-plugin/dist/ /tmp/aft-plugin-dist/
 RUN PLUGIN_DIR=$(find /root/.cache/opencode/packages -path '*/node_modules/@cortexkit/aft-opencode/dist' -type d 2>/dev/null | head -1) && \
-    if [ -n "$PLUGIN_DIR" ]; then \
-      cp -r /tmp/aft-plugin-dist/* "$PLUGIN_DIR/"; \
-    fi && \
+    test -n "$PLUGIN_DIR" && \
+    cp -r /tmp/aft-plugin-dist/* "$PLUGIN_DIR/" && \
     rm -rf /tmp/aft-plugin-dist
 
 # Set NODE_PATH so aimock global install is accessible via require()

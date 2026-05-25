@@ -92,6 +92,14 @@ function LogContains {
     return [bool] (Select-String -Path $Path -Pattern $Pattern -Quiet -ErrorAction SilentlyContinue)
 }
 
+function Get-AimockJournalRequestCount {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    $content = Get-Content $Path -Raw
+    if ($content -match "(\d+) requests") { return [int]$Matches[1] }
+    return $null
+}
+
 # Read the NDJSON reply with the requested id, skipping any unsolicited push
 # frames (configure_warnings, progress, status_changed, etc.) that arrive
 # before the real response. Throws after $TimeoutSec if no matching reply
@@ -847,6 +855,7 @@ Remove-Item $BashMarker -Force -ErrorAction SilentlyContinue
 # (no longer a meaningful concern after v0.20 — bash returns at ~5s now).
 # The session timeout stays at 240s for cold-bridge ONNX + index reload
 # headroom, but the actual bash call returns much faster.
+$S2JournalStartCount = Get-AimockJournalRequestCount $AimockJournal
 $Result2 = Join-Path $env:TEMP "result-scenario2.txt"
 $S2Start = Get-Date
 $ExitCode = Run-OpencodeSession `
@@ -950,10 +959,9 @@ Check "bg-promoted bash duration in expected range (55-70s)" {
     }
 }
 WarnCheck "aimock received >=2 requests for S2 (initial + tool result)" {
-    if (-not (Test-Path $AimockJournal)) { return $false }
-    $content = Get-Content $AimockJournal -Raw
-    if ($content -match "(\d+) requests") { return [int]$Matches[1] -ge 2 }
-    return $false
+    $after = Get-AimockJournalRequestCount $AimockJournal
+    if ($null -eq $S2JournalStartCount -or $null -eq $after) { return $false }
+    return ($after - $S2JournalStartCount) -ge 2
 }
 
 # ---------------------------------------------------------------------------

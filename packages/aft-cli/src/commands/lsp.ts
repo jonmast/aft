@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import type { AftRequest, sendAftRequest } from "../lib/aft-bridge.js";
@@ -60,6 +60,47 @@ export interface LspDiagnostic {
   source?: string | null;
 }
 
+const PROJECT_ROOT_MARKERS = [
+  ".git",
+  "package.json",
+  "Cargo.toml",
+  "pyproject.toml",
+  "requirements.txt",
+  "setup.py",
+  "go.mod",
+  "deno.json",
+  "bun.lock",
+  "bun.lockb",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "tsconfig.json",
+];
+
+export function findProjectRootForFile(
+  filePath: string,
+  fallbackCwd: string = process.cwd(),
+): string {
+  const resolvedFile = resolve(fallbackCwd, filePath);
+  let dir = dirname(resolvedFile);
+
+  try {
+    if (existsSync(resolvedFile) && statSync(resolvedFile).isDirectory()) {
+      dir = resolvedFile;
+    }
+  } catch {
+    dir = dirname(resolvedFile);
+  }
+
+  while (true) {
+    if (PROJECT_ROOT_MARKERS.some((marker) => existsSync(join(dir, marker)))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return resolve(fallbackCwd);
+    dir = parent;
+  }
+}
+
 export function printLspDoctorHelp(): void {
   console.log("Usage: aft doctor lsp <file> [--harness opencode|pi]");
   console.log("");
@@ -93,12 +134,13 @@ export async function runLspDoctor(options: LspDoctorOptions): Promise<number> {
     return 1;
   }
 
-  const projectRoot = resolve(process.cwd());
+  const resolvedFile = resolve(file);
+  const projectRoot = findProjectRootForFile(resolvedFile);
   const config: AftRequest = buildConfigureParams(adapter, projectRoot);
   const inspectRequest: AftRequest = {
     id: "doctor-lsp-inspect",
     command: "lsp_inspect",
-    file: resolve(file),
+    file: resolvedFile,
   };
   const responses = options.sendRequests
     ? await options.sendRequests(binary, [config, inspectRequest])

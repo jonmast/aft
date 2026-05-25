@@ -168,7 +168,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       };
     }
 
-    const plugins = Array.isArray(value.plugin) ? [...value.plugin] : [];
+    const plugins = Array.isArray(value.plugin) ? value.plugin : [];
     const already = plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
     if (already) {
       return {
@@ -180,8 +180,10 @@ export class OpenCodeAdapter implements HarnessAdapter {
     }
 
     plugins.push(PLUGIN_ENTRY);
-    const updated = { ...value, plugin: plugins };
-    writeJsoncFile(configPath, updated, paths.harnessConfigFormat);
+    // Mutate in place so comment-json keeps symbol-keyed comment metadata on
+    // the parsed object. Spreading into a fresh literal drops JSONC comments.
+    value.plugin = plugins;
+    writeJsoncFile(configPath, value, paths.harnessConfigFormat);
     return {
       ok: true,
       action: "added",

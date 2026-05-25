@@ -46,6 +46,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--out", default=None, help="Optional exact output path.")
     parser.add_argument("--ready-timeout", type=float, default=DEFAULT_READY_TIMEOUT_SECS)
     parser.add_argument("--relevance-mode", choices=("line-overlap", "file-only"), default="line-overlap")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Exit 0 even when one or more repos fail or are skipped. Default is strict failure.",
+    )
     return parser.parse_args(argv)
 
 
@@ -208,6 +213,9 @@ def build_report(
         "attribution": attribution,
         "task_count": len(tasks),
         "evaluated_task_count": len(evaluations),
+        "partial": bool(skipped_repos),
+        "failed_repo_count": len(skipped_repos),
+        "allow_partial": bool(getattr(args, "allow_partial", False)),
         "skipped_repos": list(skipped_repos),
         "repo_statuses": repo_statuses,
         "per_task": list(evaluations),
@@ -246,6 +254,8 @@ def print_report(report: JsonObject) -> None:
     zero = [item["task_id"] for item in report["per_task"] if item.get("zero_results")]
     if zero:
         print(f"\nZero-result tasks: {', '.join(zero)}")
+    if report.get("partial"):
+        print(f"Partial report: {report.get('failed_repo_count', 0)} repo(s) failed or skipped")
     if report.get("skipped_repos"):
         print(f"Skipped repos: {', '.join(report['skipped_repos'])}")
 

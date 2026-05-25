@@ -39,6 +39,7 @@ AIMOCK_RUN_DIR="${AFT_E2E_TEMP_ROOT:-${TMPDIR:-/tmp}/aimock-$$}"
 mkdir -p "$AIMOCK_RUN_DIR"
 export TMPDIR="$AIMOCK_RUN_DIR"
 PLUGIN_LOG="${AFT_E2E_PLUGIN_LOG:-$AIMOCK_RUN_DIR/aft-plugin.log}"
+AIMOCK_PID=""
 
 # Platform-specific paths for the broken-ONNX scenario.
 case "$PLATFORM" in
@@ -138,6 +139,25 @@ MOCK_SERVER="${AFT_E2E_MOCK_SERVER:-/test/mock-server.js}"
 AIMOCK_PORT="${AFT_E2E_AIMOCK_PORT:-$(choose_aimock_port)}"
 AIMOCK_BASE_URL="http://127.0.0.1:${AIMOCK_PORT}"
 AIMOCK_LOG="$AIMOCK_RUN_DIR/aimock.log"
+
+cleanup() {
+    set +e
+    if [ -n "${AIMOCK_PID:-}" ]; then
+        kill "$AIMOCK_PID" 2>/dev/null || true
+        wait "$AIMOCK_PID" 2>/dev/null || true
+        AIMOCK_PID=""
+    fi
+    if [ -n "${FAKE_ORT_PATH:-}" ]; then
+        rm -f "$FAKE_ORT_PATH"
+    fi
+    if [ -n "${AIMOCK_RUN_DIR:-}" ]; then
+        rm -rf "$AIMOCK_RUN_DIR"
+    fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 configure_opencode_mock_port
 
 start_aimock() {
@@ -153,8 +173,11 @@ start_aimock() {
 }
 
 stop_aimock() {
-    kill $AIMOCK_PID 2>/dev/null || true
-    wait $AIMOCK_PID 2>/dev/null || true
+    if [ -n "${AIMOCK_PID:-}" ]; then
+        kill "$AIMOCK_PID" 2>/dev/null || true
+        wait "$AIMOCK_PID" 2>/dev/null || true
+        AIMOCK_PID=""
+    fi
     # Wait for port to be freed
     sleep 2
 }
@@ -341,11 +364,18 @@ echo "── Scenario 3: ORT_DYLIB_PATH to missing file ──"
 echo ""
 
 rm -f "$PLUGIN_LOG"
+if [ "$PLATFORM" = "macos" ]; then
+    MISSING_ORT_PATH="${RUNNER_TEMP:-/tmp}/aft-test-ort-missing-$$.dylib"
+else
+    MISSING_ORT_PATH="/tmp/aft-test-ort-missing-$$.so"
+fi
+rm -f "$MISSING_ORT_PATH"
 
 start_aimock
 check "aimock started (s3)" "curl -s '$AIMOCK_BASE_URL/v1/models' > /dev/null 2>&1"
 
 RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario3.txt"
+ORT_DYLIB_PATH="$MISSING_ORT_PATH" \
 run_opencode_session \
     "Read src/main.py" \
     "$RESULT_FILE"
@@ -353,6 +383,9 @@ EXIT_CODE=$?
 
 check "session completed (missing ORT)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
 check "no crash (missing ORT)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
+check "ORT_DYLIB_PATH passed (missing ORT)" "grep -Fq '$MISSING_ORT_PATH' '$PLUGIN_LOG' 2>/dev/null"
+check "semantic disabled gracefully (missing ORT)" "grep -qi 'failed to build semantic index.*ONNX Runtime not found\|Semantic search unavailable.*ONNX Runtime not found\|semantic_search_unavailable' '$PLUGIN_LOG' '$RESULT_FILE' 2>/dev/null"
+check "other tools still work (missing ORT)" "grep -qi 'completed\|Task complete\|src/main.py' '$RESULT_FILE' 2>/dev/null"
 
 stop_aimock
 

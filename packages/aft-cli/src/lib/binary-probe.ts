@@ -5,36 +5,150 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
 
-function normalizeVersion(output: string): string | null {
-  const trimmed = output.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/^aft\s+/, "");
+async function loadPluginVersion(): Promise<string> {
+  try {
+    const bridgePackageName: string = "@cortexkit/aft-bridge";
+    const bridge = (await import(bridgePackageName)) as Record<string, unknown>;
+    if (typeof bridge.PLUGIN_VERSION === "string" && bridge.PLUGIN_VERSION.length > 0) {
+      return bridge.PLUGIN_VERSION;
+    }
+  } catch {
+    // In source tests the workspace package may not have dist/ built yet.
+  }
+
+  const require = createRequire(import.meta.url);
+  for (const relPath of [
+    "../../../aft-bridge/package.json",
+    "../../package.json",
+    "../package.json",
+  ]) {
+    try {
+      const pkg = require(relPath) as { version?: unknown };
+      if (typeof pkg.version === "string" && pkg.version.length > 0) return pkg.version;
+    } catch {
+      // try next location
+    }
+  }
+
+  return "unknown";
+}
+
+const PLUGIN_VERSION = await loadPluginVersion();
+
+const VERSION_LINE = /^(?:aft\s+)?v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/i;
+
+export type BinaryProbeCandidateStatus = "matched" | "unmatched" | "invalid" | "error";
+
+export interface BinaryProbeCandidate {
+  path: string;
+  status: BinaryProbeCandidateStatus;
+  version: string | null;
+  output?: string;
+  error?: string;
+}
+
+export interface BinaryProbeResult {
+  version: string | null;
+  path: string | null;
+  expectedVersion: string;
+  expectedMajorMinor: string | null;
+  candidates: BinaryProbeCandidate[];
+}
+
+function parseVersionOutput(output: string): string | null {
+  for (const line of output.split(/\r?\n/)) {
+    const match = line.trim().match(VERSION_LINE);
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
+function majorMinor(version: string | null | undefined): string | null {
+  if (!version) return null;
+  const match = version.trim().match(/^v?(\d+)\.(\d+)\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+  if (!match) return null;
+  return `${match[1]}.${match[2]}`;
+}
+
+function versionMatchesExpected(candidate: string, expectedVersion: string): boolean {
+  const candidateMajorMinor = majorMinor(candidate);
+  const expectedMajorMinor = majorMinor(expectedVersion);
+  return candidateMajorMinor !== null && candidateMajorMinor === expectedMajorMinor;
+}
+
+/**
+ * Parse and validate `aft --version` output. Accepts either a plain semver
+ * line (`0.30.1`) or the binary's normal `aft 0.30.1` line. Random non-semver
+ * output is rejected so PATH garbage is not reported as a healthy AFT binary.
+ */
+export function normalizeBinaryVersion(output: string): string | null {
+  return parseVersionOutput(output);
 }
 
 /**
  * Probe `aft --version` from the same prioritized candidate locations used by
  * `findAftBinary()` (cache, npm platform package, PATH, cargo fallback).
  *
- * Returns the first successfully reported version, or null if nothing
- * resolves. Errors and missing files are swallowed — callers get a signal,
- * not an exception.
+ * Returns the first successfully reported version matching the expected
+ * major.minor version, or null if nothing resolves. Errors, missing files,
+ * invalid version output, and version mismatches are swallowed — callers get a
+ * signal, not an exception.
  */
 export function probeBinaryVersion(preferredVersion?: string): string | null {
-  const candidate = findAftBinary(preferredVersion);
-  if (!candidate) return null;
+  return probeAftBinary(preferredVersion).version;
+}
 
-  try {
-    if (!existsSync(candidate)) return null;
-    const result = spawnSync(candidate, ["--version"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf-8",
-    });
-    if (result.error || result.status !== 0) return null;
-    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-    return normalizeVersion(output);
-  } catch {
-    return null;
+/** Detailed binary probe used by diagnostics to explain mismatched candidates. */
+export function probeAftBinary(preferredVersion?: string): BinaryProbeResult {
+  const expectedVersion = preferredVersion ?? PLUGIN_VERSION;
+  const expectedMajorMinor = majorMinor(expectedVersion);
+  const candidates: BinaryProbeCandidate[] = [];
+
+  for (const candidate of aftBinaryCandidates(preferredVersion)) {
+    try {
+      if (!existsSync(candidate)) continue;
+      const result = spawnSync(candidate, ["--version"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+        timeout: 5_000,
+        env: process.env,
+      });
+      const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
+      if (result.error || result.status !== 0) {
+        candidates.push({
+          path: candidate,
+          status: "error",
+          version: null,
+          ...(output ? { output } : {}),
+          error: result.error?.message ?? `exit status ${result.status ?? "unknown"}`,
+        });
+        continue;
+      }
+
+      const version = parseVersionOutput(output);
+      if (!version) {
+        candidates.push({ path: candidate, status: "invalid", version: null, output });
+        continue;
+      }
+
+      if (!versionMatchesExpected(version, expectedVersion)) {
+        candidates.push({ path: candidate, status: "unmatched", version, output });
+        continue;
+      }
+
+      candidates.push({ path: candidate, status: "matched", version, output });
+      return { version, path: candidate, expectedVersion, expectedMajorMinor, candidates };
+    } catch (error) {
+      candidates.push({
+        path: candidate,
+        status: "error",
+        version: null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
+
+  return { version: null, path: null, expectedVersion, expectedMajorMinor, candidates };
 }
 
 function pushCandidate(candidates: string[], candidate: string | null | undefined): void {
@@ -66,7 +180,7 @@ export function platformKey(
   return table[platform]?.[arch] ?? null;
 }
 
-export function findAftBinary(preferredVersion?: string): string | null {
+function aftBinaryCandidates(preferredVersion?: string): string[] {
   const candidates: string[] = [];
   if (preferredVersion) {
     const tag = preferredVersion.startsWith("v") ? preferredVersion : `v${preferredVersion}`;
@@ -85,7 +199,11 @@ export function findAftBinary(preferredVersion?: string): string | null {
 
   try {
     const lookup = process.platform === "win32" ? "where aft" : "which aft";
-    const resolved = execSync(lookup, { stdio: "pipe", encoding: "utf-8" }).trim();
+    const resolved = execSync(lookup, {
+      stdio: "pipe",
+      encoding: "utf-8",
+      env: process.env,
+    }).trim();
     if (resolved) {
       pushCandidate(candidates, resolved.split(/\r?\n/)[0]);
     }
@@ -94,6 +212,9 @@ export function findAftBinary(preferredVersion?: string): string | null {
   }
 
   pushCandidate(candidates, join(homedir(), ".cargo", "bin", getAftBinaryName()));
+  return candidates;
+}
 
-  return firstExisting(candidates);
+export function findAftBinary(preferredVersion?: string): string | null {
+  return firstExisting(aftBinaryCandidates(preferredVersion));
 }

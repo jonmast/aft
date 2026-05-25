@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
+import { probeAftBinary } from "../lib/binary-probe.js";
 import {
   collectDiagnostics,
   type DiagnosticReport,
@@ -14,8 +15,8 @@ import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js"
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
 import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
-import { runOnnxFix } from "../lib/onnx-fix.js";
-import { intro, log, note, outro, selectMany, text } from "../lib/prompts.js";
+import { findOnnxFixCandidates, runOnnxFix } from "../lib/onnx-fix.js";
+import { confirm, intro, log, note, outro, selectMany, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
 
@@ -94,8 +95,9 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   if (!report.binaryVersion) {
     log.warn(
-      "  no aft binary detected — run `aft doctor --fix` to download, or it will install automatically when an AFT-enabled session makes its first tool call",
+      "  no matching aft binary detected — run `aft doctor --fix` to download, or it will install automatically when an AFT-enabled session makes its first tool call",
     );
+    logUnmatchedBinaryCandidates(report.cliVersion);
   }
   log.info(
     `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}`,
@@ -352,6 +354,89 @@ export function clearOldBinaries(): BinaryCacheClearResult {
   return result;
 }
 
+export interface DoctorFixPlanItem {
+  kind: "plugin" | "binary" | "onnx";
+  message: string;
+}
+
+export function buildDoctorFixPlan(
+  adapters: HarnessAdapter[],
+  report: DiagnosticReport,
+): DoctorFixPlanItem[] {
+  const items: DoctorFixPlanItem[] = [];
+  const adaptersByKind = new Map<string, HarnessAdapter>(
+    adapters.map((adapter) => [adapter.kind, adapter]),
+  );
+
+  for (const harness of report.harnesses) {
+    const adapter = adaptersByKind.get(harness.kind);
+    if (!adapter || harness.pluginRegistered || !harness.hostInstalled) continue;
+    if (adapter.kind === "pi") {
+      items.push({
+        kind: "plugin",
+        message: `Will run \`pi install ${adapter.pluginEntryWithVersion}\` to register ${adapter.displayName}`,
+      });
+    } else {
+      items.push({
+        kind: "plugin",
+        message: `Will add ${adapter.pluginEntryWithVersion} to ${harness.configPaths.harnessConfig}`,
+      });
+    }
+  }
+
+  if (!report.binaryVersion) {
+    items.push({
+      kind: "binary",
+      message: `Will download/cache the aft binary matching CLI v${report.cliVersion}`,
+    });
+  }
+
+  for (const candidate of findOnnxFixCandidates(report)) {
+    if (candidate.storageOnnxBytes > 0) {
+      items.push({
+        kind: "onnx",
+        message: `Will delete AFT-managed ONNX cache at ${candidate.storageOnnxDir} (${formatBytes(candidate.storageOnnxBytes)})`,
+      });
+    } else {
+      items.push({
+        kind: "onnx",
+        message: `Will leave system ONNX untouched and refresh AFT-managed ONNX state for ${candidate.harness.displayName} on next start`,
+      });
+    }
+  }
+
+  return items;
+}
+
+export function shouldSkipDoctorFixConfirmation(argv: string[]): boolean {
+  if (argv.includes("--yes") || argv.includes("-y")) return true;
+  if (argv.includes("--ci")) return true;
+  return process.stdin.isTTY !== true || process.stdout.isTTY !== true;
+}
+
+async function confirmDoctorFixPlan(
+  plan: readonly DoctorFixPlanItem[],
+  argv: string[],
+): Promise<boolean> {
+  if (plan.length === 0) return true;
+  if (shouldSkipDoctorFixConfirmation(argv)) return true;
+  return confirm("Apply the planned doctor --fix changes?", false);
+}
+
+function logUnmatchedBinaryCandidates(expectedVersion: string): void {
+  const probe = probeAftBinary(expectedVersion);
+  const unmatched = probe.candidates.filter((candidate) => candidate.status === "unmatched");
+  if (unmatched.length === 0) return;
+
+  const expected = probe.expectedMajorMinor
+    ? `${probe.expectedMajorMinor}.x`
+    : probe.expectedVersion;
+  log.warn(`  found unmatched aft binary candidate(s); expected ${expected}:`);
+  for (const candidate of unmatched) {
+    log.warn(`  unmatched: ${candidate.path} reported v${candidate.version ?? "unknown"}`);
+  }
+}
+
 /**
  * `aft doctor --fix` flow — detect and apply auto-fixable issues with
  * user consent. Currently covers plugin registration, missing aft binary
@@ -365,6 +450,22 @@ async function runFixFlow(argv: string[]): Promise<number> {
 
   log.info("Running diagnostics to identify auto-fixable issues…");
   const report = await collectDiagnostics(adapters);
+  if (!report.binaryVersion) {
+    logUnmatchedBinaryCandidates(report.cliVersion);
+  }
+
+  const plan = buildDoctorFixPlan(adapters, report);
+  if (plan.length > 0) {
+    log.warn("Planned changes:");
+    for (const item of plan) {
+      log.info(`  • ${item.message}`);
+    }
+    if (!(await confirmDoctorFixPlan(plan, argv))) {
+      log.info("Skipped — no changes made.");
+      outro("Done.");
+      return 0;
+    }
+  }
 
   await fixPluginEntries(adapters);
 
@@ -378,7 +479,10 @@ async function runFixFlow(argv: string[]): Promise<number> {
   if (!report.binaryVersion) {
     log.info("AFT binary not found. Downloading…");
     try {
-      const { ensureBinary } = await import("@cortexkit/aft-bridge");
+      const bridgePackageName: string = "@cortexkit/aft-bridge";
+      const { ensureBinary } = (await import(bridgePackageName)) as {
+        ensureBinary: (version?: string) => Promise<string | null>;
+      };
       const path = await ensureBinary(`v${report.cliVersion}`);
       if (path) {
         log.success(`AFT binary installed at ${path}`);
@@ -398,7 +502,7 @@ async function runFixFlow(argv: string[]): Promise<number> {
   }
 
   // ONNX Runtime fix is the other supported auto-fix today.
-  const onnxResult = await runOnnxFix(adapters, report);
+  const onnxResult = await runOnnxFix(adapters, report, { yes: true });
 
   // Decide outro state based on combined results. We can have any
   // combination of: ONNX fix attempted/skipped/failed, binary
