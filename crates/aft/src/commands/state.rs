@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::context::AppContext;
+use crate::harness::Harness;
 use crate::protocol::{RawRequest, Response};
 
 #[derive(Debug, Deserialize)]
@@ -22,10 +23,14 @@ pub fn handle_db_get_state(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
 
-    let harness = ctx.harness().as_str();
+    let Some(harness) = ctx.harness_opt() else {
+        return not_configured(&req.id, "db_get_state");
+    };
+    let harness_name = harness.as_str();
     match ctx.db() {
         Some(db) => match db.lock() {
-            Ok(conn) => match crate::db::state::get_harness_state(&conn, harness, &params.key) {
+            Ok(conn) => match crate::db::state::get_harness_state(&conn, harness_name, &params.key)
+            {
                 Ok(Some(value)) => return Response::success(&req.id, json!({ "value": value })),
                 Ok(None) => {}
                 Err(error) => {
@@ -47,8 +52,8 @@ pub fn handle_db_get_state(req: &RawRequest, ctx: &AppContext) -> Response {
         None => {}
     }
 
-    let value =
-        legacy_harness_path(ctx, &params.key).and_then(|path| fs::read_to_string(path).ok());
+    let value = legacy_harness_path(ctx, harness, &params.key)
+        .and_then(|path| fs::read_to_string(path).ok());
     Response::success(&req.id, json!({ "value": value }))
 }
 
@@ -65,20 +70,20 @@ pub fn handle_db_set_state(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     };
 
-    let Some(db) = ctx.db() else {
-        return Response::error(
-            &req.id,
-            "db_unavailable",
-            "db_set_state: database unavailable",
-        );
+    let Some(harness) = ctx.harness_opt() else {
+        return not_configured(&req.id, "db_set_state");
     };
 
-    let harness = ctx.harness().as_str();
+    let Some(db) = ctx.db() else {
+        return write_legacy_harness_state(&req.id, ctx, harness, &params.key, &value);
+    };
+
+    let harness_name = harness.as_str();
     match db.lock() {
         Ok(conn) => {
             if let Err(error) = crate::db::state::set_harness_state(
                 &conn,
-                harness,
+                harness_name,
                 &params.key,
                 &value,
                 unix_millis(),
@@ -99,7 +104,7 @@ pub fn handle_db_set_state(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    if let Some(path) = legacy_harness_path(ctx, &params.key) {
+    if let Some(path) = legacy_harness_path(ctx, harness, &params.key) {
         if let Err(error) = atomic_write(&path, value.as_bytes()) {
             log::warn!(
                 "db_set_state legacy write failed for {}: {}",
@@ -160,11 +165,7 @@ pub fn handle_db_set_host_state(req: &RawRequest, ctx: &AppContext) -> Response 
     };
 
     let Some(db) = ctx.db() else {
-        return Response::error(
-            &req.id,
-            "db_unavailable",
-            "db_set_host_state: database unavailable",
-        );
+        return write_legacy_host_state(&req.id, ctx, &params.key, &value);
     };
 
     match db.lock() {
@@ -201,6 +202,66 @@ pub fn handle_db_set_host_state(req: &RawRequest, ctx: &AppContext) -> Response 
     Response::success(&req.id, json!({ "ok": true }))
 }
 
+fn not_configured(request_id: &str, command: &str) -> Response {
+    Response::error(
+        request_id,
+        "not_configured",
+        format!("{command}: configure must be called before harness-scoped state is available"),
+    )
+}
+
+fn db_unavailable_without_fallback(request_id: &str, command: &str, key: &str) -> Response {
+    Response::error(
+        request_id,
+        "db_unavailable",
+        format!("{command}: database unavailable and no JSON fallback is defined for key '{key}'"),
+    )
+}
+
+fn write_legacy_harness_state(
+    request_id: &str,
+    ctx: &AppContext,
+    harness: Harness,
+    key: &str,
+    value: &str,
+) -> Response {
+    let Some(path) = legacy_harness_path(ctx, harness, key) else {
+        return db_unavailable_without_fallback(request_id, "db_set_state", key);
+    };
+
+    match atomic_write(&path, value.as_bytes()) {
+        Ok(()) => Response::success(request_id, json!({ "ok": true })),
+        Err(error) => Response::error(
+            request_id,
+            "state_persistence_error",
+            format!(
+                "db_set_state JSON fallback write failed for {}: {}",
+                path.display(),
+                error
+            ),
+        ),
+    }
+}
+
+fn write_legacy_host_state(request_id: &str, ctx: &AppContext, key: &str, value: &str) -> Response {
+    let Some(path) = legacy_host_path(ctx, key) else {
+        return db_unavailable_without_fallback(request_id, "db_set_host_state", key);
+    };
+
+    match atomic_write(&path, value.as_bytes()) {
+        Ok(()) => Response::success(request_id, json!({ "ok": true })),
+        Err(error) => Response::error(
+            request_id,
+            "state_persistence_error",
+            format!(
+                "db_set_host_state JSON fallback write failed for {}: {}",
+                path.display(),
+                error
+            ),
+        ),
+    }
+}
+
 fn parse_params(req: &RawRequest, command: &str) -> Result<StateParams, Response> {
     let raw_params = req
         .params
@@ -216,8 +277,8 @@ fn parse_params(req: &RawRequest, command: &str) -> Result<StateParams, Response
     })
 }
 
-fn legacy_harness_path(ctx: &AppContext, key: &str) -> Option<PathBuf> {
-    let dir = ctx.harness_dir();
+fn legacy_harness_path(ctx: &AppContext, harness: Harness, key: &str) -> Option<PathBuf> {
+    let dir = ctx.storage_dir().join(harness.as_str());
     match key {
         "last_announced_version" => Some(repair_root_scoped_harness_file(
             ctx,
@@ -303,4 +364,78 @@ fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::parser::TreeSitterProvider;
+
+    fn test_context() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    fn state_request(command: &str, params: serde_json::Value) -> RawRequest {
+        RawRequest {
+            id: "state".to_string(),
+            command: command.to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params,
+        }
+    }
+
+    #[test]
+    fn db_get_state_before_configure_returns_not_configured() {
+        let ctx = test_context();
+        let req = state_request("db_get_state", json!({ "key": "warned_tools" }));
+
+        let response = handle_db_get_state(&req, &ctx);
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "not_configured");
+    }
+
+    #[test]
+    fn db_set_state_uses_json_fallback_when_database_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.config_mut().storage_dir = Some(temp.path().to_path_buf());
+        ctx.set_harness(Harness::Opencode);
+
+        let set_req = state_request(
+            "db_set_state",
+            json!({ "key": "warned_tools", "value": "[\"rustfmt\"]" }),
+        );
+        let set_response = handle_db_set_state(&set_req, &ctx);
+
+        assert!(set_response.success);
+        let path = temp.path().join("opencode").join("warned_tools.json");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"rustfmt\"]");
+
+        let get_req = state_request("db_get_state", json!({ "key": "warned_tools" }));
+        let get_response = handle_db_get_state(&get_req, &ctx);
+        assert!(get_response.success);
+        assert_eq!(get_response.data["value"], "[\"rustfmt\"]");
+    }
+
+    #[test]
+    fn db_set_host_state_uses_json_fallback_when_database_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.config_mut().storage_dir = Some(temp.path().to_path_buf());
+
+        let set_req = state_request(
+            "db_set_host_state",
+            json!({ "key": "trusted_filter_projects", "value": "[]" }),
+        );
+        let set_response = handle_db_set_host_state(&set_req, &ctx);
+
+        assert!(set_response.success);
+        let path = temp.path().join("trusted-filter-projects.json");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+    }
 }

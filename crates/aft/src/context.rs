@@ -1,6 +1,7 @@
 use std::cell::{Ref, RefCell, RefMut};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,9 @@ use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
 use crate::parser::{SharedSymbolCache, SymbolCache};
-use crate::protocol::{ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload};
+use crate::protocol::{
+    ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
+};
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
@@ -314,6 +317,9 @@ pub struct AppContext {
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
     stdout_writer: SharedStdoutWriter,
     progress_sender: SharedProgressSender,
+    configure_generation: AtomicU64,
+    configure_warnings_tx: mpsc::Sender<(u64, ConfigureWarningsFrame)>,
+    configure_warnings_rx: mpsc::Receiver<(u64, ConfigureWarningsFrame)>,
     status_emitter: StatusEmitter,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
@@ -345,6 +351,7 @@ impl AppContext {
         let bash_compress_enabled = config.experimental_bash_compress;
         let progress_sender = Arc::new(Mutex::new(None));
         let stdout_writer = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+        let (configure_warnings_tx, configure_warnings_rx) = mpsc::channel();
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let symbol_cache = provider
             .as_any()
@@ -379,6 +386,9 @@ impl AppContext {
             lsp_child_registry,
             stdout_writer,
             progress_sender: Arc::clone(&progress_sender),
+            configure_generation: AtomicU64::new(0),
+            configure_warnings_tx,
+            configure_warnings_rx,
             status_emitter,
             bash_background: BgTaskRegistry::new(progress_sender),
             filter_registry: Arc::new(std::sync::RwLock::new(
@@ -621,6 +631,28 @@ impl AppContext {
             .and_then(|sender| sender.clone())
     }
 
+    pub fn advance_configure_generation(&self) -> u64 {
+        self.configure_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub fn configure_generation(&self) -> u64 {
+        self.configure_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn configure_warnings_sender(&self) -> mpsc::Sender<(u64, ConfigureWarningsFrame)> {
+        self.configure_warnings_tx.clone()
+    }
+
+    pub fn drain_configure_warnings(&self) -> Vec<(u64, ConfigureWarningsFrame)> {
+        let mut warnings = Vec::new();
+        while let Ok(warning) = self.configure_warnings_rx.try_recv() {
+            warnings.push(warning);
+        }
+        warnings
+    }
+
     pub fn bash_background(&self) -> &BgTaskRegistry {
         &self.bash_background
     }
@@ -671,9 +703,12 @@ impl AppContext {
         self.bash_background.set_harness(harness);
     }
 
+    pub fn harness_opt(&self) -> Option<Harness> {
+        *self.harness.borrow()
+    }
+
     pub fn harness(&self) -> Harness {
-        self.harness
-            .borrow()
+        self.harness_opt()
             .expect("harness set by configure before any tool call")
     }
 

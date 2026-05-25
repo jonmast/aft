@@ -7,7 +7,9 @@ use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
-use std::sync::mpsc;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -77,17 +79,16 @@ fn main() {
     }
 
     let stdout_writer = ctx.stdout_writer();
-    ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(
-        move |frame: PushFrame| {
-            let Ok(mut writer) = stdout_writer.lock() else {
-                aft::slog_error!("stdout push frame lock poisoned");
-                return;
-            };
-            if let Err(e) = write_push_frame(&mut *writer, &frame) {
-                aft::slog_error!("stdout push frame write error: {}", e);
-            }
-        },
-    ))));
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_from_push = Arc::clone(&shutdown_requested);
+    ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame: PushFrame| {
+        let Ok(mut writer) = stdout_writer.lock() else {
+            aft::slog_error!("stdout push frame lock poisoned; shutting down bridge");
+            shutdown_from_push.store(true, Ordering::SeqCst);
+            return;
+        };
+        write_push_frame_or_request_shutdown(&mut *writer, &frame, &shutdown_from_push);
+    }))));
 
     // Stdin is read by a dedicated thread that forwards lines through a
     // channel. The main thread does recv_timeout so it wakes periodically
@@ -109,16 +110,24 @@ fn main() {
     });
 
     loop {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
+
         let line_result = match line_rx.recv_timeout(DRAIN_INTERVAL) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Periodic drain so push frames flow even without requests.
                 // Cheap on the idle path: each drain just checks try_recv
                 // on a channel and bails if empty.
+                drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
                 drain_watcher_events(&ctx);
                 drain_lsp_events(&ctx);
+                if shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -137,27 +146,34 @@ fn main() {
             continue;
         }
 
+        let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
                 // Drain search index FIRST so watcher events apply to the latest index.
                 // If reversed, watcher updates applied to the old index would be lost
                 // when the background-built index replaces it.
+                drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
                 drain_watcher_events(&ctx);
                 drain_lsp_events(&ctx);
+                let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
                 let session_id_for_log = req.session_id.clone();
-                // For `configure`, the response frame must be the first frame a
-                // bridge observes for that request/session. The deferred
-                // configure_warnings worker in configure.rs deliberately waits
-                // until after dispatch returns so clients can register their
-                // configured state before processing async warning pushes.
-                let mut response =
-                    log_ctx::with_session(session_id_for_log, || dispatch(req, &ctx));
-                attach_bg_completions(&mut response, &ctx, &session_id, &command);
-                response
+                let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
+                    log_ctx::with_session(session_id_for_log, || dispatch(req, &ctx))
+                }));
+                match dispatch_result {
+                    Ok(mut response) => {
+                        attach_bg_completions(&mut response, &ctx, &session_id, &command);
+                        response
+                    }
+                    Err(payload) => {
+                        shutdown_after_response = true;
+                        dispatch_panic_response(request_id, &command, payload.as_ref())
+                    }
+                }
             }
             Err(e) => {
                 aft::slog_error!("parse error: {} — input: {}", e, trimmed);
@@ -171,6 +187,10 @@ fn main() {
 
         if let Err(e) = write_response(&ctx, &response) {
             aft::slog_error!("stdout write error: {}", e);
+            break;
+        }
+        drain_configure_warning_events(&ctx);
+        if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
             break;
         }
     }
@@ -283,6 +303,65 @@ fn install_signal_handler(
     #[cfg(not(windows))]
     {
         let _ = (bg_registry, lsp_children);
+    }
+}
+
+fn write_push_frame_or_request_shutdown(
+    writer: &mut impl Write,
+    frame: &PushFrame,
+    shutdown_requested: &AtomicBool,
+) {
+    if let Err(error) = write_push_frame(writer, frame) {
+        aft::slog_error!(
+            "stdout push frame write error: {}; shutting down bridge",
+            error
+        );
+        shutdown_requested.store(true, Ordering::SeqCst);
+    }
+}
+
+fn dispatch_panic_response(
+    request_id: impl Into<String>,
+    command: &str,
+    payload: &(dyn std::any::Any + Send),
+) -> Response {
+    let panic_message = panic_payload_message(payload);
+    aft::slog_error!(
+        "command '{}' panicked: {}; shutting down bridge",
+        command,
+        panic_message
+    );
+    Response::error(
+        request_id,
+        "internal_error",
+        format!("command '{command}' panicked: {panic_message}"),
+    )
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn drain_configure_warning_events(ctx: &AppContext) {
+    for (generation, frame) in ctx.drain_configure_warnings() {
+        if ctx.configure_generation() != generation {
+            aft::slog_info!(
+                "dropping stale configure_warnings for generation {} (current {})",
+                generation,
+                ctx.configure_generation()
+            );
+            continue;
+        }
+
+        if let Some(sender) = ctx.progress_sender_handle() {
+            sender(PushFrame::ConfigureWarnings(frame));
+        }
     }
 }
 
@@ -802,10 +881,14 @@ fn drain_lsp_events(ctx: &AppContext) {
 
 #[cfg(test)]
 mod watcher_filter_tests {
-    use super::{filter_watcher_raw_paths, watcher_event_invalidates};
+    use super::{
+        dispatch_panic_response, drain_configure_warning_events, filter_watcher_raw_paths,
+        watcher_event_invalidates, write_push_frame_or_request_shutdown,
+    };
     use aft::config::Config;
     use aft::context::AppContext;
     use aft::parser::TreeSitterProvider;
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame};
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
         RenameMode,
@@ -924,6 +1007,88 @@ mod watcher_filter_tests {
         // already handle the meaningful catch-all cases.
         assert!(!watcher_event_invalidates(&EventKind::Other));
         assert!(!watcher_event_invalidates(&EventKind::Any));
+    }
+
+    #[test]
+    fn dispatch_panic_response_is_clear_internal_error() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+
+        let response = dispatch_panic_response("panic-id", "db_get_state", payload.as_ref());
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "internal_error");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("command 'db_get_state' panicked: boom"));
+    }
+
+    #[test]
+    fn push_frame_write_error_requests_shutdown() {
+        struct BrokenWriter;
+
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdout closed",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let frame = PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new(
+            "/repo",
+            0,
+            false,
+            5_000,
+            Vec::new(),
+        ));
+
+        write_push_frame_or_request_shutdown(&mut BrokenWriter, &frame, &shutdown);
+
+        assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn configure_warning_drain_drops_stale_generation() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(tmp.path());
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel();
+        ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(move |frame| {
+            let _ = frame_tx.send(frame);
+        }))));
+
+        let warnings_tx = ctx.configure_warnings_sender();
+        let current_generation = ctx.advance_configure_generation();
+        warnings_tx
+            .send((
+                current_generation - 1,
+                ConfigureWarningsFrame::new("/stale", 1, false, 5_000, Vec::new()),
+            ))
+            .unwrap();
+        warnings_tx
+            .send((
+                current_generation,
+                ConfigureWarningsFrame::new("/current", 2, false, 5_000, Vec::new()),
+            ))
+            .unwrap();
+
+        drain_configure_warning_events(&ctx);
+
+        let frame = frame_rx.try_recv().expect("current warning frame");
+        match frame {
+            PushFrame::ConfigureWarnings(frame) => {
+                assert_eq!(frame.project_root, "/current");
+                assert_eq!(frame.source_file_count, 2);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        assert!(frame_rx.try_recv().is_err());
     }
 
     #[test]

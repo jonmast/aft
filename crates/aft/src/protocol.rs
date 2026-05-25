@@ -216,9 +216,22 @@ impl StatusChangedFrame {
         Self {
             frame_type: "status_changed",
             session_id,
-            snapshot,
+            snapshot: status_push_payload(snapshot),
         }
     }
+}
+
+fn status_push_payload(mut snapshot: StatusPayload) -> StatusPayload {
+    if let Some(object) = snapshot.as_object_mut() {
+        object.remove("session");
+        if let Some(compression) = object
+            .get_mut("compression")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            compression.remove("session");
+        }
+    }
+    snapshot
 }
 
 #[cfg(test)]
@@ -305,6 +318,27 @@ mod tests {
         assert!(json["session_id"].is_null());
         assert_eq!(json["snapshot"]["cache_role"], "main");
         assert_eq!(json["snapshot"]["project_root"], "/repo");
+    }
+
+    #[test]
+    fn status_changed_frame_strips_session_scoped_push_fields() {
+        let frame = StatusChangedFrame::new(
+            None,
+            json!({
+                "version": "0.24.0",
+                "checkpoints_total": 7,
+                "session": { "id": "default", "tracked_files": 2, "checkpoints": 1 },
+                "compression": {
+                    "project": { "events": 3 },
+                    "session": { "events": 99 }
+                }
+            }),
+        );
+
+        assert!(frame.snapshot.get("session").is_none());
+        assert_eq!(frame.snapshot["checkpoints_total"], 7);
+        assert_eq!(frame.snapshot["compression"]["project"]["events"], 3);
+        assert!(frame.snapshot["compression"].get("session").is_none());
     }
 }
 
