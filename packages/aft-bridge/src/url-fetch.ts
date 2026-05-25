@@ -312,7 +312,7 @@ async function fetchWithRedirects(
           // `application/vnd.github.raw` is GitHub's custom type — returns raw markdown from
           // repo file and readme endpoints. Falls back to HTML if markdown is not available.
           accept:
-            "application/vnd.github.raw, text/markdown, text/x-markdown, text/html;q=0.9, text/plain;q=0.5",
+            "application/vnd.github.raw, text/markdown, text/x-markdown, text/html;q=0.9, application/json;q=0.8, text/plain;q=0.5",
         },
       });
     } catch (err) {
@@ -389,6 +389,11 @@ function resolveExtension(contentType: string): string | null {
   if (lower === "text/plain") {
     // treat plain text as markdown so aft_outline can show headings if present
     return ".md";
+  }
+  if (lower === "application/json" || lower === "application/ld+json" || lower.endsWith("+json")) {
+    // JSON is parseable by aft_outline (top-level keys become symbols).
+    // Covers npm registry, unpkg package.json, OpenAPI specs, etc.
+    return ".json";
   }
   return null;
 }

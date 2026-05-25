@@ -128,4 +128,41 @@ describe("fetchUrlToTempFile", () => {
     const { readFileSync } = await import("node:fs");
     expect(readFileSync(path, "utf8")).toBe(body);
   });
+
+  test("application/json is supported and saved with .json extension", async () => {
+    // Real-world failure: npm registry, unpkg package.json, OpenAPI specs all
+    // return application/json. Previously aft_outline rejected these with
+    // "Unsupported content type". aft_outline can parse top-level JSON keys
+    // as symbols, so accepting JSON unlocks package metadata inspection.
+    const body = JSON.stringify({ name: "pkg", version: "1.0.0" });
+    const fetchImpl = async () =>
+      new Response(body, {
+        headers: { "content-type": "application/json" },
+      });
+
+    const path = await fetchUrlToTempFile("http://example.com/pkg.json", storageDir, {
+      allowPrivate: true,
+      fetchImpl,
+    });
+
+    expect(path).toMatch(/\.json$/);
+    const { readFileSync } = await import("node:fs");
+    expect(readFileSync(path, "utf8")).toBe(body);
+  });
+
+  test("application/ld+json and other +json types are accepted as JSON", async () => {
+    // Many APIs return custom +json types (JSON-LD, vendor types, etc).
+    const body = '{"@context":"https://schema.org","@type":"Article"}';
+    const fetchImpl = async () =>
+      new Response(body, {
+        headers: { "content-type": "application/ld+json" },
+      });
+
+    const path = await fetchUrlToTempFile("http://example.com/data", storageDir, {
+      allowPrivate: true,
+      fetchImpl,
+    });
+
+    expect(path).toMatch(/\.json$/);
+  });
 });
