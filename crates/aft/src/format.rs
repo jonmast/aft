@@ -296,7 +296,7 @@ fn resolve_tool(command: &str, project_root: Option<&Path>) -> Option<String> {
     resolved.map(|path| path.to_string_lossy().to_string())
 }
 
-fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<PathBuf> {
     // 1. Check node_modules/.bin/<command> relative to project root
     if let Some(root) = project_root {
         let local_bin = root.join("node_modules").join(".bin").join(command);
@@ -371,17 +371,19 @@ fn try_path_lookup(command: &str) -> Option<PathBuf> {
 /// absolute-path candidate that doesn't accept `--version` would emit a
 /// false negative (and Rust's `fs::metadata` is much cheaper than a spawn).
 fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
-    if cfg!(windows) {
-        // On Windows, well-known POSIX paths don't apply. Skip the fallback
-        // entirely — the user's tool is either on PATH or genuinely missing.
-        return None;
-    }
     // Test-only escape hatch: integration tests that need to assert
     // "tool not installed" semantics set AFT_DISABLE_WELL_KNOWN_LOOKUP=1
     // so CI runners with a system tsc/biome/etc. at /usr/local/bin don't
     // silently make those tests pass. Production callers never set this.
     if std::env::var_os("AFT_DISABLE_WELL_KNOWN_LOOKUP").is_some() {
         return None;
+    }
+    if cfg!(windows) {
+        // On Windows, check common install locations that GUI-launched editors
+        // may miss from PATH: Go SDK, Cargo, and user-local Go binaries.
+        let candidates =
+            well_known_windows_search_paths(command, std::env::var_os("USERPROFILE").as_deref());
+        return try_well_known_path_lookup_in(&candidates);
     }
     let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
     try_well_known_path_lookup_in(&candidates)
@@ -401,6 +403,46 @@ fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec
         candidates.push(home_path.join(".local/bin").join(command));
     }
     candidates
+}
+
+/// Build the candidate path list for the given command name using well-known
+/// Windows install locations. Extracted so tests can drive the lookup with a
+/// controlled USERPROFILE without mutating process-global env vars.
+///
+/// Search order:
+/// 1. `C:\Go\bin\<command>.exe` — Windows Go installer (default path)
+/// 2. `C:\Program Files\Go\bin\<command>.exe` — Windows Go installer (Program Files)
+/// 3. `%USERPROFILE%\.cargo\bin\<command>.exe` — `cargo install`
+/// 4. `%USERPROFILE%\go\bin\<command>.exe` — `go install` with default GOPATH
+///
+/// Each candidate appends `.exe` because Windows executables require the
+/// extension for `std::fs::metadata` to resolve the correct file.
+#[cfg(windows)]
+fn well_known_windows_search_paths(
+    command: &str,
+    userprofile: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let exe_name = format!("{}.exe", command);
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(5);
+    // Go SDK installations
+    candidates.push(PathBuf::from(r"C:\Go\bin").join(&exe_name));
+    candidates.push(PathBuf::from(r"C:\Program Files\Go\bin").join(&exe_name));
+    if let Some(up) = userprofile {
+        let up_path = PathBuf::from(up);
+        // Cargo-installed tools (rustfmt, cargo-outdated, etc.)
+        candidates.push(up_path.join(r".cargo\bin").join(&exe_name));
+        // Go-installed tools (gopls, staticcheck, goimports, etc.)
+        candidates.push(up_path.join(r"go\bin").join(&exe_name));
+    }
+    candidates
+}
+
+#[cfg(not(windows))]
+fn well_known_windows_search_paths(
+    _command: &str,
+    _userprofile: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    Vec::new() // dead code on POSIX, included for compile-time completeness
 }
 
 /// Walk a pre-built candidate list, returning the first file that exists and
@@ -425,9 +467,10 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
-    // Windows: regular files in well-known POSIX paths don't apply
-    // (try_well_known_path_lookup returns early on Windows). This stub
-    // exists only so the file compiles on Windows.
+    // Windows: the well-known Windows paths in `try_well_known_path_lookup`
+    // construct .exe paths which are always executable (or the metadata check
+    // already filters out non-files). This stub exists for compile-time
+    // completeness on the POSIX candidate path used during non-Windows builds.
     true
 }
 
@@ -1053,13 +1096,17 @@ pub(crate) fn install_hint(tool: &str) -> String {
         "rustfmt" => "Install: `rustup component add rustfmt`".to_string(),
         "rust-analyzer" => "Install: `rustup component add rust-analyzer`".to_string(),
         "cargo" => "Install Rust from https://rustup.rs/.".to_string(),
-        "go" => [
-            "Install Go from https://go.dev/dl/, or — if it's already installed —",
-            "ensure its bin directory is on PATH (Homebrew typically uses",
-            "/opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS).",
-            "GUI-launched editors often don't inherit login-shell PATH.",
-        ]
-        .join(" "),
+        "go" => if cfg!(windows) {
+            "Install Go from https://go.dev/dl/. Common install paths: \
+                 C:\\Go\\bin, C:\\Program Files\\Go\\bin. \
+                 GUI-launched editors often don't inherit login-shell PATH."
+        } else {
+            "Install Go from https://go.dev/dl/, or — if it's already installed — \
+                 ensure its bin directory is on PATH (Homebrew typically uses \
+                 /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS). \
+                 GUI-launched editors often don't inherit login-shell PATH."
+        }
+        .to_string(),
         "gopls" => "Install: `go install golang.org/x/tools/gopls@latest`".to_string(),
         "bash-language-server" => "Install: `npm install -g bash-language-server`".to_string(),
         "yaml-language-server" => "Install: `npm install -g yaml-language-server`".to_string(),
