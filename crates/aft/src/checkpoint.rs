@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::backup::BackupStore;
 use crate::error::AftError;
+use crate::fs_lock;
+
+const CHECKPOINT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Metadata about a checkpoint, returned by list/create/restore.
 #[derive(Debug, Clone)]
@@ -17,12 +23,70 @@ pub struct CheckpointInfo {
     pub skipped: Vec<(PathBuf, String)>,
 }
 
-/// A stored checkpoint: a snapshot of multiple file contents.
+/// A stored checkpoint: a snapshot of multiple file contents and metadata.
 #[derive(Debug, Clone)]
 struct Checkpoint {
     name: String,
-    file_contents: HashMap<PathBuf, String>,
+    file_contents: HashMap<PathBuf, CheckpointFile>,
     created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointFile {
+    metadata: fs::Metadata,
+    kind: CheckpointFileKind,
+}
+
+#[derive(Debug, Clone)]
+enum CheckpointFileKind {
+    Regular {
+        bytes: Vec<u8>,
+    },
+    Symlink {
+        target: PathBuf,
+        target_is_dir: bool,
+    },
+}
+
+impl CheckpointFile {
+    fn read(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            let target = fs::read_link(path)?;
+            let target_is_dir = fs::metadata(path)
+                .map(|target_metadata| target_metadata.is_dir())
+                .unwrap_or(false);
+            return Ok(Self {
+                metadata,
+                kind: CheckpointFileKind::Symlink {
+                    target,
+                    target_is_dir,
+                },
+            });
+        }
+
+        if metadata.is_file() {
+            let bytes = fs::read(path)?;
+            return Ok(Self {
+                metadata,
+                kind: CheckpointFileKind::Regular { bytes },
+            });
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file or symlink",
+        ))
+    }
+
+    fn read_optional(path: &Path) -> io::Result<Option<Self>> {
+        match Self::read(path) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Workspace-wide, per-session checkpoint store.
@@ -37,13 +101,47 @@ struct Checkpoint {
 pub struct CheckpointStore {
     /// session -> name -> checkpoint
     checkpoints: HashMap<String, HashMap<String, Checkpoint>>,
+    lock_path: PathBuf,
+    lock_timeout: Duration,
 }
 
 impl CheckpointStore {
     pub fn new() -> Self {
+        let project_root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let project_key = crate::search_index::project_cache_key(&project_root);
+        let lock_path = crate::bash_background::storage_dir(None)
+            .join("checkpoints")
+            .join(project_key)
+            .join("checkpoint.lock");
+        Self::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT)
+    }
+
+    fn with_lock_path(lock_path: PathBuf, lock_timeout: Duration) -> Self {
         CheckpointStore {
             checkpoints: HashMap::new(),
+            lock_path,
+            lock_timeout,
         }
+    }
+
+    fn acquire_mutation_lock(&self) -> Result<fs_lock::LockGuard, AftError> {
+        if let Some(parent) = self.lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| AftError::IoError {
+                path: parent.display().to_string(),
+                message: format!("failed to create checkpoint lock directory: {error}"),
+            })?;
+        }
+
+        fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(|error| match error {
+            fs_lock::AcquireError::Timeout => AftError::IoError {
+                path: self.lock_path.display().to_string(),
+                message: "timed out acquiring checkpoint mutation lock".to_string(),
+            },
+            fs_lock::AcquireError::Io(error) => AftError::IoError {
+                path: self.lock_path.display().to_string(),
+                message: format!("failed to acquire checkpoint mutation lock: {error}"),
+            },
+        })
     }
 
     /// Create a checkpoint by reading the given files, scoped to `session`.
@@ -66,6 +164,7 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: &BackupStore,
     ) -> Result<CheckpointInfo, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
         let explicit_request = !files.is_empty();
         let file_list = if files.is_empty() {
             backup_store.tracked_files(session)
@@ -76,9 +175,9 @@ impl CheckpointStore {
         let mut file_contents = HashMap::new();
         let mut skipped: Vec<(PathBuf, String)> = Vec::new();
         for path in &file_list {
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    file_contents.insert(path.clone(), content);
+            match CheckpointFile::read(path) {
+                Ok(snapshot) => {
+                    file_contents.insert(path.clone(), snapshot);
                 }
                 Err(e) => {
                     crate::slog_warn!(
@@ -139,6 +238,7 @@ impl CheckpointStore {
 
     /// Restore a checkpoint by overwriting files with stored content.
     pub fn restore(&self, session: &str, name: &str) -> Result<CheckpointInfo, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
         let checkpoint = self.get(session, name)?;
         let mut paths = checkpoint.file_contents.keys().cloned().collect::<Vec<_>>();
         paths.sort();
@@ -162,6 +262,7 @@ impl CheckpointStore {
         name: &str,
         validated_paths: &[PathBuf],
     ) -> Result<CheckpointInfo, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
         let checkpoint = self.get(session, name)?;
 
         for path in validated_paths {
@@ -246,40 +347,36 @@ impl CheckpointStore {
 }
 
 fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Result<(), AftError> {
-    let mut pre_restore_snapshot: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut pre_restore_snapshot: HashMap<PathBuf, Option<CheckpointFile>> = HashMap::new();
     for path in paths {
-        let current = if path.exists() {
-            Some(
-                std::fs::read_to_string(path).map_err(|_| AftError::FileNotFound {
-                    path: path.display().to_string(),
-                })?,
-            )
-        } else {
-            None
-        };
+        let current = CheckpointFile::read_optional(path).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: format!("failed to snapshot pre-restore file metadata: {error}"),
+        })?;
         pre_restore_snapshot.insert(path.clone(), current);
     }
 
     let mut restored_paths: Vec<PathBuf> = Vec::new();
     let mut created_dirs: Vec<PathBuf> = Vec::new();
     for path in paths {
-        let content = checkpoint
-            .file_contents
-            .get(path)
-            .ok_or_else(|| AftError::FileNotFound {
-                path: path.display().to_string(),
-            })?;
-        if let Err(e) = write_restored_file(path, content, &mut created_dirs) {
+        let snapshot =
+            checkpoint
+                .file_contents
+                .get(path)
+                .ok_or_else(|| AftError::FileNotFound {
+                    path: path.display().to_string(),
+                })?;
+        if let Err(e) = write_restored_file(path, snapshot, &mut created_dirs) {
             let mut rollback_errors = Vec::new();
             if let Some(snapshot) = pre_restore_snapshot.get(path) {
-                if let Err(rollback_error) = restore_snapshot_file(path, snapshot.as_deref()) {
+                if let Err(rollback_error) = restore_snapshot_file(path, snapshot.as_ref()) {
                     rollback_errors.push(format!("{}: {}", path.display(), rollback_error));
                 }
             }
             for restored_path in restored_paths.iter().rev() {
                 if let Some(snapshot) = pre_restore_snapshot.get(restored_path) {
                     if let Err(rollback_error) =
-                        restore_snapshot_file(restored_path, snapshot.as_deref())
+                        restore_snapshot_file(restored_path, snapshot.as_ref())
                     {
                         rollback_errors.push(format!(
                             "{}: {}",
@@ -313,34 +410,105 @@ fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Resul
     Ok(())
 }
 
-fn restore_snapshot_file(path: &Path, content: Option<&str>) -> Result<(), AftError> {
-    match content {
-        Some(content) => write_restored_file(path, content, &mut Vec::new()),
-        None => match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(AftError::FileNotFound {
-                path: path.display().to_string(),
-            }),
-        },
+fn restore_snapshot_file(path: &Path, snapshot: Option<&CheckpointFile>) -> Result<(), AftError> {
+    match snapshot {
+        Some(snapshot) => write_restored_file(path, snapshot, &mut Vec::new()),
+        None => remove_file_if_exists(path).map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: format!("failed to remove file during checkpoint restore rollback: {error}"),
+        }),
     }
 }
 
 fn write_restored_file(
     path: &Path,
-    content: &str,
+    snapshot: &CheckpointFile,
     created_dirs: &mut Vec<PathBuf>,
 ) -> Result<(), AftError> {
+    create_parent_dirs(path, created_dirs)?;
+
+    match &snapshot.kind {
+        CheckpointFileKind::Regular { bytes } => {
+            if path_is_symlink(path) {
+                remove_file_if_exists(path).map_err(|error| AftError::IoError {
+                    path: path.display().to_string(),
+                    message: format!("failed to replace symlink with regular file: {error}"),
+                })?;
+            }
+            fs::write(path, bytes).map_err(|error| AftError::IoError {
+                path: path.display().to_string(),
+                message: format!("failed to restore checkpoint file contents: {error}"),
+            })?;
+            fs::set_permissions(path, snapshot.metadata.permissions()).map_err(|error| {
+                AftError::IoError {
+                    path: path.display().to_string(),
+                    message: format!("failed to restore checkpoint file permissions: {error}"),
+                }
+            })
+        }
+        CheckpointFileKind::Symlink {
+            target,
+            target_is_dir,
+        } => {
+            remove_file_if_exists(path).map_err(|error| AftError::IoError {
+                path: path.display().to_string(),
+                message: format!("failed to replace file with checkpoint symlink: {error}"),
+            })?;
+            create_symlink(target, path, *target_is_dir).map_err(|error| AftError::IoError {
+                path: path.display().to_string(),
+                message: format!("failed to restore checkpoint symlink: {error}"),
+            })
+        }
+    }
+}
+
+fn create_parent_dirs(path: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<(), AftError> {
     if let Some(parent) = path.parent() {
         let missing_dirs = missing_parent_dirs(parent);
-        std::fs::create_dir_all(parent).map_err(|_| AftError::FileNotFound {
-            path: path.display().to_string(),
+        fs::create_dir_all(parent).map_err(|error| AftError::IoError {
+            path: parent.display().to_string(),
+            message: format!("failed to create checkpoint restore parent directories: {error}"),
         })?;
         created_dirs.extend(missing_dirs);
     }
-    std::fs::write(path, content).map_err(|_| AftError::FileNotFound {
-        path: path.display().to_string(),
-    })
+    Ok(())
+}
+
+fn path_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path, target_is_dir: bool) -> io::Result<()> {
+    let _ = target_is_dir;
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path, target_is_dir: bool) -> io::Result<()> {
+    if target_is_dir {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_target: &Path, _link: &Path, _target_is_dir: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "checkpoint symlink restore is unsupported on this platform",
+    ))
 }
 
 fn missing_parent_dirs(parent: &Path) -> Vec<PathBuf> {
@@ -393,6 +561,12 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, content).unwrap();
         path
+    }
+
+    fn checkpoint_file(content: &str) -> CheckpointFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), content).unwrap();
+        CheckpointFile::read(file.path()).unwrap()
     }
 
     #[test]
@@ -734,6 +908,116 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_create_and_restore_use_mutation_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("locks").join("checkpoint.lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut store =
+            CheckpointStore::with_lock_path(lock_path.clone(), Duration::from_millis(50));
+        let backup_store = BackupStore::new();
+        let path = dir.path().join("locked.txt");
+        fs::write(&path, "original").unwrap();
+
+        let held_lock =
+            fs_lock::try_acquire(&lock_path, Duration::from_secs(1)).expect("hold checkpoint lock");
+        let create_result = store.create(
+            DEFAULT_SESSION_ID,
+            "locked",
+            vec![path.clone()],
+            &backup_store,
+        );
+        assert!(matches!(create_result, Err(AftError::IoError { .. })));
+        drop(held_lock);
+
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "locked",
+                vec![path.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        fs::write(&path, "changed").unwrap();
+
+        let held_lock =
+            fs_lock::try_acquire(&lock_path, Duration::from_secs(1)).expect("hold checkpoint lock");
+        let restore_result = store.restore(DEFAULT_SESSION_ID, "locked");
+        assert!(matches!(restore_result, Err(AftError::IoError { .. })));
+        drop(held_lock);
+
+        store.restore(DEFAULT_SESSION_ID, "locked").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_restore_preserves_regular_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode.txt");
+        fs::write(&path, "original").unwrap();
+        let mut original_permissions = fs::metadata(&path).unwrap().permissions();
+        original_permissions.set_mode(0o600);
+        fs::set_permissions(&path, original_permissions).unwrap();
+
+        let backup_store = BackupStore::new();
+        let mut store = CheckpointStore::new();
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "mode",
+                vec![path.clone()],
+                &backup_store,
+            )
+            .unwrap();
+
+        fs::write(&path, "changed").unwrap();
+        let mut changed_permissions = fs::metadata(&path).unwrap().permissions();
+        changed_permissions.set_mode(0o644);
+        fs::set_permissions(&path, changed_permissions).unwrap();
+
+        store.restore(DEFAULT_SESSION_ID, "mode").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        let restored_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(restored_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_restore_recreates_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        fs::write(&target, "target content").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let backup_store = BackupStore::new();
+        let mut store = CheckpointStore::new();
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "symlink",
+                vec![link.clone()],
+                &backup_store,
+            )
+            .unwrap();
+
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "plain file").unwrap();
+
+        store.restore(DEFAULT_SESSION_ID, "symlink").unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read_to_string(&link).unwrap(), "target content");
+    }
+
+    #[test]
     fn checkpoint_restore_failure_removes_created_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let missing_root = dir.path().join("created");
@@ -744,8 +1028,8 @@ mod tests {
         let checkpoint = Checkpoint {
             name: "dir-cleanup".to_string(),
             file_contents: HashMap::from([
-                (path_a.clone(), "checkpoint-a".to_string()),
-                (path_b.clone(), "checkpoint-b".to_string()),
+                (path_a.clone(), checkpoint_file("checkpoint-a")),
+                (path_b.clone(), checkpoint_file("checkpoint-b")),
             ]),
             created_at: current_timestamp(),
         };

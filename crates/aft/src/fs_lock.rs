@@ -26,6 +26,12 @@ struct LockConfig {
     poll_interval_ms: u64,
 }
 
+impl LockConfig {
+    fn cross_host_stale_heartbeat_ms(self) -> u64 {
+        self.stale_heartbeat_ms.saturating_mul(5)
+    }
+}
+
 impl Default for LockConfig {
     fn default() -> Self {
         Self {
@@ -144,6 +150,7 @@ fn acquire_with_config(
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let hostname = current_hostname();
     let mut warned_live_owner = false;
+    let mut warned_stale_live_owner = false;
 
     loop {
         if let Some(deadline) = deadline {
@@ -185,7 +192,22 @@ fn acquire_with_config(
             }
         };
 
+        let now = now_ms();
+        let since_heartbeat = now.saturating_sub(metadata.heartbeat_at_ms);
+
         if metadata.hostname != hostname {
+            let cross_host_stale_ms = config.cross_host_stale_heartbeat_ms();
+            if since_heartbeat > cross_host_stale_ms {
+                slog_warn!(
+                    "reclaiming cross-host filesystem lock at {} from host {} after stale heartbeat ({}ms > {}ms)",
+                    path.display(),
+                    metadata.hostname,
+                    since_heartbeat,
+                    cross_host_stale_ms
+                );
+                remove_lock_file(path)?;
+                continue;
+            }
             sleep_until_retry(deadline, config.poll_interval_ms)?;
             continue;
         }
@@ -200,17 +222,19 @@ fn acquire_with_config(
             continue;
         }
 
-        let now = now_ms();
-        let since_heartbeat = now.saturating_sub(metadata.heartbeat_at_ms);
-        if since_heartbeat > config.stale_heartbeat_ms {
+        if since_heartbeat > config.stale_heartbeat_ms && !warned_stale_live_owner {
+            // Same-host PID liveness is authoritative. A SIGSTOP'd process,
+            // suspended VM, or sleeping laptop can miss heartbeats and later
+            // resume inside the critical section. Breaking that lock would allow
+            // split-brain writers, so a paused live owner blocks acquirers until
+            // it resumes and releases the lock or the PID dies.
             slog_warn!(
-                "reclaiming filesystem lock at {}: PID {} is alive but heartbeat is stale ({}ms)",
+                "filesystem lock at {} held by live PID {} has stale heartbeat ({}ms); NOT breaking",
                 path.display(),
                 metadata.pid,
                 since_heartbeat
             );
-            remove_lock_file(path)?;
-            continue;
+            warned_stale_live_owner = true;
         }
 
         let held_for = now.saturating_sub(metadata.created_at_ms);
@@ -742,18 +766,18 @@ mod tests {
     }
 
     #[test]
-    fn stale_heartbeat_lock_is_reclaimed() {
+    fn stale_heartbeat_from_live_pid_blocks() {
         let (_dir, path) = test_lock_path();
         let mut metadata = current_process_metadata();
         metadata.created_at_ms = now_ms().saturating_sub(60_000);
         metadata.heartbeat_at_ms = now_ms().saturating_sub(60_000);
         write_synthetic_lock(&path, &metadata);
 
-        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
-            .expect("reclaim stale heartbeat lock");
-        let reclaimed = read_lock_metadata(&path).expect("read reclaimed lock");
-        assert_ne!(reclaimed.created_at_ms, metadata.created_at_ms);
-        drop(guard);
+        let result = acquire_with_config(&path, Some(Duration::from_millis(80)), test_config());
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert_eq!(read_lock_metadata(&path).expect("read lock"), metadata);
+
+        remove_lock_file(&path).expect("cleanup synthetic lock");
     }
 
     #[test]
@@ -781,9 +805,9 @@ mod tests {
     }
 
     #[test]
-    fn cross_host_lock_is_not_stolen() {
+    fn cross_host_lock_is_not_stolen_before_extended_stale_threshold() {
         let (_dir, path) = test_lock_path();
-        let now = now_ms().saturating_sub(60_000);
+        let now = now_ms();
         let metadata = LockMetadata {
             pid: std::process::id(),
             hostname: format!("{}-other", current_hostname()),
@@ -797,6 +821,27 @@ mod tests {
         assert_eq!(read_lock_metadata(&path).expect("read lock"), metadata);
 
         remove_lock_file(&path).expect("cleanup synthetic lock");
+    }
+
+    #[test]
+    fn stale_cross_host_lock_is_reclaimed_after_extended_threshold() {
+        let (_dir, path) = test_lock_path();
+        let stale_at =
+            now_ms().saturating_sub(test_config().cross_host_stale_heartbeat_ms() + 1_000);
+        let metadata = LockMetadata {
+            pid: std::process::id(),
+            hostname: format!("{}-other", current_hostname()),
+            created_at_ms: stale_at,
+            heartbeat_at_ms: stale_at,
+        };
+        write_synthetic_lock(&path, &metadata);
+
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
+            .expect("reclaim stale cross-host lock");
+        let reclaimed = read_lock_metadata(&path).expect("read reclaimed lock");
+        assert_eq!(reclaimed.hostname, current_hostname());
+        assert_ne!(reclaimed.created_at_ms, metadata.created_at_ms);
+        drop(guard);
     }
 
     #[test]
