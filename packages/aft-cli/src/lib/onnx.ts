@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, win32 } from "node:path";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
 
@@ -29,6 +29,34 @@ export function getManualInstallHint(): string {
   return "ONNX Runtime must be installed manually for this platform";
 }
 
+function pathEnvValue(): string {
+  return process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
+}
+
+function pathEntriesForPlatform(): string[] {
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  return pathEnvValue()
+    .split(delimiter)
+    .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+    .filter((entry) => {
+      if (!entry || entry === "." || entry.includes("\0")) return false;
+      return isAbsolute(entry) || win32.isAbsolute(entry);
+    });
+}
+
+function directoryContainsLibrary(dir: string, libName: string): boolean {
+  try {
+    const entries = readdirSync(dir);
+    if (process.platform === "win32") {
+      const expected = libName.toLowerCase();
+      return entries.some((entry) => entry.toLowerCase() === expected);
+    }
+    return entries.includes(libName);
+  } catch {
+    return false;
+  }
+}
+
 export function findSystemOnnxRuntime(): string | null {
   const libName = getOnnxLibraryName();
   const searchPaths =
@@ -36,10 +64,17 @@ export function findSystemOnnxRuntime(): string | null {
       ? ["/opt/homebrew/lib", "/usr/local/lib"]
       : process.platform === "linux"
         ? ["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/local/lib"]
-        : [];
+        : process.platform === "win32"
+          ? pathEntriesForPlatform()
+          : [];
 
+  const seen = new Set<string>();
   for (const path of searchPaths) {
-    if (existsSync(join(path, libName))) return path;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    // Doctor only probes for presence here; the plugin's actual load path uses
+    // the hardened bridge resolver in packages/aft-bridge/src/onnx-runtime.ts.
+    if (directoryContainsLibrary(path, libName)) return path;
   }
   return null;
 }

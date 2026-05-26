@@ -1,4 +1,4 @@
-import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
@@ -7,6 +7,8 @@ import { probeAftBinary } from "../lib/binary-probe.js";
 import {
   collectDiagnostics,
   type DiagnosticReport,
+  findPluginCliVersionSkews,
+  formatDiagnosticIssuesSection,
   renderDiagnosticsMarkdown,
   tailLogFile,
 } from "../lib/diagnostics.js";
@@ -120,6 +122,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     }
     log.info(`  host: ${h.hostVersion ?? "unknown version"}`);
     log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
+    log.info(`  plugin version: ${h.pluginCache.cached ?? "not installed"}`);
     if (!h.pluginRegistered) {
       log.warn("  plugin registration can be fixed with `aft setup` or `aft doctor --fix`");
     }
@@ -129,9 +132,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       log.error(`  aft config parse error: ${h.aftConfig.parseError}`);
     }
 
-    log.info(
-      `  storage: ${h.storageDir.exists ? h.storageDir.path : "(not created)"} (${formatStorageSizes(h.storageDir.sizesByKey)})`,
-    );
+    log.info(`  storage: ${formatDoctorStorageStatus(h)}`);
 
     if (h.onnxRuntime.required) {
       const parts: string[] = [];
@@ -170,6 +171,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   }
 
   if (hadProblems) {
+    logDoctorIssues(report);
     note(
       "Run `aft setup` or `aft doctor --fix` to register AFT with any harness showing `plugin registered: no`. Run `aft doctor --fix` for ONNX Runtime issues or to download a missing aft binary.",
       "Tips",
@@ -187,17 +189,7 @@ export function hasDoctorProblems(report: DiagnosticReport): boolean {
   // good." outro. Reproducer: `rm -rf ~/.cache/aft/bin && bunx --bun
   // @cortexkit/aft doctor` previously printed "AFT binary unknown" + "Binary
   // cache: 0 versions" and then "Everything looks good." at the bottom.
-  if (!report.binaryVersion) return true;
-  return report.harnesses.some((h) => {
-    if (!h.hostInstalled) return true;
-    if (!h.pluginRegistered) return true;
-    if (h.aftConfig.parseError) return true;
-    if (!h.onnxRuntime.required) return false;
-    if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) return true;
-    if (h.onnxRuntime.cachedCompatible === false) return true;
-    if (h.onnxRuntime.systemCompatible === false) return true;
-    return false;
-  });
+  return formatDiagnosticIssuesSection(report).length > 0;
 }
 
 async function runClearFlow(argv: string[]): Promise<number> {
@@ -355,7 +347,7 @@ export function clearOldBinaries(): BinaryCacheClearResult {
 }
 
 export interface DoctorFixPlanItem {
-  kind: "plugin" | "binary" | "onnx";
+  kind: "plugin" | "binary" | "onnx" | "storage";
   message: string;
 }
 
@@ -385,9 +377,21 @@ export function buildDoctorFixPlan(
   }
 
   if (!report.binaryVersion) {
+    const skews = findPluginCliVersionSkews(report);
     items.push({
       kind: "binary",
-      message: `Will download/cache the aft binary matching CLI v${report.cliVersion}`,
+      message:
+        skews.length > 0
+          ? `Will ask before caching CLI v${report.cliVersion} because the installed plugin will not use it until updated`
+          : `Will download/cache the aft binary matching CLI v${report.cliVersion}`,
+    });
+  }
+
+  for (const harness of report.harnesses) {
+    if (!harness.hostInstalled || !harness.pluginRegistered || harness.storageDir.exists) continue;
+    items.push({
+      kind: "storage",
+      message: `Will create AFT storage directory at ${harness.storageDir.path}`,
     });
   }
 
@@ -412,6 +416,13 @@ export function shouldSkipDoctorFixConfirmation(argv: string[]): boolean {
   if (argv.includes("--yes") || argv.includes("-y")) return true;
   if (argv.includes("--ci")) return true;
   return process.stdin.isTTY !== true || process.stdout.isTTY !== true;
+}
+
+export function doctorSkewBinaryDownloadDecision(argv: string[]): "prompt" | "proceed" | "skip" {
+  if (argv.includes("--yes") || argv.includes("-y")) return "proceed";
+  if (argv.includes("--ci")) return "skip";
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) return "skip";
+  return "prompt";
 }
 
 async function confirmDoctorFixPlan(
@@ -468,6 +479,7 @@ async function runFixFlow(argv: string[]): Promise<number> {
   }
 
   await fixPluginEntries(adapters);
+  const storageSummary = ensureStorageDirsForRegisteredPlugins(adapters);
 
   // GitHub #46 follow-up: download the binary if it's missing. Without this,
   // doctor would silently say "everything looks good" while the user
@@ -475,29 +487,35 @@ async function runFixFlow(argv: string[]): Promise<number> {
   // the cache (so it's idempotent if the binary was downloaded concurrently
   // by another OpenCode session) and only hits the network when needed.
   let binaryDownloaded = false;
+  let binaryDownloadSkipped = false;
   let binaryDownloadError: string | null = null;
   if (!report.binaryVersion) {
-    log.info("AFT binary not found. Downloading…");
-    try {
-      const bridgePackageName: string = "@cortexkit/aft-bridge";
-      const { ensureBinary } = (await import(bridgePackageName)) as {
-        ensureBinary: (version?: string) => Promise<string | null>;
-      };
-      const path = await ensureBinary(`v${report.cliVersion}`);
-      if (path) {
-        log.success(`AFT binary installed at ${path}`);
-        binaryDownloaded = true;
-      } else {
-        log.error(
-          "AFT binary download failed — no matching release asset on GitHub. " +
-            "Try opening any AFT-enabled session to trigger plugin-side download instead.",
-        );
-        binaryDownloadError = "no matching release asset";
+    const shouldDownload = await confirmBinaryDownloadDespitePluginSkew(report, argv);
+    if (!shouldDownload) {
+      binaryDownloadSkipped = true;
+    } else {
+      log.info("AFT binary not found. Downloading…");
+      try {
+        const bridgePackageName: string = "@cortexkit/aft-bridge";
+        const { ensureBinary } = (await import(bridgePackageName)) as {
+          ensureBinary: (version?: string) => Promise<string | null>;
+        };
+        const path = await ensureBinary(`v${report.cliVersion}`);
+        if (path) {
+          log.success(`AFT binary installed at ${path}`);
+          binaryDownloaded = true;
+        } else {
+          log.error(
+            "AFT binary download failed — no matching release asset on GitHub. " +
+              "Try opening any AFT-enabled session to trigger plugin-side download instead.",
+          );
+          binaryDownloadError = "no matching release asset";
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(`AFT binary download failed: ${message}`);
+        binaryDownloadError = message;
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log.error(`AFT binary download failed: ${message}`);
-      binaryDownloadError = message;
     }
   }
 
@@ -508,7 +526,14 @@ async function runFixFlow(argv: string[]): Promise<number> {
   // combination of: ONNX fix attempted/skipped/failed, binary
   // downloaded/skipped/failed, plus pre-existing harness issues left over
   // that this --fix run can't remediate (plugin entry, host install, etc).
-  if (onnxResult === null && !binaryDownloaded && !binaryDownloadError) {
+  if (
+    onnxResult === null &&
+    !binaryDownloaded &&
+    !binaryDownloadSkipped &&
+    !binaryDownloadError &&
+    storageSummary.created === 0 &&
+    storageSummary.errors === 0
+  ) {
     log.info("No auto-fixable issues detected.");
     note(
       "If you're still seeing 'Semantic Index: failed' in the TUI sidebar, run " +
@@ -521,7 +546,10 @@ async function runFixFlow(argv: string[]): Promise<number> {
     return stillHasProblems ? 1 : 0;
   }
 
-  const hadErrors = (onnxResult?.errors.length ?? 0) > 0 || binaryDownloadError !== null;
+  const hadErrors =
+    (onnxResult?.errors.length ?? 0) > 0 ||
+    binaryDownloadError !== null ||
+    storageSummary.errors > 0;
   const afterReport = await collectDiagnostics(adapters);
   const stillHasProblems = hasDoctorProblems(afterReport);
   outro(
@@ -532,6 +560,88 @@ async function runFixFlow(argv: string[]): Promise<number> {
         : "Done.",
   );
   return hadErrors || stillHasProblems ? 1 : 0;
+}
+
+function logDoctorIssues(report: DiagnosticReport): void {
+  const lines = formatDiagnosticIssuesSection(report);
+  if (lines.length === 0) return;
+
+  log.warn(lines[0]);
+  for (let i = 1; i < lines.length; i += 2) {
+    const issue = lines[i];
+    const remediation = lines[i + 1];
+    if (issue.startsWith("[HIGH]")) {
+      log.error(issue);
+    } else {
+      log.warn(issue);
+    }
+    if (remediation) log.warn(remediation);
+  }
+}
+
+export function formatDoctorStorageStatus(h: DiagnosticReport["harnesses"][number]): string {
+  const state = h.storageDir.exists
+    ? h.storageDir.path
+    : `${h.storageDir.path} (${h.pluginRegistered ? "not yet created (lazy — created on first tool call)" : "not created"})`;
+  return `${state} (${formatStorageSizes(h.storageDir.sizesByKey)})`;
+}
+
+async function confirmBinaryDownloadDespitePluginSkew(
+  report: DiagnosticReport,
+  argv: string[],
+): Promise<boolean> {
+  const skews = findPluginCliVersionSkews(report);
+  if (skews.length === 0) return true;
+
+  log.warn("Plugin/CLI version mismatch detected before binary download:");
+  for (const skew of skews) {
+    log.warn(`  ${skew.scope}: ${skew.message}`);
+    log.warn(`  ${skew.remediation}`);
+  }
+  log.warn(
+    "A newly cached binary will not be used by the older plugin until the plugin is updated.",
+  );
+
+  const decision = doctorSkewBinaryDownloadDecision(argv);
+  if (decision === "proceed") {
+    log.info("Proceeding because --yes/-y was provided.");
+    return true;
+  }
+  if (decision === "skip") {
+    log.info(
+      "Skipped binary download. Update the plugin to @latest, then rerun `aft doctor --fix`.",
+    );
+    return false;
+  }
+  return confirm(
+    "Download/cache the CLI-matching binary anyway for after you update the plugin?",
+    false,
+  );
+}
+
+function ensureStorageDirsForRegisteredPlugins(adapters: HarnessAdapter[]): {
+  created: number;
+  errors: number;
+} {
+  const summary = { created: 0, errors: 0 };
+
+  for (const adapter of adapters) {
+    try {
+      if (!adapter.isInstalled() || !adapter.hasPluginEntry()) continue;
+      const storageDir = adapter.getStorageDir();
+      if (existsSync(storageDir)) continue;
+      mkdirSync(storageDir, { recursive: true });
+      summary.created += 1;
+      log.success(`${adapter.displayName}: created AFT storage directory at ${storageDir}`);
+    } catch (err) {
+      summary.errors += 1;
+      log.error(
+        `${adapter.displayName}: failed to create AFT storage directory: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return summary;
 }
 
 async function clearPluginCache(

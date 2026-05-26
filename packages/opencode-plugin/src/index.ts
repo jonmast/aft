@@ -23,7 +23,7 @@ import {
 } from "./bg-notifications.js";
 import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
-import { bridgeLogger, error, log, warn } from "./logger.js";
+import { bridgeLogger, debug, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
 import {
   abortInFlightGithubInstalls,
@@ -587,11 +587,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   void probeServerReachable(input.serverUrl?.toString())
     .then((reachable) => {
       setLiveServerWakeAvailable(reachable);
-      log(
-        reachable
-          ? "Live OpenCode HTTP listener reachable; bg-notifications wake path = live-server (anomalyco/opencode#28202 workaround active)."
-          : "Live OpenCode HTTP listener unreachable; bg-notifications wake path = in-process-fallback. Wakes will still arrive but the upstream duplicate-runner bug (anomalyco/opencode#28202) is not worked around. Launch with `opencode --port 0` in TUI mode to activate the workaround.",
-      );
+      if (reachable) {
+        log(
+          "Live OpenCode HTTP listener reachable; bg-notifications wake path = live-server (anomalyco/opencode#28202 workaround active).",
+        );
+      } else {
+        // Normal OpenCode TUI flow: the optional live HTTP listener is absent,
+        // so bg-notifications uses the reliable in-process wake path. Keep the
+        // duplicate-runner workaround nudge in DEBUG instead of surfacing it as
+        // a user-actionable warning.
+        debug(
+          "Live OpenCode HTTP listener unreachable; bg-notifications wake path = in-process-fallback. Wakes will still arrive but the upstream duplicate-runner bug (anomalyco/opencode#28202) is not worked around. Launch with `opencode --port 0` in TUI mode to activate the workaround.",
+        );
+      }
     })
     .catch(() => {
       // Probe failures stay on the safe default (in-process fallback).

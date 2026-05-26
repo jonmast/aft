@@ -73,6 +73,10 @@ export function log(message: string, data?: unknown): void {
   write("INFO", message, data);
 }
 
+export function debug(message: string, data?: unknown): void {
+  write("DEBUG", message, data);
+}
+
 export function warn(message: string, data?: unknown): void {
   write("WARN", message, data);
 }
@@ -89,6 +93,10 @@ export function error(message: string, data?: unknown): void {
  */
 export function sessionLog(sessionId: string | undefined, message: string, data?: unknown): void {
   write("INFO", message, data, sessionId);
+}
+
+export function sessionDebug(sessionId: string | undefined, message: string, data?: unknown): void {
+  write("DEBUG", message, data, sessionId);
 }
 
 export function sessionWarn(sessionId: string | undefined, message: string, data?: unknown): void {

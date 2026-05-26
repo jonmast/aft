@@ -6,6 +6,8 @@ import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js"
 import {
   buildDoctorFixPlan,
   type DoctorFixPlanItem,
+  doctorSkewBinaryDownloadDecision,
+  formatDoctorStorageStatus,
   shouldSkipDoctorFixConfirmation,
 } from "./doctor.js";
 
@@ -125,5 +127,66 @@ describe("doctor --fix planning", () => {
   test("skips the confirmation prompt for explicit automation flags", () => {
     expect(shouldSkipDoctorFixConfirmation(["--yes"])).toBe(true);
     expect(shouldSkipDoctorFixConfirmation(["--ci"])).toBe(true);
+  });
+
+  test("warns that a skewed plugin will not use a freshly cached CLI binary", () => {
+    const report = makeReport(
+      [
+        makeHarness({
+          pluginCache: {
+            path: "/tmp/aft-test/plugin-cache",
+            exists: true,
+            cached: "0.29.1",
+            latest: "0.30.3",
+          },
+        }),
+      ],
+      null,
+    );
+    report.cliVersion = "0.30.3";
+
+    const plan = buildDoctorFixPlan([makeAdapter()], report);
+
+    expect(messages(plan)).toContain(
+      "Will ask before caching CLI v0.30.3 because the installed plugin will not use it until updated",
+    );
+  });
+
+  test("plans lazy storage directory creation only for registered plugins", () => {
+    const report = makeReport(
+      [
+        makeHarness({
+          storageDir: { path: "/tmp/aft-test/storage", exists: false, sizesByKey: {} },
+        }),
+      ],
+      "0.30.1",
+    );
+
+    const plan = buildDoctorFixPlan([makeAdapter()], report);
+
+    expect(messages(plan)).toContain("Will create AFT storage directory at /tmp/aft-test/storage");
+  });
+});
+
+describe("doctor skew download prompt decision", () => {
+  test("defaults to skipping skewed binary downloads in non-interactive runs", () => {
+    expect(doctorSkewBinaryDownloadDecision([])).toBe("skip");
+    expect(doctorSkewBinaryDownloadDecision(["--ci"])).toBe("skip");
+    expect(doctorSkewBinaryDownloadDecision(["--yes"])).toBe("proceed");
+  });
+});
+
+describe("doctor storage wording", () => {
+  test("explains registered-plugin storage is lazy-created", () => {
+    expect(formatDoctorStorageStatus(makeHarness())).toContain(
+      "not yet created (lazy — created on first tool call)",
+    );
+  });
+
+  test("keeps plain not-created wording when the plugin is not registered", () => {
+    const text = formatDoctorStorageStatus(makeHarness({ pluginRegistered: false }));
+
+    expect(text).toContain("not created");
+    expect(text).not.toContain("lazy");
   });
 });

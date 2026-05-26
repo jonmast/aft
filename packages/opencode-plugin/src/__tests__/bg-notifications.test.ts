@@ -13,10 +13,15 @@ const sessionLogSpy = mock(
 const sessionWarnSpy = mock(
   (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
 );
+const sessionDebugSpy = mock(
+  (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
+);
 mock.module("../logger.js", () => ({
   sessionLog: sessionLogSpy,
+  sessionDebug: sessionDebugSpy,
   sessionWarn: sessionWarnSpy,
   log: () => {},
+  debug: () => {},
   warn: () => {},
   error: () => {},
   sessionError: () => {},
@@ -165,6 +170,7 @@ const TEST_SERVER_URL = "http://127.0.0.1:0/";
 
 beforeEach(() => {
   sessionLogSpy.mockClear();
+  sessionDebugSpy.mockClear();
   sessionWarnSpy.mockClear();
   liveServerClient = null;
   lastLiveServerArgs = null;
@@ -213,6 +219,10 @@ function makeClient(
 /** Helper: extract the structured data argument from the first matching trace event. */
 function findTraceEvent(eventName: string): Record<string, unknown> | undefined {
   for (const call of sessionLogSpy.mock.calls) {
+    const data = call[2] as { event?: string } | undefined;
+    if (data?.event === eventName) return data as Record<string, unknown>;
+  }
+  for (const call of sessionDebugSpy.mock.calls) {
     const data = call[2] as { event?: string } | undefined;
     if (data?.event === eventName) return data as Record<string, unknown>;
   }
@@ -1101,6 +1111,17 @@ describe("OpenCode background notifications", () => {
     expect(perUrlAvailability.get(normalizeServerUrl(TEST_SERVER_URL))).toBe(false);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+
+    const warnEvents = sessionWarnSpy.mock.calls.map(
+      (call) => (call[2] as { event?: string } | undefined)?.event,
+    );
+    const debugEvents = sessionDebugSpy.mock.calls.map(
+      (call) => (call[2] as { event?: string } | undefined)?.event,
+    );
+    expect(debugEvents).toContain("bash_completion_wake_prompt_async_error");
+    expect(debugEvents).toContain("bash_completion_wake_live_server_fallback");
+    expect(warnEvents).not.toContain("bash_completion_wake_prompt_async_error");
+    expect(warnEvents).not.toContain("bash_completion_wake_live_server_fallback");
 
     trackBgTask("s1", "task-2");
     await handleIdleBgCompletions({

@@ -272,6 +272,23 @@ describe("doctor problem assessment", () => {
     expect(hasDoctorProblems(report)).toBe(true);
   });
 
+  test("plugin older than the CLI is treated as a high-priority problem", () => {
+    const report = makeReport(
+      makeHarness({
+        pluginCache: {
+          path: "/tmp/aft-test/plugin-cache",
+          exists: true,
+          cached: "0.29.1",
+          latest: "0.30.3",
+        },
+      }),
+    );
+    report.cliVersion = "0.30.3";
+    report.binaryVersion = "0.30.3";
+
+    expect(hasDoctorProblems(report)).toBe(true);
+  });
+
   test("present binary alongside a clean harness is not a problem", () => {
     const report = makeReport(makeHarness({ pluginRegistered: true }));
     // baseline: binaryVersion is "0.0.0-test", everything else green

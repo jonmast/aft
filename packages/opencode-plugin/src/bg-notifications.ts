@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { sessionLog, sessionWarn } from "./logger.js";
+import { sessionDebug, sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import {
   getLiveServerClient,
@@ -604,7 +604,8 @@ async function triggerWakeIfPending(
           // MAX_WAKE_SEND_ATTEMPTS by the catch in scheduleWake unless a
           // live-server failure can be delivered by the in-process fallback
           // below. Re-throw so the retry/fallback path runs.
-          sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
+          const logPromptError = clientPath === "live-server" ? sessionDebug : sessionWarn;
+          logPromptError(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
             event: "bash_completion_wake_prompt_async_error",
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
@@ -648,7 +649,11 @@ async function triggerWakeIfPending(
           return;
         } catch (err) {
           setLiveServerWakeAvailable(drainContext.serverUrl, false);
-          sessionWarn(
+          // Falling back from live-server to the in-process client is the
+          // expected safe path when the optional duplicate-runner workaround is
+          // unavailable. Keep it DEBUG; the scheduler emits WARN only if no
+          // transport ultimately delivers the wake.
+          sessionDebug(
             drainContext.sessionID,
             `${LOG_PREFIX} live-server wake failed; falling back`,
             {

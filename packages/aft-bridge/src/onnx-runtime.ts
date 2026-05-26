@@ -53,7 +53,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
@@ -415,6 +415,34 @@ function isOnnxVersionCompatible(version: string): boolean {
   return minor >= REQUIRED_ORT_MIN_MINOR;
 }
 
+function pathEnvValue(): string {
+  return process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
+}
+
+function pathEntriesForPlatform(): string[] {
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  return pathEnvValue()
+    .split(delimiter)
+    .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+    .filter((entry) => {
+      if (!entry || entry === "." || entry.includes("\0")) return false;
+      return isAbsolute(entry) || win32.isAbsolute(entry);
+    });
+}
+
+function directoryContainsLibrary(dir: string, libName: string): boolean {
+  try {
+    const entries = readdirSync(dir);
+    if (process.platform === "win32") {
+      const expected = libName.toLowerCase();
+      return entries.some((entry) => entry.toLowerCase() === expected);
+    }
+    return entries.includes(libName);
+  } catch {
+    return false;
+  }
+}
+
 function findSystemOnnxRuntime(libName?: string): string | null {
   if (!libName) return null;
 
@@ -430,10 +458,23 @@ function findSystemOnnxRuntime(libName?: string): string | null {
       "/usr/lib/aarch64-linux-gnu",
       "/usr/local/lib",
     );
+  } else if (process.platform === "win32") {
+    // Windows users often install ONNX Runtime via Scoop or a manual zip and
+    // put the directory containing `onnxruntime.dll` on PATH. We only consider
+    // absolute PATH entries (never the current directory or relative paths).
+    // Returning one of those directories means the plugin may pass it to Rust
+    // as the ORT DLL directory; that mirrors Windows loader semantics for a
+    // user-controlled PATH while avoiding accidental current-dir DLL loads.
+    // Doctor-only probes may be looser, but the bridge path can become a real
+    // load path and should stay conservative.
+    searchPaths.push(...pathEntriesForPlatform());
   }
 
+  const seen = new Set<string>();
   for (const dir of searchPaths) {
-    if (!existsSync(join(dir, libName))) continue;
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    if (!directoryContainsLibrary(dir, libName)) continue;
 
     // Reject system installs that the Rust pre-validator will refuse. Without
     // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu

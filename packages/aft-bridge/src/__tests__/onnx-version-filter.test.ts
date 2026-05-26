@@ -21,15 +21,31 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __onnxTest__ } from "../index.js";
+import { withEnv } from "./test-utils/env-guard.js";
 
-const { detectOnnxVersion, isOnnxVersionCompatible, REQUIRED_ORT_MAJOR, REQUIRED_ORT_MIN_MINOR } =
-  __onnxTest__;
+const {
+  detectOnnxVersion,
+  findSystemOnnxRuntime,
+  isOnnxVersionCompatible,
+  REQUIRED_ORT_MAJOR,
+  REQUIRED_ORT_MIN_MINOR,
+} = __onnxTest__;
 
 let workDir: string;
+
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { configurable: true, value: platform });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, "platform", descriptor);
+  }
+}
 
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "aft-onnx-version-filter-"));
@@ -155,5 +171,50 @@ describe("findSystemOnnxRuntime (Linux paths)", () => {
   test("filter contract: detect + compat must reject v1.9 and accept v1.24", () => {
     expect(isOnnxVersionCompatible("1.9.0")).toBe(false);
     expect(isOnnxVersionCompatible("1.24.4")).toBe(true);
+  });
+});
+
+describe("findSystemOnnxRuntime (Windows PATH)", () => {
+  test("finds onnxruntime.dll in PATH directories on Windows", async () => {
+    const missingDir = join(workDir, "missing");
+    const runtimeDir = join(workDir, "scoop", "onnxruntime", "bin");
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "onnxruntime.dll"), "binary");
+
+    await withEnv(
+      { PATH: `${missingDir};${runtimeDir}`, Path: undefined, path: undefined },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBe(runtimeDir);
+      },
+    );
+  });
+
+  test("ignores non-existent PATH directories without throwing", async () => {
+    await withEnv(
+      {
+        PATH: `${join(workDir, "missing-a")};${join(workDir, "missing-b")}`,
+        Path: undefined,
+        path: undefined,
+      },
+      async () => {
+        const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+        expect(found).toBeNull();
+      },
+    );
+  });
+
+  test("matches mixed-case ONNX Runtime DLL names case-insensitively", async () => {
+    const runtimeDir = join(workDir, "manual-install");
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "OnNxRuNtImE.DlL"), "binary");
+
+    await withEnv({ PATH: runtimeDir, Path: undefined, path: undefined }, async () => {
+      const found = withPlatform("win32", () => findSystemOnnxRuntime("onnxruntime.dll"));
+
+      expect(found).toBe(runtimeDir);
+    });
   });
 });

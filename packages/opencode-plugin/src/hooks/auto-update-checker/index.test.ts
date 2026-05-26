@@ -23,6 +23,7 @@ const cacheMocks = {
 
 mock.module("../../logger.js", () => ({
   log: logMock,
+  debug: mock(() => {}),
   warn: warnMock,
   error: mock(() => {}),
 }));

@@ -57,6 +57,23 @@ export function getAftLspBinariesDir(): string {
   return join(base, "aft", "lsp-binaries");
 }
 
+function homeDir(): string {
+  if (process.platform === "win32") return process.env.USERPROFILE || process.env.HOME || homedir();
+  return process.env.HOME || homedir();
+}
+
+function dataHome(): string {
+  if (process.env.XDG_DATA_HOME) return process.env.XDG_DATA_HOME;
+  if (process.platform === "win32") {
+    return process.env.LOCALAPPDATA || process.env.APPDATA || join(homeDir(), "AppData", "Local");
+  }
+  return join(homeDir(), ".local", "share");
+}
+
+export function getCortexKitStorageRoot(): string {
+  return join(dataHome(), "cortexkit", "aft");
+}
+
 /** Resolve the plugin log file path. Shared with the plugin's logger. */
 export function getTmpLogPath(filename: string): string {
   return join(tmpdir(), filename);

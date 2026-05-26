@@ -5,7 +5,7 @@ import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
-import { getTmpLogPath } from "../lib/paths.js";
+import { getCortexKitStorageRoot, getTmpLogPath } from "../lib/paths.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import type {
   HarnessAdapter,
@@ -219,8 +219,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
   }
 
   getStorageDir(): string {
-    const xdg = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-    return join(xdg, "opencode", "storage", "plugin", "aft");
+    return getCortexKitStorageRoot();
   }
 
   getLogFile(): string {

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 
 mock.module("../../logger.js", () => ({
   log: mock(() => {}),
+  debug: mock(() => {}),
   warn: mock(() => {}),
   error: mock(() => {}),
 }));

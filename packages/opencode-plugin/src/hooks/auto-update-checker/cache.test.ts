@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 
 mock.module("../../logger.js", () => ({
   log: mock(() => {}),
+  debug: mock(() => {}),
   warn: mock(() => {}),
   error: mock(() => {}),
 }));
