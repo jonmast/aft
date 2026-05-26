@@ -174,4 +174,110 @@ describe("reading tool adapters", () => {
     expect(externalAsks[0]?.patterns).toEqual([join(externalRoot, "*").replaceAll("\\", "/")]);
     expect(sendCalls[0]?.params).toMatchObject({ target: [first, second], files: true });
   });
+
+  test("aft_zoom targets array fans out one zoom request per entry across different files", async () => {
+    const root = await tempProject();
+    const { sendCalls, tools } = createMockReadingHarness((_command, params) => {
+      const file = params.file as string;
+      const symbol = params.symbol as string;
+      return {
+        success: true,
+        name: symbol,
+        kind: "function",
+        range: { start_line: 10, end_line: 20 },
+        content: `// body of ${symbol} from ${file}\n`,
+      };
+    });
+
+    const result = (await tools.aft_zoom.execute(
+      {
+        targets: [
+          { filePath: "src/a.ts", symbol: "foo" },
+          { filePath: "src/b.ts", symbol: "bar" },
+        ],
+      },
+      createMockSdkContext(root),
+    )) as string;
+
+    expect(sendCalls).toHaveLength(2);
+    expect(sendCalls[0]?.command).toBe("zoom");
+    expect(sendCalls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
+    expect(sendCalls[1]?.command).toBe("zoom");
+    expect(sendCalls[1]?.params).toMatchObject({ file: "src/b.ts", symbol: "bar" });
+    // Each section uses its OWN filePath as the header label, not a shared one.
+    expect(result).toContain("src/a.ts:10-20 [function foo]");
+    expect(result).toContain("src/b.ts:10-20 [function bar]");
+  });
+
+  test("aft_zoom targets renders per-entry failure with the right file label", async () => {
+    const root = await tempProject();
+    const { tools } = createMockReadingHarness((_command, params) => {
+      if (params.symbol === "missing") {
+        return {
+          success: false,
+          code: "symbol_not_found",
+          message: "symbol 'missing' not found",
+        };
+      }
+      return {
+        success: true,
+        name: params.symbol as string,
+        kind: "function",
+        range: { start_line: 1, end_line: 2 },
+        content: "ok\n",
+      };
+    });
+
+    const text = (await tools.aft_zoom.execute(
+      {
+        targets: [
+          { filePath: "src/a.ts", symbol: "ok" },
+          { filePath: "src/b.ts", symbol: "missing" },
+        ],
+      },
+      createMockSdkContext(root),
+    )) as string;
+
+    expect(text).toContain("Incomplete zoom results");
+    expect(text).toContain('Symbol "missing" not found in src/b.ts:');
+    expect(text).toContain("src/a.ts:1-2 [function ok]");
+  });
+
+  test("aft_zoom targets is mutually exclusive with filePath/symbol/symbols/url", async () => {
+    const root = await tempProject();
+    const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+
+    await expect(
+      tools.aft_zoom.execute(
+        {
+          targets: [{ filePath: "src/a.ts", symbol: "foo" }],
+          filePath: "src/a.ts",
+          symbol: "foo",
+        },
+        createMockSdkContext(root),
+      ),
+    ).rejects.toThrow(/mutually exclusive/);
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  test("aft_zoom targets rejects empty filePath/symbol entries", async () => {
+    const root = await tempProject();
+    const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+
+    await expect(
+      tools.aft_zoom.execute(
+        { targets: [{ filePath: "src/a.ts", symbol: "" }] },
+        createMockSdkContext(root),
+      ),
+    ).rejects.toThrow(/targets\[0\]\.symbol/);
+
+    await expect(
+      tools.aft_zoom.execute(
+        { targets: [{ filePath: "", symbol: "x" }] },
+        createMockSdkContext(root),
+      ),
+    ).rejects.toThrow(/targets\[0\]\.filePath/);
+
+    expect(sendCalls).toHaveLength(0);
+  });
 });

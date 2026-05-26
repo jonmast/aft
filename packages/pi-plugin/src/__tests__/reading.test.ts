@@ -125,4 +125,74 @@ describe("reading tool adapters", () => {
     ).rejects.toThrow("not both");
     expect(calls).toHaveLength(0);
   });
+
+  test("aft_zoom targets array fans out one zoom request per entry across different files", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      name: params.symbol as string,
+      kind: "function",
+      range: { start_line: 10, end_line: 20 },
+      content: `// body of ${params.symbol} from ${params.file}\n`,
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    const result = (await executeTool(tools.get("aft_zoom")!, {
+      targets: [
+        { filePath: "src/a.ts", symbol: "foo" },
+        { filePath: "src/b.ts", symbol: "bar" },
+      ],
+    })) as { content: Array<{ text: string }> };
+
+    expect(calls.map((call) => call.params)).toEqual([
+      { file: "src/a.ts", symbol: "foo" },
+      { file: "src/b.ts", symbol: "bar" },
+    ]);
+    // Each section uses its own filePath as the header label.
+    expect(result.content[0].text).toContain("src/a.ts:10-20 [function foo]");
+    expect(result.content[0].text).toContain("src/b.ts:10-20 [function bar]");
+  });
+
+  test("aft_zoom targets renders per-entry failure with the right file label", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge((_command, params) => {
+      if (params.symbol === "missing") {
+        return { success: false, message: "symbol 'missing' not found" };
+      }
+      return {
+        success: true,
+        name: params.symbol as string,
+        kind: "function",
+        range: { start_line: 1, end_line: 2 },
+        content: "ok\n",
+      };
+    });
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    const result = (await executeTool(tools.get("aft_zoom")!, {
+      targets: [
+        { filePath: "src/a.ts", symbol: "ok" },
+        { filePath: "src/b.ts", symbol: "missing" },
+      ],
+    })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toContain("Incomplete zoom results");
+    expect(result.content[0].text).toContain('Symbol "missing" not found in src/b.ts:');
+    expect(result.content[0].text).toContain("src/a.ts:1-2 [function ok]");
+  });
+
+  test("aft_zoom targets is mutually exclusive with filePath/symbol/symbols/url", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge();
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    await expect(
+      executeTool(tools.get("aft_zoom")!, {
+        targets: [{ filePath: "src/a.ts", symbol: "foo" }],
+        filePath: "src/a.ts",
+        symbol: "foo",
+      }),
+    ).rejects.toThrow(/mutually exclusive/);
+    expect(calls).toHaveLength(0);
+  });
 });

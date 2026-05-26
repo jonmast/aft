@@ -135,3 +135,77 @@ export function formatZoomText(targetLabel: string, response: ZoomResponseLike):
 
   return out.join("\n");
 }
+
+/**
+ * Per-target entry for {@link formatZoomMultiTargetResult}.
+ *
+ * `targetLabel` is what the agent passed in (filePath or url) and is used for
+ * the per-section header.
+ * `name` is the symbol the agent asked for (used in the failure-line wording).
+ * `response` is the Rust zoom response (may be `success: false` on failure).
+ */
+export interface ZoomMultiTargetEntry {
+  targetLabel: string;
+  name: string;
+  response: { success?: boolean; message?: unknown } & Record<string, unknown>;
+}
+
+/** Single rendered entry from a multi-target zoom call. */
+export interface ZoomMultiTargetSymbolResult {
+  targetLabel: string;
+  name: string;
+  success: boolean;
+  content?: string;
+  error?: string;
+}
+
+/** Aggregate result of a multi-target zoom call. */
+export interface ZoomMultiTargetResult {
+  complete: boolean;
+  entries: ZoomMultiTargetSymbolResult[];
+  text: string;
+}
+
+/**
+ * Format multi-target zoom results as plain text. Each successful entry uses
+ * {@link formatZoomText} with its OWN `targetLabel` (so cross-file batches
+ * still show the right file path in each section). Failures render as
+ * `Symbol "name" not found in <file>: <reason>`.
+ *
+ * Sections are blank-line separated and output is byte-identical across hosts.
+ */
+export function formatZoomMultiTargetResult(
+  entries: ZoomMultiTargetEntry[],
+): ZoomMultiTargetResult {
+  const rendered = entries.map((entry): ZoomMultiTargetSymbolResult => {
+    const { targetLabel, name, response } = entry;
+    if (response.success === false) {
+      const message =
+        typeof response.message === "string" && response.message.length > 0
+          ? response.message
+          : "zoom failed";
+      return { targetLabel, name, success: false, error: message };
+    }
+    return {
+      targetLabel,
+      name,
+      success: true,
+      content: formatZoomText(targetLabel, response as ZoomResponseLike),
+    };
+  });
+  const complete = rendered.every((entry) => entry.success);
+  const sections: string[] = [];
+  if (!complete) {
+    sections.push("Incomplete zoom results: one or more symbols failed.");
+  }
+  for (const entry of rendered) {
+    if (entry.success) {
+      sections.push(entry.content ?? "");
+    } else {
+      sections.push(
+        `Symbol "${entry.name}" not found in ${entry.targetLabel}: ${entry.error ?? "zoom failed"}`,
+      );
+    }
+  }
+  return { complete, entries: rendered, text: sections.join("\n\n") };
+}

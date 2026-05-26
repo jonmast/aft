@@ -5,7 +5,7 @@
 
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { formatZoomText } from "@cortexkit/aft-bridge";
+import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
@@ -37,6 +37,11 @@ const OutlineParams = Type.Object({
   ),
 });
 
+const ZoomTarget = Type.Object({
+  filePath: Type.String({ description: "Path to file (absolute or project-relative)" }),
+  symbol: Type.String({ description: "Symbol name in that file" }),
+});
+
 const ZoomParams = Type.Object({
   filePath: Type.Optional(
     Type.String({ description: "Path to file (absolute or project-relative)" }),
@@ -50,7 +55,15 @@ const ZoomParams = Type.Object({
     Type.String({ description: "Symbol name (function/class/type) or Markdown heading" }),
   ),
   symbols: Type.Optional(
-    Type.Array(Type.String(), { description: "Multiple symbols — returns array of matches" }),
+    Type.Array(Type.String(), {
+      description: "Multiple symbols in the same file/URL — returns array of matches",
+    }),
+  ),
+  targets: Type.Optional(
+    Type.Array(ZoomTarget, {
+      description:
+        "Array of {filePath, symbol} pairs for batched zoom across DIFFERENT files. Mutually exclusive with filePath/url/symbol/symbols.",
+    }),
   ),
   contextLines: Type.Optional(
     Type.Number({ description: "Lines of context before/after (default: 3)" }),
@@ -360,7 +373,7 @@ export function registerReadingTools(
       name: "aft_zoom",
       label: "zoom",
       description:
-        "Inspect a code symbol or Markdown/HTML section. For code, returns the full source of the symbol with call-graph annotations (calls/called-by). Pass `symbols` for batched lookups.\n\nProvide exactly ONE of `filePath` or `url`.",
+        "Inspect a code symbol or Markdown/HTML section. For code, returns the full source of the symbol with call-graph annotations (calls/called-by).\n\nModes (provide ONE):\n  • `filePath` (or `url`) + `symbol` — single symbol in one file/URL\n  • `filePath` (or `url`) + `symbols` — multiple symbols, all in the same file/URL\n  • `targets` — multiple symbols from DIFFERENT files: `[{ filePath, symbol }, ...]`",
       parameters: ZoomParams,
       async execute(
         _toolCallId: string,
@@ -372,9 +385,49 @@ export function registerReadingTools(
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const hasFilePath = typeof params.filePath === "string" && params.filePath.length > 0;
         const hasUrl = typeof params.url === "string" && params.url.length > 0;
+        const hasTargets = Array.isArray(params.targets) && params.targets.length > 0;
+        const hasSymbol = typeof params.symbol === "string" && params.symbol.length > 0;
+        const hasSymbols = Array.isArray(params.symbols) && params.symbols.length > 0;
+
+        // Multi-target mode (different files). Mutually exclusive with the
+        // other modes so the agent doesn't accidentally provide overlapping
+        // inputs that get silently ignored.
+        if (hasTargets) {
+          if (hasFilePath || hasUrl || hasSymbol || hasSymbols) {
+            throw new Error(
+              "'targets' is mutually exclusive with 'filePath', 'url', 'symbol', and 'symbols'",
+            );
+          }
+          const targets = params.targets as Array<{ filePath: string; symbol: string }>;
+          for (const [i, entry] of targets.entries()) {
+            if (typeof entry.filePath !== "string" || entry.filePath.length === 0) {
+              throw new Error(`targets[${i}].filePath must be a non-empty string`);
+            }
+            if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
+              throw new Error(`targets[${i}].symbol must be a non-empty string`);
+            }
+          }
+          const responses = await Promise.all(
+            targets.map((t) => {
+              const req: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
+              if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+              return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
+                success: false,
+                message: err instanceof Error ? err.message : String(err),
+              }));
+            }),
+          );
+          const entries = targets.map((t, i) => ({
+            targetLabel: t.filePath,
+            name: t.symbol,
+            response: responses[i] ?? { success: false, message: "missing zoom response" },
+          }));
+          const batch = formatZoomMultiTargetResult(entries);
+          return textResult(batch.text, batch);
+        }
 
         if (!hasFilePath && !hasUrl) {
-          throw new Error("Provide exactly one of 'filePath' or 'url'");
+          throw new Error("Provide exactly one of 'filePath', 'url', or 'targets'");
         }
         if (hasFilePath && hasUrl) {
           throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
@@ -390,9 +443,10 @@ export function registerReadingTools(
         // Uses callBridge (not bridge.send directly) so each parallel request
         // carries Pi's native session_id — otherwise multi-symbol zoom would
         // bypass per-session undo/checkpoint scoping.
-        if (Array.isArray(params.symbols) && params.symbols.length > 0) {
+        if (hasSymbols && params.symbols) {
+          const symbolsList = params.symbols;
           const results = await Promise.all(
-            params.symbols.map((sym) => {
+            symbolsList.map((sym) => {
               const req: Record<string, unknown> = { file, symbol: sym };
               if (params.contextLines !== undefined) req.context_lines = params.contextLines;
               return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({

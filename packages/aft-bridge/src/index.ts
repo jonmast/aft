@@ -75,5 +75,10 @@ export type {
 } from "./protocol.js";
 export { findBinary, findBinarySync, platformKey } from "./resolver.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
-export type { ZoomResponseLike } from "./zoom-format.js";
-export { formatZoomText } from "./zoom-format.js";
+export type {
+  ZoomMultiTargetEntry,
+  ZoomMultiTargetResult,
+  ZoomMultiTargetSymbolResult,
+  ZoomResponseLike,
+} from "./zoom-format.js";
+export { formatZoomMultiTargetResult, formatZoomText } from "./zoom-format.js";

@@ -1,5 +1,5 @@
 import { dirname, resolve } from "node:path";
-import { formatZoomText } from "@cortexkit/aft-bridge";
+import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -156,7 +156,10 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     aft_zoom: {
       description:
         "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\n" +
-        "Provide exactly ONE of 'filePath' or 'url'. Pass either 'symbol' for a single lookup or 'symbols' for multiple in one call.",
+        "Modes (provide ONE):\n" +
+        "  • `filePath` (or `url`) + `symbol` — single symbol in one file/URL\n" +
+        "  • `filePath` (or `url`) + `symbols` — multiple symbols, all in the same file/URL\n" +
+        "  • `targets` — multiple symbols from DIFFERENT files in one call: `[{ filePath, symbol }, ...]`",
       args: {
         filePath: z
           .string()
@@ -173,7 +176,20 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         symbols: z
           .array(z.string())
           .optional()
-          .describe("Array of symbol names or heading texts for a single batched call"),
+          .describe(
+            "Array of symbol names or heading texts (all in the same file/URL) for a batched call",
+          ),
+        targets: z
+          .array(
+            z.object({
+              filePath: z.string().describe("Path to file (absolute or relative to project root)"),
+              symbol: z.string().describe("Symbol name in that file"),
+            }),
+          )
+          .optional()
+          .describe(
+            "Array of {filePath, symbol} pairs for batched zoom across DIFFERENT files. Mutually exclusive with filePath/url/symbol/symbols.",
+          ),
         contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
           "Lines of context before/after the symbol (default: 3)",
         ),
@@ -181,9 +197,48 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       execute: async (args, context): Promise<string> => {
         const hasFilePath = typeof args.filePath === "string" && args.filePath.length > 0;
         const hasUrl = typeof args.url === "string" && args.url.length > 0;
+        const hasTargets = Array.isArray(args.targets) && args.targets.length > 0;
+        const hasSymbol = typeof args.symbol === "string" && args.symbol.length > 0;
+        const hasSymbols = Array.isArray(args.symbols) && args.symbols.length > 0;
+
+        // Multi-target mode (different files). Mutually exclusive with the
+        // other modes so the agent doesn't accidentally provide overlapping
+        // inputs that get silently ignored.
+        if (hasTargets) {
+          if (hasFilePath || hasUrl || hasSymbol || hasSymbols) {
+            throw new Error(
+              "'targets' is mutually exclusive with 'filePath', 'url', 'symbol', and 'symbols'",
+            );
+          }
+          const targets = args.targets as Array<{ filePath: string; symbol: string }>;
+          for (const [i, entry] of targets.entries()) {
+            if (typeof entry.filePath !== "string" || entry.filePath.length === 0) {
+              throw new Error(`targets[${i}].filePath must be a non-empty string`);
+            }
+            if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
+              throw new Error(`targets[${i}].symbol must be a non-empty string`);
+            }
+          }
+          const responses = await Promise.all(
+            targets.map((t) => {
+              const params: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
+              if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+              return callBridge(ctx, context, "zoom", params).catch((err) => ({
+                success: false,
+                message: err instanceof Error ? err.message : String(err),
+              }));
+            }),
+          );
+          const entries = targets.map((t, i) => ({
+            targetLabel: t.filePath,
+            name: t.symbol,
+            response: responses[i] ?? { success: false, message: "missing zoom response" },
+          }));
+          return formatZoomMultiTargetResult(entries).text;
+        }
 
         if (!hasFilePath && !hasUrl) {
-          throw new Error("Provide exactly one of 'filePath' or 'url'");
+          throw new Error("Provide exactly one of 'filePath', 'url', or 'targets'");
         }
         if (hasFilePath && hasUrl) {
           throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
@@ -195,8 +250,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // Header label — what the agent typed, not the on-disk cache path.
         const targetLabel = (hasUrl ? (args.url as string) : (args.filePath as string)) ?? file;
 
-        // Multi-symbol mode: make separate zoom calls in parallel and combine results
-        if (Array.isArray(args.symbols) && args.symbols.length > 0) {
+        // Multi-symbol mode (same file): make separate zoom calls in parallel
+        // and combine results.
+        if (hasSymbols) {
           const results = await Promise.all(
             (args.symbols as string[]).map((sym) => {
               const params: Record<string, unknown> = { file, symbol: sym };
