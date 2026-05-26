@@ -2,11 +2,44 @@ import { dirname, resolve } from "node:path";
 import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { storeToolMetadata } from "../metadata-store.js";
 import type { PluginContext } from "../types.js";
 import { callBridge, optionalInt } from "./_shared.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
+
+/** Read the OpenCode runtime callID off the tool context (shape varies by host version). */
+function getCallID(ctx: unknown): string | undefined {
+  const c = ctx as { callID?: string; callId?: string; call_id?: string };
+  return c.callID ?? c.callId ?? c.call_id;
+}
+
+/** Build a short TUI title for an `aft_zoom` invocation, based on which mode the agent used. */
+function buildZoomTitle(args: {
+  filePath?: string;
+  url?: string;
+  symbols?: string | string[];
+  targets?: { filePath: string; symbol: string } | Array<{ filePath: string; symbol: string }>;
+}): string {
+  if (args.targets !== undefined && args.targets !== null) {
+    if (Array.isArray(args.targets)) {
+      if (args.targets.length === 1 && args.targets[0]) {
+        return `${args.targets[0].filePath}#${args.targets[0].symbol}`;
+      }
+      return `${args.targets.length} targets across files`;
+    }
+    return `${args.targets.filePath}#${args.targets.symbol}`;
+  }
+
+  const path = args.filePath ?? args.url ?? "";
+  if (typeof args.symbols === "string") return path ? `${path}#${args.symbols}` : args.symbols;
+  if (Array.isArray(args.symbols) && args.symbols.length > 0) {
+    if (args.symbols.length === 1) return path ? `${path}#${args.symbols[0]}` : args.symbols[0];
+    return path ? `${path} (${args.symbols.length} symbols)` : `${args.symbols.length} symbols`;
+  }
+  return path || "(no target)";
+}
 
 interface ZoomBatchSymbolResult {
   name: string;
@@ -204,6 +237,17 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           (typeof args.symbols === "string"
             ? args.symbols.length > 0
             : Array.isArray(args.symbols) && args.symbols.length > 0);
+
+        // Set TUI title BEFORE any bridge call so even errors render with a
+        // meaningful tool-call header. OpenCode's default auto-title only
+        // surfaces the first scalar arg, which leaves array/object-only
+        // invocations (symbols: [...], targets: {...}, targets: [...]) showing
+        // up as a bare `aft_zoom` with no hint.
+        const zoomCallID = getCallID(context);
+        if (zoomCallID) {
+          const title = buildZoomTitle(args);
+          storeToolMetadata(context.sessionID, zoomCallID, { title, metadata: { title } });
+        }
 
         // Multi-target mode (cross-file). Mutually exclusive with the other
         // modes so the agent doesn't accidentally provide overlapping inputs
