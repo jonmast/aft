@@ -1,5 +1,4 @@
 use super::helpers::AftProcess;
-use filetime::{set_file_mtime, FileTime};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -222,52 +221,16 @@ fn outline_files_mode_excludes_gitignored_paths_when_matcher_is_active() {
     assert!(aft.shutdown().success());
 }
 
-#[test]
-fn outline_files_mode_uses_fresh_symbol_cache_without_reparsing() {
-    let dir = TempDir::new().unwrap();
-    let mut content = String::from("export function cached() { return 1; }\n");
-    content.push_str("//");
-    content.push_str(&"x".repeat(4 * 1024 * 1024 + 32));
-    content.push('\n');
-    let file = write_file(dir.path(), "cached.ts", &content);
-    let original_len = fs::metadata(&file).unwrap().len() as usize;
-
-    // Pin mtime BEFORE warming the cache so platform mtime-precision differences
-    // (e.g. Linux tmpfs truncating sub-microsecond bits) can't cause the cached
-    // mtime to differ from what we set later.
-    let fixed_mtime = FileTime::from_unix_time(1_700_000_000, 0);
-    set_file_mtime(&file, fixed_mtime).unwrap();
-
-    let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
-
-    let warm = send(
-        &mut aft,
-        json!({
-            "id": "warm-cache",
-            "command": "outline",
-            "file": file,
-        }),
-    );
-    assert_eq!(warm["success"], true, "cache warm outline failed: {warm:?}");
-
-    fs::write(&file, vec![0xff; original_len]).unwrap();
-    set_file_mtime(&file, fixed_mtime).unwrap();
-
-    let resp = outline_files(&mut aft, dir.path());
-    assert_eq!(
-        resp["success"], true,
-        "outline files should succeed: {resp:?}"
-    );
-    let entry = file_entry(&resp, "cached.ts");
-    assert_eq!(entry["language"], "typescript");
-    assert_eq!(
-        entry["symbols"], 1,
-        "fresh cache count should be used even though the current bytes are not parseable UTF-8"
-    );
-
-    assert!(aft.shutdown().success());
-}
+// NOTE: A previous test here (`outline_files_mode_uses_fresh_symbol_cache_without_reparsing`)
+// tried to verify that the cache fast-path returns the stored symbol count when
+// `(mtime, size)` match, even if the file's current bytes are unparseable. The
+// scenario only succeeded when the filesystem watcher's invalidation happened to
+// be slow enough that the read landed before invalidation. On Linux with a
+// responsive inotify watcher (and on GH Actions specifically) the watcher
+// catches the corruption write and correctly invalidates the cache — which is
+// the desired behavior in real usage. The cache fast-path itself is covered by
+// unit tests in `crates/aft/src/parser.rs` against `SymbolCache` directly,
+// without the racy protocol-level setup.
 
 #[test]
 fn outline_files_mode_truncates_text_and_reports_unchecked_files() {
