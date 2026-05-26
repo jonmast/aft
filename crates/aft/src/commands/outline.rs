@@ -15,6 +15,8 @@ use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
 
 const MAX_OUTLINE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
+const OUTLINE_FILE_WALK_CAP: usize = 200;
+const OUTLINE_FILE_COLLECTION_CAP: usize = 10_000;
 
 /// A single entry in the outline tree.
 ///
@@ -65,21 +67,22 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
 
-        let (files, walk_truncated) = discover_outline_files(&dir_path);
+        let discovery = discover_outline_files(&dir_path);
         let project_root = ctx.config().project_root.clone();
         let (file_outlines, skipped_files) =
-            match outline_many_files(&files, ctx, &req.id, project_root.as_deref()) {
+            match outline_many_files(&discovery.files, ctx, &req.id, project_root.as_deref()) {
                 Ok(result) => result,
                 Err(resp) => return resp,
             };
 
-        let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, files.len());
+        let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, discovery.files.len());
         return Response::success(
             &req.id,
             serde_json::json!({
                 "text": text,
-                "complete": !walk_truncated,
-                "walk_truncated": walk_truncated,
+                "complete": !discovery.walk_truncated && !discovery.collection_truncated,
+                "walk_truncated": discovery.walk_truncated,
+                "collection_truncated": discovery.collection_truncated,
                 "skipped_files": skipped_files,
             }),
         );
@@ -294,6 +297,13 @@ struct OutlineWalkOptions {
     gitignore_root: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct OutlineFileDiscovery {
+    files: Vec<String>,
+    walk_truncated: bool,
+    collection_truncated: bool,
+}
+
 fn handle_outline_files_mode(
     req: &RawRequest,
     ctx: &AppContext,
@@ -304,8 +314,12 @@ fn handle_outline_files_mode(
         Err(response) => return response,
     };
 
+    let multiple_targets = targets.len() >= 2;
+    let project_root = ctx.config().project_root.clone();
+
     let mut file_entries = Vec::new();
     let mut walk_truncated = false;
+    let mut collection_truncated = false;
 
     for target in targets {
         let dir_path = match ctx.validate_path(&req.id, Path::new(&target)) {
@@ -328,12 +342,18 @@ fn handle_outline_files_mode(
             );
         }
 
-        let (files, truncated) = discover_outline_files_for_files_mode(&dir_path, ctx);
-        walk_truncated |= truncated;
+        let display_root = if multiple_targets {
+            project_root.as_deref().unwrap_or(&dir_path)
+        } else {
+            &dir_path
+        };
+        let discovery = discover_outline_files_for_files_mode(&dir_path, ctx);
+        walk_truncated |= discovery.walk_truncated;
+        collection_truncated |= discovery.collection_truncated;
 
-        for file in files {
+        for file in discovery.files {
             let file_path = PathBuf::from(file);
-            if let Some(entry) = outline_file_entry(&file_path, &dir_path, ctx) {
+            if let Some(entry) = outline_file_entry(&file_path, display_root, ctx) {
                 file_entries.push(entry);
             }
         }
@@ -346,14 +366,19 @@ fn handle_outline_files_mode(
         unchecked_files
             .push("<additional files not discovered: directory walk limit reached>".to_string());
     }
+    if collection_truncated && unchecked_files.is_empty() {
+        unchecked_files
+            .push("<additional files not discovered: collection safety limit reached>".to_string());
+    }
 
     Response::success(
         &req.id,
         serde_json::json!({
             "text": text,
             "files": file_entries,
-            "complete": !walk_truncated && !text_truncated,
+            "complete": !walk_truncated && !collection_truncated && !text_truncated,
             "walk_truncated": walk_truncated,
+            "collection_truncated": collection_truncated,
             "unchecked_files": unchecked_files,
         }),
     )
@@ -375,6 +400,21 @@ fn outline_files_mode_targets(req: &RawRequest) -> Result<Vec<String>, Response>
             .collect::<Vec<_>>();
         if !targets.is_empty() {
             return Ok(targets);
+        }
+    }
+
+    if let Some(targets) = req.params.get("targets") {
+        if let Some(target) = targets.as_str() {
+            return Ok(vec![target.to_string()]);
+        }
+        if let Some(targets) = targets.as_array() {
+            let targets = targets
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>();
+            if !targets.is_empty() {
+                return Ok(targets);
+            }
         }
     }
 
@@ -407,7 +447,7 @@ fn outline_files_mode_targets(req: &RawRequest) -> Result<Vec<String>, Response>
 fn discover_outline_files_for_files_mode(
     directory: &Path,
     ctx: &AppContext,
-) -> (Vec<String>, bool) {
+) -> OutlineFileDiscovery {
     let gitignore = ctx.gitignore();
     let gitignore_root = ctx
         .config()
@@ -423,15 +463,12 @@ fn discover_outline_files_for_files_mode(
 
 fn outline_file_entry(
     path: &Path,
-    target_root: &Path,
+    display_root: &Path,
     ctx: &AppContext,
 ) -> Option<OutlineFileEntry> {
     let metadata = std::fs::metadata(path).ok()?;
-    let rel_path = path
-        .strip_prefix(target_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let rel_path =
+        relative_path_from_root(path, display_root).unwrap_or_else(|| path_to_slash(path));
     let bytes = metadata.len();
     let detected_language = detect_language(path).map(language_id);
 
@@ -488,6 +525,23 @@ fn outline_file_entry(
         symbols,
         bytes,
     })
+}
+
+fn relative_path_from_root(path: &Path, root: &Path) -> Option<String> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(path_to_slash(relative));
+    }
+
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    canonical_path
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(path_to_slash)
+}
+
+fn path_to_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn cached_symbol_count(
@@ -644,39 +698,51 @@ fn outline_many_files(
     Ok((file_outlines, skipped_files))
 }
 
-fn discover_outline_files(directory: &Path) -> (Vec<String>, bool) {
+fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
     discover_outline_files_with_options(directory, None)
 }
 
 fn discover_outline_files_with_options(
     directory: &Path,
     options: Option<&OutlineWalkOptions>,
-) -> (Vec<String>, bool) {
+) -> OutlineFileDiscovery {
     let mut files = Vec::new();
-    let mut truncated = false;
-    collect_outline_files(directory, &mut files, &mut truncated, options);
+    let mut collection_truncated = false;
+    collect_outline_files(directory, &mut files, &mut collection_truncated, options);
     files.sort();
-    (files, truncated)
+
+    let walk_truncated = files.len() > OUTLINE_FILE_WALK_CAP;
+    if walk_truncated {
+        files.truncate(OUTLINE_FILE_WALK_CAP);
+    }
+
+    OutlineFileDiscovery {
+        files,
+        walk_truncated,
+        collection_truncated,
+    }
 }
 
 fn collect_outline_files(
     directory: &Path,
     files: &mut Vec<String>,
-    truncated: &mut bool,
+    collection_truncated: &mut bool,
     options: Option<&OutlineWalkOptions>,
 ) {
-    if files.len() >= 200 {
-        *truncated = true;
+    if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+        *collection_truncated = true;
         return;
     }
 
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
 
-    for entry in entries.flatten() {
-        if files.len() >= 200 {
-            *truncated = true;
+    for entry in entries {
+        if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+            *collection_truncated = true;
             return;
         }
         let path = entry.path();
@@ -687,7 +753,10 @@ fn collect_outline_files(
             if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
                 continue;
             }
-            collect_outline_files(&path, files, truncated, options);
+            collect_outline_files(&path, files, collection_truncated, options);
+            if *collection_truncated {
+                return;
+            }
         } else if path.is_file() {
             if is_ignored_outline_path(&path, false, options) {
                 continue;

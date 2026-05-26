@@ -305,6 +305,118 @@ fn outline_files_mode_truncates_text_and_reports_unchecked_files() {
 }
 
 #[test]
+fn files_mode_multi_target_uses_project_root_relative_paths() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "src/shared/index.ts",
+        "export function fromSrc() {}\n",
+    );
+    write_file(
+        dir.path(),
+        "tests/shared/index.ts",
+        "export function fromTests() {}\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "outline-files-multi-target",
+            "command": "outline",
+            "target": [dir.path().join("src"), dir.path().join("tests")],
+            "files": true,
+        }),
+    );
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+
+    let paths = response_paths(&resp);
+    assert_eq!(paths, vec!["src/shared/index.ts", "tests/shared/index.ts"]);
+    assert!(
+        !paths.iter().any(|path| path == "shared/index.ts"),
+        "multi-target paths must not be stripped to ambiguous target-relative names: {paths:?}"
+    );
+
+    let text = resp["text"].as_str().unwrap();
+    assert!(
+        text.contains("src/shared/index.ts"),
+        "missing src row: {text}"
+    );
+    assert!(
+        text.contains("tests/shared/index.ts"),
+        "missing tests row: {text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn files_mode_single_target_keeps_target_relative_behavior() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "src/shared/index.ts",
+        "export function singleTarget() {}\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, &dir.path().join("src"));
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+
+    let paths = response_paths(&resp);
+    assert_eq!(paths, vec!["shared/index.ts"]);
+    let text = resp["text"].as_str().unwrap();
+    assert!(
+        text.contains("shared/index.ts"),
+        "missing target-relative row: {text}"
+    );
+    assert!(
+        !text.contains("src/shared/index.ts"),
+        "single-target mode should remain target-relative: {text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn files_mode_walk_cap_is_subset_stable_under_lexical_sort() {
+    let dir = TempDir::new().unwrap();
+    for index in (0..260).rev() {
+        write_file(dir.path(), &format!("files/file-{index:03}.txt"), "x\n");
+    }
+    let expected = (0..200)
+        .map(|index| format!("files/file-{index:03}.txt"))
+        .collect::<Vec<_>>();
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    for _ in 0..3 {
+        let resp = outline_files(&mut aft, dir.path());
+        assert_eq!(
+            resp["success"], true,
+            "outline files should succeed: {resp:?}"
+        );
+        assert_eq!(resp["complete"], false);
+        assert_eq!(resp["walk_truncated"], true);
+        assert_eq!(resp["collection_truncated"], false);
+        assert_eq!(response_paths(&resp), expected);
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn outline_files_mode_sorts_entries_by_path() {
     let dir = TempDir::new().unwrap();
     write_file(dir.path(), "zeta.ts", "export function zeta() {}\n");
