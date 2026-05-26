@@ -55,6 +55,10 @@ describe("extension UI permission ask (real Pi RPC)", () => {
         aftPluginDir: resolvePiPluginDir(),
         configDir: env.configDir,
         workdir: env.workdir,
+        // External-path edit MUST trigger ui.confirm — only happens when
+        // restrict_to_project_root is true. Under the Pi default (false)
+        // the plugin defers to Rust silently.
+        restrictToProjectRoot: true,
       });
       client = spawned.client;
 

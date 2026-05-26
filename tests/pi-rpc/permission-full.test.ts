@@ -20,6 +20,13 @@ async function withPiTool(
     setup?: (env: PiIsolatedEnv) => Promise<void>;
     onClient?: (client: RpcClient) => void;
     afterTool?: (env: PiIsolatedEnv, toolEnd: Record<string, unknown>) => Promise<void>;
+    /**
+     * Force `restrict_to_project_root: true` in the generated AFT config.
+     * Required for tests that exercise the `ui.confirm` external-directory
+     * prompt — under the Pi default (false) the plugin defers to Rust
+     * without prompting at all.
+     */
+    restrictToProjectRoot?: boolean;
   },
 ) {
   const env = createPiIsolatedEnv();
@@ -37,6 +44,7 @@ async function withPiTool(
       aftPluginDir: resolvePiPluginDir(),
       configDir: env.configDir,
       workdir: env.workdir,
+      restrictToProjectRoot: opts.restrictToProjectRoot,
     });
     client = spawned.client;
     opts.onClient?.(client);
@@ -82,7 +90,20 @@ describe("permission matrix (real Pi RPC)", () => {
     expect(JSON.stringify(toolEnd.result)).toContain("Edited inside.txt");
   }, 120_000);
 
-  test("external edit succeeds when permission is confirmed", async () => {
+  test("external edit under strict mode prompts then Rust still rejects (defense in depth)", async () => {
+    // Under `restrict_to_project_root: true`, two gates apply in order:
+    //   1. Plugin prompts via ui.confirm (this is what `uiRequestSeen` checks).
+    //   2. Rust enforces the same flag and hard-rejects the path itself.
+    //
+    // Confirming the prompt at the plugin layer does NOT override Rust's
+    // gate — there's no "human override" path in the Rust contract. The
+    // edit therefore fails even when the user clicks confirm. This is the
+    // intended defense-in-depth behavior: the prompt warns the user about
+    // an out-of-root operation, and Rust independently blocks it.
+    //
+    // (Pi users who want external paths to work should set
+    // `restrict_to_project_root: false` — the Pi default — which skips the
+    // prompt and lets Rust accept the path.)
     const outsideDir = await mkdtemp(join(tmpdir(), "aft-pi-rpc-outside-"));
     try {
       const target = join(outsideDir, "confirmed-edit.txt");
@@ -95,6 +116,7 @@ describe("permission matrix (real Pi RPC)", () => {
         },
         {
           message: `Edit ${target}.`,
+          restrictToProjectRoot: true,
           onClient: (client) => {
             client.onExtensionUIRequest((request) => {
               uiRequestSeen = true;
@@ -104,6 +126,40 @@ describe("permission matrix (real Pi RPC)", () => {
         },
       );
       expect(uiRequestSeen).toBe(true);
+      expect(toolEnd.isError).toBe(true);
+      // Confirming at the plugin layer doesn't override Rust's hard gate;
+      // the file content stays unchanged.
+      expect(await readFile(target, "utf8")).toBe("original content\n");
+    } finally {
+      await rm(outsideDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test("external edit under Pi default (restrict_to_project_root: false) skips prompt and succeeds", async () => {
+    // The Pi default: no plugin-side prompt, Rust accepts external paths.
+    // This is the path the v0.31.0 hang fix unblocked — agents calling
+    // grep/write/edit on `~/Work/...` no longer get stuck on an
+    // unanswerable ui.confirm prompt.
+    const outsideDir = await mkdtemp(join(tmpdir(), "aft-pi-rpc-outside-default-"));
+    try {
+      const target = join(outsideDir, "default-edit.txt");
+      await writeFile(target, "original content\n");
+      let uiRequestSeen = false;
+      const toolEnd = await withPiTool(
+        {
+          name: "edit",
+          arguments: { filePath: target, oldString: "original", newString: "modified" },
+        },
+        {
+          message: `Edit ${target}.`,
+          onClient: (client) => {
+            client.onExtensionUIRequest(() => {
+              uiRequestSeen = true;
+            });
+          },
+        },
+      );
+      expect(uiRequestSeen).toBe(false);
       expect(toolEnd.isError).toBe(false);
       expect(await readFile(target, "utf8")).toBe("modified content\n");
     } finally {
@@ -120,6 +176,7 @@ describe("permission matrix (real Pi RPC)", () => {
         { name: "write", arguments: { filePath: target, content: "new content\n" } },
         {
           message: `Write ${target}.`,
+          restrictToProjectRoot: true,
           onClient: (client) => {
             client.onExtensionUIRequest((request) => {
               uiRequestSeen = true;
@@ -146,6 +203,7 @@ describe("permission matrix (real Pi RPC)", () => {
         { name: "grep", arguments: { pattern: "needle", path: outsideDir } },
         {
           message: `Search ${outsideDir}.`,
+          restrictToProjectRoot: true,
           onClient: (client) => {
             client.onExtensionUIRequest((request) => {
               uiRequestSeen = true;

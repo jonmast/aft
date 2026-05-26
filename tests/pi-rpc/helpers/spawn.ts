@@ -59,6 +59,13 @@ export interface PiSpawnOptions {
   configDir: string;
   workdir: string;
   extraArgs?: string[];
+  /**
+   * Force `restrict_to_project_root: true` in the generated AFT config so
+   * tests that exercise the `ui.confirm` external-directory prompt actually
+   * trigger it. Pi defaults this to false ("no restriction"), in which case
+   * the plugin defers to Rust without ever showing the prompt.
+   */
+  restrictToProjectRoot?: boolean;
 }
 
 function childEnv(configDir: string): Record<string, string> {
@@ -132,10 +139,14 @@ function writeConfigs(opts: PiSpawnOptions): string {
       2,
     ),
   );
-  writeFileSync(
-    join(agentDir, "aft.jsonc"),
-    readFileSync(join(import.meta.dir, "../fixtures/aft-pi-config.jsonc"), "utf8"),
-  );
+  const baseConfig = readFileSync(join(import.meta.dir, "../fixtures/aft-pi-config.jsonc"), "utf8");
+  // Tests that exercise the `ui.confirm` external-directory prompt opt into
+  // strict mode by passing `restrictToProjectRoot: true`. Without this, the
+  // plugin defers to Rust (Pi default behavior) and the prompt never fires.
+  const aftConfig = opts.restrictToProjectRoot
+    ? baseConfig.replace(/\}\s*$/, ',\n  "restrict_to_project_root": true\n}\n')
+    : baseConfig;
+  writeFileSync(join(agentDir, "aft.jsonc"), aftConfig);
   return agentDir;
 }
 
