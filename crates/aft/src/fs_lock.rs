@@ -734,15 +734,31 @@ mod tests {
         // heartbeat_interval_ms=25. The contract being asserted is "the
         // heartbeat advances eventually", not "it advances within N
         // heartbeat intervals".
+        //
+        // On Windows, `rename_over` does `remove_file(to)` then
+        // `fs::rename(from, to)` because Windows can't atomically replace
+        // an open file. There's a brief window where the lockfile doesn't
+        // exist. If the poller hits that window, `read_lock_metadata`
+        // returns `Io(NotFound)`. Production callers already handle this
+        // (see `remove_lock_if_owned`), so the test treats `NotFound` the
+        // same as "no update yet" and keeps polling.
         let deadline = std::time::Instant::now() + Duration::from_millis(2_000);
         let mut updated = initial;
         while std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
-            updated = read_lock_metadata(&path)
-                .expect("read updated metadata")
-                .heartbeat_at_ms;
-            if updated > initial {
-                break;
+            match read_lock_metadata(&path) {
+                Ok(meta) => {
+                    updated = meta.heartbeat_at_ms;
+                    if updated > initial {
+                        break;
+                    }
+                }
+                Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    // Heartbeat thread is mid-rewrite (Windows
+                    // remove-then-rename window). Retry next iteration.
+                    continue;
+                }
+                Err(other) => panic!("read updated metadata: {other:?}"),
             }
         }
         assert!(
