@@ -1,7 +1,10 @@
 mod cli;
 use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
-use aft::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use aft::context::{
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    SemanticRefreshRequest,
+};
 use aft::log_ctx;
 use aft::lsp::client::LspEvent;
 use aft::parser::TreeSitterProvider;
@@ -135,8 +138,10 @@ fn main() {
                 drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
                 if shutdown_requested.load(Ordering::SeqCst) {
                     break;
@@ -168,8 +173,10 @@ fn main() {
                 drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
                 drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
@@ -798,6 +805,7 @@ fn drain_watcher_events(ctx: &AppContext) {
 
     let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
     let mut semantic_status_changed = false;
+    let mut semantic_refresh_paths = Vec::new();
     if let Some(index) = semantic_index_ref.as_mut() {
         let mut stale_paths = Vec::new();
         for path in &changed {
@@ -813,9 +821,10 @@ fn drain_watcher_events(ctx: &AppContext) {
         if !stale_paths.is_empty() {
             let mut status = ctx.semantic_index_status().borrow_mut();
             if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                for path in stale_paths {
-                    status.add_refreshing_file(path);
+                for path in &stale_paths {
+                    status.add_refreshing_file(path.clone());
                 }
+                semantic_refresh_paths = stale_paths;
                 semantic_status_changed = true;
             }
         }
@@ -823,6 +832,27 @@ fn drain_watcher_events(ctx: &AppContext) {
 
     drop(semantic_index_ref);
     drop(index_ref);
+
+    if !semantic_refresh_paths.is_empty() {
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest {
+                    paths: semantic_refresh_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            aft::slog_warn!(
+                "semantic refresh worker unavailable; dropping {} refreshing file(s)",
+                semantic_refresh_paths.len()
+            );
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            for path in &semantic_refresh_paths {
+                status.remove_refreshing_file(path);
+            }
+            semantic_status_changed = true;
+        }
+    }
 
     aft::slog_info!("invalidated {} files", changed.len());
     if semantic_status_changed {
@@ -893,6 +923,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
             }
             SemanticIndexEvent::Failed(error) => {
                 *ctx.semantic_index().borrow_mut() = None;
+                ctx.clear_semantic_refresh_worker();
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
                 status_changed = true;
@@ -903,6 +934,70 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     if !keep_receiver {
         *ctx.semantic_index_rx().borrow_mut() = None;
     }
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+fn drain_semantic_refresh_events(ctx: &AppContext) {
+    let events = {
+        let rx_ref = ctx.semantic_refresh_event_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    };
+
+    if events.is_empty() {
+        return;
+    }
+
+    let mut status_changed = false;
+    for event in events {
+        match event {
+            SemanticRefreshEvent::Started { paths } => {
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in paths {
+                        status.add_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+            SemanticRefreshEvent::Completed {
+                added_entries,
+                updated_metadata,
+                completed_paths,
+            } => {
+                if let Some(index) = ctx.semantic_index().borrow_mut().as_mut() {
+                    index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
+                }
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &completed_paths {
+                        status.remove_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+            SemanticRefreshEvent::Failed { paths, error } => {
+                aft::slog_warn!("semantic refresh failed: {}", error);
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &paths {
+                        status.remove_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+        }
+    }
+
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }

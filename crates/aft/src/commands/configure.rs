@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
@@ -14,7 +14,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
-use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use crate::context::{
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+};
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
@@ -30,6 +33,8 @@ use crate::{slog_info, slog_warn};
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 const MAX_SEARCH_INDEX_FILES: usize = 20_000;
+const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
+const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -95,6 +100,111 @@ where
 
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
     let _ = install_project_watcher_with(ctx, root_path, create_project_watcher);
+}
+
+fn spawn_semantic_refresh_worker(
+    project_root: PathBuf,
+    mut index: SemanticIndex,
+    mut model: crate::semantic_index::EmbeddingModel,
+    max_batch_size: usize,
+    request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
+    event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
+    session_id: Option<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            while let Ok(first_request) = request_rx.recv() {
+                let mut paths = first_request.paths;
+                let mut disconnected = false;
+                let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
+                let mut deadline = Instant::now() + quiet_window;
+
+                while paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match request_rx.recv_timeout(remaining) {
+                        Ok(request) => {
+                            paths.extend(request.paths);
+                            if paths.len() >= SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                                break;
+                            }
+                            deadline = Instant::now() + quiet_window;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if disconnected {
+                    break;
+                }
+
+                paths.sort();
+                paths.dedup();
+                if paths.is_empty() {
+                    continue;
+                }
+
+                if event_tx
+                    .send(SemanticRefreshEvent::Started {
+                        paths: paths.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+
+                let mut embed = |texts: Vec<String>| model.embed(texts);
+                let mut progress = |_done: usize, _total: usize| {};
+                match index.refresh_invalidated_files(
+                    &project_root,
+                    &paths,
+                    &mut embed,
+                    max_batch_size,
+                    &mut progress,
+                ) {
+                    Ok(update) => {
+                        if !update.summary.is_noop() {
+                            slog_info!(
+                                "semantic refresh: {} changed, {} new, {} deleted, {} total processed",
+                                update.summary.changed,
+                                update.summary.added,
+                                update.summary.deleted,
+                                update.summary.total_processed,
+                            );
+                        }
+                        if event_tx
+                            .send(SemanticRefreshEvent::Completed {
+                                added_entries: update.added_entries,
+                                updated_metadata: update.updated_metadata,
+                                completed_paths: update.completed_paths,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        slog_warn!(
+                            "semantic refresh failed for {} file(s): {}",
+                            paths.len(),
+                            error
+                        );
+                        if event_tx
+                            .send(SemanticRefreshEvent::Failed { paths, error })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    })
 }
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
@@ -1608,6 +1718,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+    ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;
 
     // Snapshot accumulated degraded reasons on the context so status /
@@ -1738,6 +1849,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ) = unbounded();
         *ctx.semantic_index_rx().borrow_mut() = Some(rx);
 
+        let (refresh_tx, refresh_rx) = unbounded::<SemanticRefreshRequest>();
+        let (refresh_event_tx, refresh_event_rx) = unbounded::<SemanticRefreshEvent>();
+        let refresh_worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+        ctx.install_semantic_refresh_worker(
+            refresh_tx,
+            refresh_event_rx,
+            Arc::clone(&refresh_worker_slot),
+        );
+
         let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
         let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
@@ -1753,7 +1873,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 const MAX_SEMANTIC_FILES: usize = 10_000;
 
                 let build_result = catch_unwind(AssertUnwindSafe(
-                    || -> Result<SemanticIndex, String> {
+                    || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
                             files: None,
@@ -1864,7 +1984,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                             entries_done: Some(cached.entry_count()),
                                             entries_total: Some(cached.entry_count()),
                                         });
-                                        return Ok(cached);
+                                        return Ok((cached, model));
                                     }
                                     Err(error) => {
                                         // Hard failure (dimension mismatch, embed backend
@@ -1944,12 +2064,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
-                        Ok(index)
+                        Ok((index, model))
                     },
                 ));
 
                 let event = match build_result {
-                    Ok(Ok(index)) => SemanticIndexEvent::Ready(index),
+                    Ok(Ok((index, model))) => {
+                        let worker_index = index.clone();
+                        let worker_handle = spawn_semantic_refresh_worker(
+                            root_clone.clone(),
+                            worker_index,
+                            model,
+                            semantic_config.max_batch_size.max(1),
+                            refresh_rx,
+                            refresh_event_tx,
+                            log_ctx::current_session(),
+                        );
+                        if let Ok(mut slot) = refresh_worker_slot.lock() {
+                            *slot = Some(worker_handle);
+                        }
+                        SemanticIndexEvent::Ready(index)
+                    }
                     Ok(Err(error)) => {
                         slog_warn!("failed to build semantic index: {}", error);
                         SemanticIndexEvent::Failed(error)
