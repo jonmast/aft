@@ -8,6 +8,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { formatReadFooter, registerHoistedTools } from "../tools/hoisted.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
@@ -18,6 +20,10 @@ async function tempRoot(): Promise<string> {
   roots.push(root);
   await mkdir(root, { recursive: true });
   return root;
+}
+
+function schemaAccepts(schema: unknown, value: unknown): boolean {
+  return Value.Check(schema as TSchema, value);
 }
 
 afterEach(async () => {
@@ -81,9 +87,72 @@ describe("hoisted tool adapters", () => {
       op: "append",
       file: "README.md",
       append_content: "\nnext",
-      diagnostics: true,
+      diagnostics: false,
       include_diff: true,
     });
+  });
+
+  test("edit defaults diagnostics off and omits LSP payload", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      diff: { additions: 1 },
+      replacements: 1,
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("edit")!, {
+      filePath: "src/app.ts",
+      oldString: "before",
+      newString: "after",
+    })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
+
+    expect(calls[0].command).toBe("edit_match");
+    expect(calls[0].params).toMatchObject({
+      file: "src/app.ts",
+      match: "before",
+      replacement: "after",
+      diagnostics: false,
+      include_diff: true,
+    });
+    expect(result.content[0].text).not.toContain("LSP diagnostics");
+    expect(result.details.diagnostics).toBeUndefined();
+  });
+
+  test("edit honors diagnostics true and includes LSP payload", async () => {
+    const diagnostics = [{ severity: "error", line: 5, message: "Broken edit" }];
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      diff: { additions: 1 },
+      replacements: 1,
+      lsp_diagnostics: diagnostics,
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("edit")!, {
+      filePath: "src/app.ts",
+      oldString: "before",
+      newString: "after",
+      diagnostics: true,
+    })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
+
+    expect(calls[0].params.diagnostics).toBe(true);
+    expect(result.details.diagnostics).toEqual(diagnostics);
+    expect(result.content[0].text).toContain("LSP diagnostics");
+    expect(result.content[0].text).toContain("Broken edit");
   });
 
   test("grep resolves existing path args and preserves brace-aware include globs", async () => {
@@ -139,7 +208,7 @@ describe("hoisted tool adapters", () => {
     expect(calls[0].params).toEqual({ pattern: "oauth", path: home });
   });
 
-  test("write always asks Rust for diagnostics and a diff", async () => {
+  test("write defaults diagnostics off and asks Rust for a diff", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
     registerHoistedTools(api, makePluginContext(bridge), {
@@ -150,15 +219,77 @@ describe("hoisted tool adapters", () => {
       restrictToProjectRoot: true,
     });
 
-    await executeTool(tools.get("write")!, { filePath: "src/app.ts", content: "export {};\n" });
+    const result = (await executeTool(tools.get("write")!, {
+      filePath: "src/app.ts",
+      content: "export {};\n",
+    })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
     expect(calls[0].command).toBe("write");
     expect(calls[0].params).toEqual({
       file: "src/app.ts",
       content: "export {};\n",
-      diagnostics: true,
+      diagnostics: false,
       include_diff: true,
     });
+    expect(result.content[0].text).not.toContain("LSP diagnostics");
+    expect(result.details.diagnostics).toBeUndefined();
+  });
+
+  test("write honors diagnostics true and includes LSP payload", async () => {
+    const diagnostics = [{ severity: "error", line: 11, message: "Broken write" }];
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      diff: { additions: 1 },
+      lsp_diagnostics: diagnostics,
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("write")!, {
+      filePath: "src/app.ts",
+      content: "export {};\n",
+      diagnostics: true,
+    })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
+
+    expect(calls[0].command).toBe("write");
+    expect(calls[0].params.diagnostics).toBe(true);
+    expect(result.details.diagnostics).toEqual(diagnostics);
+    expect(result.content[0].text).toContain("LSP diagnostics");
+    expect(result.content[0].text).toContain("Broken write");
+  });
+
+  test("mutation schemas reject non-boolean diagnostics", () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({ success: true }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    expect(
+      schemaAccepts(tools.get("write")!.parameters, {
+        filePath: "src/app.ts",
+        content: "export {};\n",
+        diagnostics: "yes",
+      }),
+    ).toBe(false);
+    expect(
+      schemaAccepts(tools.get("edit")!.parameters, {
+        filePath: "src/app.ts",
+        oldString: "before",
+        newString: "after",
+        diagnostics: "yes",
+      }),
+    ).toBe(false);
   });
 
   test("write to external path triggers ui.confirm; denial rejects, approval calls bridge", async () => {

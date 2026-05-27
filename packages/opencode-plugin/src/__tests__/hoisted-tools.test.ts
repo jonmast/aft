@@ -115,6 +115,183 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Refusing to write outside project root");
   });
 
+  test("write defaults diagnostics off and omits LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({ success: true }));
+
+    const result = await tools.write.execute(
+      { filePath: "src/app.ts", content: "export {};\n" },
+      sdkCtx,
+    );
+
+    expect(result).toBe("File updated.");
+    expect(result).not.toContain("lsp_diagnostics");
+    expect(result).not.toContain("LSP errors detected");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({
+      command: "write",
+      params: {
+        file: resolve(tmpDir, "src/app.ts"),
+        content: "export {};\n",
+        create_dirs: true,
+        diagnostics: false,
+        include_diff: true,
+        session_id: "test",
+      },
+    });
+  });
+
+  test("write honors diagnostics true and includes LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      lsp_diagnostics: [{ severity: "error", line: 7, message: "Bad type" }],
+    }));
+
+    const result = await tools.write.execute(
+      { filePath: "src/app.ts", content: "export {};\n", diagnostics: true },
+      sdkCtx,
+    );
+
+    expect(calls[0].params.diagnostics).toBe(true);
+    expect(result).toContain("LSP errors detected");
+    expect(result).toContain("Line 7: Bad type");
+  });
+
+  test("edit defaults diagnostics off and omits LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+    }));
+
+    const result = await tools.edit.execute(
+      { filePath: "src/app.ts", oldString: "before", newString: "after" },
+      sdkCtx,
+    );
+
+    expect(JSON.parse(result)).toEqual({ success: true, replacements: 1 });
+    expect(result).not.toContain("lsp_diagnostics");
+    expect(result).not.toContain("LSP errors detected");
+    expect(calls[0].command).toBe("edit_match");
+    expect(calls[0].params.diagnostics).toBe(false);
+  });
+
+  test("edit honors diagnostics true and includes LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const diagnostics = [{ severity: "error", line: 3, message: "Missing import" }];
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+      lsp_diagnostics: diagnostics,
+    }));
+
+    const result = await tools.edit.execute(
+      {
+        filePath: "src/app.ts",
+        oldString: "before",
+        newString: "after",
+        diagnostics: true,
+      },
+      sdkCtx,
+    );
+
+    const parsed = JSON.parse(result.split("\n\nLSP errors detected")[0]);
+    expect(parsed.lsp_diagnostics).toEqual(diagnostics);
+    expect(calls[0].params.diagnostics).toBe(true);
+    expect(result).toContain("Line 3: Missing import");
+  });
+
+  test("apply_patch defaults diagnostics off and omits LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+    await writeFile(resolve(tmpDir, "file.ts"), "old\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: file.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") return { success: true };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = await tools.apply_patch.execute({ patchText }, sdkCtx);
+
+    const writeCall = calls.find((call) => call.command === "write");
+    expect(writeCall?.params.diagnostics).toBe(false);
+    expect(result).toContain("Updated file.ts");
+    expect(result).not.toContain("lsp_diagnostics");
+    expect(result).not.toContain("LSP errors detected");
+  });
+
+  test("apply_patch honors diagnostics true and includes LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+    await writeFile(resolve(tmpDir, "file.ts"), "old\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: file.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") {
+        return {
+          success: true,
+          lsp_diagnostics: [{ severity: "error", line: 9, message: "Patch type error" }],
+        };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = await tools.apply_patch.execute({ patchText, diagnostics: true }, sdkCtx);
+
+    const writeCall = calls.find((call) => call.command === "write");
+    expect(writeCall?.params.diagnostics).toBe(true);
+    expect(result).toContain("LSP errors detected in file.ts");
+    expect(result).toContain("Line 9: Patch type error");
+  });
+
+  test("mutation tool schemas reject non-boolean diagnostics", () => {
+    const { tools } = createMockHoistedHarness(async () => ({ success: true }));
+    const pool = {
+      getBridge: () => ({ send: async () => ({ success: true }) }),
+    } as unknown as BridgePool;
+    const prefixedTools = aftPrefixedTools(createPluginContext(pool));
+
+    for (const toolDef of [
+      tools.write,
+      tools.edit,
+      tools.apply_patch,
+      prefixedTools.aft_write,
+      prefixedTools.aft_edit,
+      prefixedTools.aft_apply_patch,
+    ]) {
+      const diagnosticsSchema = toolDef.args.diagnostics as { parse: (value: unknown) => unknown };
+      expect(() => diagnosticsSchema.parse("yes")).toThrow();
+    }
+  });
+
   failingTest("edit throws the Rust error response for failed replacements", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
@@ -302,7 +479,7 @@ describe("Hoisted tool execute handlers", () => {
           { match: "before", replacement: "after" },
           { line_start: 4, line_end: 6, content: "replacement" },
         ],
-        diagnostics: true,
+        diagnostics: false,
         include_diff: true,
         session_id: "test",
       },
@@ -334,8 +511,9 @@ describe("Hoisted tool execute handlers", () => {
 
     const pool = {
       getBridge: () => ({
-        send: async (command: string) => {
+        send: async (command: string, params: Record<string, unknown>) => {
           expect(command).toBe("write");
+          expect(params.diagnostics).toBe(false);
           return { success: false, message: "legacy write refused" };
         },
       }),
@@ -378,7 +556,7 @@ describe("Hoisted tool execute handlers", () => {
         match: "oldName",
         replacement: "newName",
         replace_all: true,
-        diagnostics: true,
+        diagnostics: false,
         include_diff: true,
         session_id: "test",
       },

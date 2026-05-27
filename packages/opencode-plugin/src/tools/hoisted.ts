@@ -342,6 +342,8 @@ function inferBeforeStart(ops: DiffOp[], from: number, beforeLen: number): numbe
 }
 
 const z = tool.schema;
+const DIAGNOSTICS_PARAM_DESCRIPTION =
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Default false — edits return as soon as the write completes. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
 
 // ---------------------------------------------------------------------------
 // Tool descriptions focus on behavior, modes, and return values.
@@ -544,17 +546,20 @@ function getWriteDescription(editToolName: string): string {
 
 Automatically creates parent directories. Backs up existing files before overwriting.
 If the project has a formatter configured (biome, prettier, rustfmt, etc.), the file
-is auto-formatted after writing. Returns inline LSP diagnostics when available.
+is auto-formatted after writing. Edits return as soon as the write completes; LSP
+diagnostics are populated asynchronously. Pass \`diagnostics: true\` for legacy
+sync-wait behavior, or call \`aft_inspect\` afterward to check diagnostics across a
+batch of edits.
 
 **Behavior:**
 - Creates parent directories automatically (no need to mkdir first)
 - Existing files are backed up before overwriting (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
-- Returns LSP error-level diagnostics inline if type errors are introduced
+- LSP diagnostics are opt-in with \`diagnostics: true\`; otherwise they populate asynchronously
 - Use this for creating new files or completely replacing file contents
 - For partial edits (find/replace), use the \`${editToolName}\` tool instead
 
-Returns: Status message string (for example: "Created new file. Auto-formatted.") with optional inline LSP error lines.`;
+Returns: Status message string (for example: "Created new file. Auto-formatted.") with optional inline LSP error lines when \`diagnostics: true\` is passed.`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -565,6 +570,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         .string()
         .describe("Path to the file to write (absolute or relative to project root)"),
       content: z.string().describe("The full content to write to the file"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<string> => {
       const file = args.filePath as string;
@@ -594,7 +600,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         file: filePath,
         content,
         create_dirs: true,
-        diagnostics: true,
+        diagnostics: args.diagnostics ?? false,
         include_diff: true,
       });
 
@@ -724,9 +730,9 @@ Note: Modes 6 and 7 are options on mode 5 (find/replace) — they require \`oldS
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- LSP error-level diagnostics are returned automatically after edits
+- Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass \`diagnostics: true\` for legacy sync-wait behavior, or call \`aft_inspect\` afterward to check diagnostics across a batch of edits.
 
-Returns: JSON string for the selected edit mode. Edits may append inline LSP error lines.
+Returns: JSON string for the selected edit mode. Edits may append inline LSP error lines when \`diagnostics: true\` is passed.
 
 Common response fields: success (boolean), diff (object with before/after), backup_id (string), syntax_valid (boolean). Exact fields vary by mode.`;
   // Note: The Returns section intentionally stays high-level because per-mode JSON shapes
@@ -776,6 +782,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .describe(
           "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback. Note: uses 'file'/'match'/'replacement' (not filePath/oldString/newString)",
         ),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<string> => {
       // Footgun guard: top-level startLine/endLine are not valid params on
@@ -913,7 +920,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
 
-      params.diagnostics = true;
+      params.diagnostics = args.diagnostics ?? false;
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
       params.include_diff = true;
 
@@ -1049,16 +1056,18 @@ Example patch:
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with \`+\` even when creating a new file
 
-Returns: Status message string listing created, updated, moved, deleted, or failed file operations. May include inline LSP errors if type errors are introduced by the patch.`;
+Returns: Status message string listing created, updated, moved, deleted, or failed file operations. Edits return as soon as the write completes; LSP diagnostics are populated asynchronously. Pass \`diagnostics: true\` for legacy sync-wait behavior, or call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description: APPLY_PATCH_DESCRIPTION,
     args: {
       patchText: z.string().describe("The full patch text including Begin/End markers"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<string> => {
       const patchText = args.patchText as string;
+      const diagnostics = args.diagnostics ?? false;
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
@@ -1200,7 +1209,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 file: filePath,
                 content,
                 create_dirs: true,
-                diagnostics: true,
+                diagnostics,
                 include_diff: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
@@ -1273,7 +1282,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 file: targetPath,
                 content: newContent,
                 create_dirs: true,
-                diagnostics: true,
+                diagnostics,
                 include_diff: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
@@ -1777,7 +1786,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             file: filePath,
             content: normalizedArgs.content as string,
             create_dirs: normalizedArgs.create_dirs !== false,
-            diagnostics: true,
+            diagnostics: normalizedArgs.diagnostics ?? false,
           };
           const response = await callBridge(ctx, context, "write", writeParams);
           if (response.success === false) {
