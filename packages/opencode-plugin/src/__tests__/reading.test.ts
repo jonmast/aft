@@ -260,6 +260,43 @@ describe("reading tool adapters", () => {
     expect(sendCalls).toHaveLength(0);
   });
 
+  test("aft_zoom treats empty-content targets shapes as not provided (GPT empty-param regression)", async () => {
+    const root = await tempProject();
+    await Bun.write(`${root}/src/a.ts`, "export function foo() {}\nexport function bar() {}\n");
+    const { sendCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      file: "src/a.ts",
+      symbol: "foo",
+      text: "export function foo() {}",
+    }));
+
+    // Array of empty-content entries — GPT models send this shape instead of omitting `targets`.
+    // Plus `url: ""` (empty string). Both must be treated as not-provided so filePath wins
+    // and we don't get a misleading "targets is mutually exclusive" error.
+    await tools.aft_zoom.execute(
+      {
+        filePath: "src/a.ts",
+        url: "",
+        targets: [{ filePath: "", symbol: "" }],
+        symbols: "foo",
+      },
+      createMockSdkContext(root),
+    );
+    expect(sendCalls).toHaveLength(1);
+
+    // Single object form, same all-empty pattern.
+    sendCalls.length = 0;
+    await tools.aft_zoom.execute(
+      {
+        filePath: "src/a.ts",
+        targets: { filePath: "", symbol: "" },
+        symbols: "foo",
+      },
+      createMockSdkContext(root),
+    );
+    expect(sendCalls).toHaveLength(1);
+  });
+
   test("aft_zoom targets rejects empty filePath/symbol entries", async () => {
     const root = await tempProject();
     const { sendCalls, tools } = createMockReadingHarness(() => ({ success: true }));

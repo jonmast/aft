@@ -196,6 +196,38 @@ describe("reading tool adapters", () => {
     expect(calls).toHaveLength(0);
   });
 
+  test("aft_zoom treats empty-content targets shapes as not provided (GPT empty-param regression)", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      name: params.symbol as string,
+      kind: "function",
+      range: { start_line: 1, end_line: 5 },
+      content: "ok\n",
+    }));
+    registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
+
+    // Array of empty-content entries — GPT models send this shape instead of omitting `targets`.
+    // Plus `url: ""` (empty string). Both must be treated as not-provided so filePath wins
+    // and we don't get a misleading "targets is mutually exclusive" error.
+    await executeTool(tools.get("aft_zoom")!, {
+      filePath: "src.ts",
+      url: "",
+      targets: [{ filePath: "", symbol: "" }],
+      symbols: "ok",
+    });
+    expect(calls).toHaveLength(1);
+
+    // Single object form, same all-empty pattern.
+    calls.length = 0;
+    await executeTool(tools.get("aft_zoom")!, {
+      filePath: "src.ts",
+      targets: { filePath: "", symbol: "" },
+      symbols: "ok",
+    });
+    expect(calls).toHaveLength(1);
+  });
+
   test("aft_zoom symbols accepts string form for single-symbol lookup", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((_command, params) => ({

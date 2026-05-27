@@ -395,9 +395,24 @@ export function registerReadingTools(
         // instead of omitting optional params. Use `isEmptyParam` so e.g.
         // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
         // against fields the agent didn't actually intend to provide.
+        // `targets` also accepts nested object/array shapes — if all entries
+        // are empty (`[{filePath: "", symbol: ""}]`, `{filePath: "", symbol: ""}`),
+        // treat as not provided. `isEmptyParam` only catches top-level shapes.
+        const hasTargetsProvided = (t: unknown): boolean => {
+          if (isEmptyParam(t)) return false;
+          const entryProvided = (entry: unknown): boolean =>
+            !!entry &&
+            typeof entry === "object" &&
+            typeof (entry as { filePath?: unknown }).filePath === "string" &&
+            ((entry as { filePath: string }).filePath as string).length > 0 &&
+            typeof (entry as { symbol?: unknown }).symbol === "string" &&
+            ((entry as { symbol: string }).symbol as string).length > 0;
+          if (Array.isArray(t)) return t.some(entryProvided);
+          return entryProvided(t);
+        };
         const hasFilePath = !isEmptyParam(params.filePath);
         const hasUrl = !isEmptyParam(params.url);
-        const hasTargets = !isEmptyParam(params.targets);
+        const hasTargets = hasTargetsProvided(params.targets);
         const hasSymbols = !isEmptyParam(params.symbols);
 
         // Multi-target mode (cross-file). Mutually exclusive with the other
