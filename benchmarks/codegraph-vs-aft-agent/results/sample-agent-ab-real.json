@@ -1,6 +1,6 @@
 {
   "benchmark": "codegraph-vs-aft-agent",
-  "timestamp": "2026-05-27T05:41:49.528Z",
+  "timestamp": "2026-05-27T06:56:04.694Z",
   "model": "opencode-go/deepseek-v4-flash-free",
   "fallbackModel": "opencode-go/deepseek-v4-pro",
   "corpus": "agent-fixture",
@@ -14,21 +14,21 @@
       "runs": 1,
       "successRate": 1,
       "successes": 1,
-      "tokensTotal": 13623,
-      "tokensMedian": 13623,
-      "wallTimeMsMedian": 15358.208,
-      "wallTimeMsP95": 15358.208,
-      "toolCallsMedian": 3
+      "tokensTotal": 13512,
+      "tokensMedian": 13512,
+      "wallTimeMsMedian": 11469.115,
+      "wallTimeMsP95": 11469.115,
+      "toolCallsMedian": 1
     },
     "codegraph": {
       "runs": 1,
       "successRate": 1,
       "successes": 1,
-      "tokensTotal": 10507,
-      "tokensMedian": 10507,
-      "wallTimeMsMedian": 6217.955,
-      "wallTimeMsP95": 6217.955,
-      "toolCallsMedian": 1
+      "tokensTotal": 10504,
+      "tokensMedian": 10504,
+      "wallTimeMsMedian": 7118.596,
+      "wallTimeMsP95": 7118.596,
+      "toolCallsMedian": 2
     }
   },
   "results": [
@@ -39,18 +39,18 @@
       "success": true,
       "model": "opencode-go/deepseek-v4-flash-free",
       "attemptedModel": "opencode-go/deepseek-v4-flash-free",
-      "wallTimeMs": 15358.208,
+      "wallTimeMs": 11469.115,
       "exitCode": 0,
       "tokens": {
         "input": 12696,
-        "output": 106,
-        "total": 13623
+        "output": 64,
+        "total": 13512
       },
-      "toolCalls": 3,
-      "answerText": "```json\n{\n  \"file\": \"src/pricing.ts\",\n  \"symbol\": \"applyLoyaltyDiscount\"\n}\n```",
-      "stdoutPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T05-41-27-564Z/answer-loyalty-discount/aft/opencode.stdout.jsonl",
-      "stderrPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T05-41-27-564Z/answer-loyalty-discount/aft/opencode.stderr.log",
-      "repoPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T05-41-27-564Z/answer-loyalty-discount/aft/repo",
+      "toolCalls": 1,
+      "answerText": "```json\n{\"file\": \"src/pricing.ts\", \"symbol\": \"applyLoyaltyDiscount\"}\n```",
+      "stdoutPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/aft/opencode.stdout.jsonl",
+      "stderrPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/aft/opencode.stderr.log",
+      "repoPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/aft/repo",
       "checks": [
         {
           "check": {
@@ -71,18 +71,18 @@
       "success": true,
       "model": "opencode-go/deepseek-v4-flash-free",
       "attemptedModel": "opencode-go/deepseek-v4-flash-free",
-      "wallTimeMs": 6217.955,
+      "wallTimeMs": 7118.596,
       "exitCode": 0,
       "tokens": {
         "input": 10274,
-        "output": 85,
-        "total": 10507
+        "output": 98,
+        "total": 10504
       },
-      "toolCalls": 1,
-      "answerText": "{\"file\": \"src/pricing.ts\", \"symbol\": \"applyLoyaltyDiscount\"}",
-      "stdoutPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T05-41-27-564Z/answer-loyalty-discount/codegraph/opencode.stdout.jsonl",
-      "stderrPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T05-41-27-564Z/answer-loyalty-discount/codegraph/opencode.stderr.log",
-      "repoPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T05-41-27-564Z/answer-loyalty-discount/codegraph/repo",
+      "toolCalls": 2,
+      "answerText": "```json\n{\"file\": \"src/pricing.ts\", \"symbol\": \"applyLoyaltyDiscount\"}\n```",
+      "stdoutPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/codegraph/opencode.stdout.jsonl",
+      "stderrPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/codegraph/opencode.stderr.log",
+      "repoPath": "/workspace/benchmarks/codegraph-vs-aft-agent/.bench/runs/2026-05-27T06-55-25-162Z/answer-loyalty-discount/codegraph/repo",
       "checks": [
         {
           "check": {

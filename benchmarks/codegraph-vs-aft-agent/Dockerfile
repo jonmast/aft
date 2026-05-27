@@ -49,7 +49,8 @@ WORKDIR /workspace
 COPY . /workspace
 
 RUN bun install --frozen-lockfile
-RUN cargo build --release -p agent-file-tools
+RUN cargo build --release -p agent-file-tools \
+  && cp /workspace/target/release/aft /usr/local/bin/aft
 RUN bun run --filter @cortexkit/aft-bridge build \
   && bun run --filter @cortexkit/aft-opencode build
 

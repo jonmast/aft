@@ -25,15 +25,38 @@ class AftRetrievalDriver implements RetrievalDriver {
     if (!existsSync(this.context.aftBinary)) {
       throw new Error(`AFT binary not found: ${this.context.aftBinary}`);
     }
+    const storageDir = process.env.AFT_STORAGE_DIR ?? join(homedir(), ".cache", "aft");
     const ortDir = process.env.ORT_DYLIB_PATH
       ? dirname(process.env.ORT_DYLIB_PATH)
-      : await ensureOnnxRuntime(process.env.AFT_STORAGE_DIR ?? join(homedir(), ".cache", "aft"));
+      : await ensureOnnxRuntime(storageDir);
+    const warmup = await runCommand(
+      [
+        this.context.aftBinary,
+        "warmup",
+        "--root",
+        this.context.codebasePath,
+        "--timeout",
+        String(this.context.timeoutMs),
+        "--quiet",
+      ],
+      HARNESS_DIR,
+      this.context.timeoutMs,
+      {
+        AFT_STORAGE_DIR: storageDir,
+        FASTEMBED_CACHE_DIR: join(storageDir, "semantic", "models"),
+      },
+    );
+    if (warmup.exitCode !== 0) {
+      throw new Error(`aft warmup failed: ${warmup.stderr || warmup.stdout}`);
+    }
+
     this.bridge = new BinaryBridge(
       this.context.aftBinary,
       this.context.codebasePath,
       { timeoutMs: this.context.timeoutMs, errorPrefix: "[aft-vs-codegraph-retrieval]" },
       {
         harness: "opencode",
+        storage_dir: storageDir,
         search_index: true,
         semantic_search: true,
         experimental_search_index: true,
@@ -46,6 +69,7 @@ class AftRetrievalDriver implements RetrievalDriver {
       {
         project_root: this.context.codebasePath,
         harness: "opencode",
+        storage_dir: storageDir,
         search_index: true,
         semantic_search: true,
         experimental_search_index: true,

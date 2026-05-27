@@ -1,7 +1,7 @@
 {
   "benchmark": "codegraph-vs-aft-retrieval",
   "driver": "aft",
-  "timestamp": "2026-05-27T05:14:08.163Z",
+  "timestamp": "2026-05-27T07:06:14.960Z",
   "corpus": "opencode-aft",
   "corpusPath": "/workspace/benchmarks/codegraph-vs-aft-retrieval/corpora/opencode-aft.json",
   "codebasePath": "/workspace",
@@ -16,8 +16,8 @@
     "meanPrecisionAt1": 0.666667,
     "meanPrecisionAt5": 0.3,
     "meanPrecisionAt10": 0.233333,
-    "latencyMsP50": 4.4,
-    "latencyMsP95": 97.407
+    "latencyMsP50": 4.141,
+    "latencyMsP95": 65.48
   },
   "results": [
     {
@@ -39,7 +39,7 @@
         }
       ],
       "missed": [],
-      "latencyMs": 97.407,
+      "latencyMs": 65.48,
       "resultCount": 10,
       "results": [
         {
@@ -163,7 +163,7 @@
         }
       ],
       "missed": [],
-      "latencyMs": 3.38,
+      "latencyMs": 4.121,
       "resultCount": 10,
       "results": [
         {
@@ -287,7 +287,7 @@
         }
       ],
       "missed": [],
-      "latencyMs": 3.501,
+      "latencyMs": 4.14,
       "resultCount": 10,
       "results": [
         {
@@ -422,7 +422,7 @@
           "startLine": 272
         }
       ],
-      "latencyMs": 8.288,
+      "latencyMs": 4.882,
       "resultCount": 10,
       "results": [
         {
@@ -490,8 +490,8 @@
           "file": "packages/opencode-plugin/src/tools/hoisted.ts",
           "symbol": "aftPrefixedTools",
           "kind": "function",
-          "startLine": 1713,
-          "endLine": 1810,
+          "startLine": 1722,
+          "endLine": 1819,
           "score": 0.6226973533630371,
           "text": "/**\n * Returns the same tools with aft_ prefix (for when hoisting is disabled).\n */\nexport function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {\n  const aftEditTool = createEditTool(ctx, \"aft_write\");\n  ..."
         },
@@ -557,7 +557,7 @@
           "startLine": 58
         }
       ],
-      "latencyMs": 7.885,
+      "latencyMs": 4.141,
       "resultCount": 10,
       "results": [
         {
@@ -697,7 +697,7 @@
           "startLine": 399
         }
       ],
-      "latencyMs": 4.4,
+      "latencyMs": 7.155,
       "resultCount": 10,
       "results": [
         {

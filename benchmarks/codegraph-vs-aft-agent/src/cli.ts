@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { AgentArm, AgentCheck, AgentCorpus, AgentReport, AgentRunResult, AgentTask, TokenUsage } from "./types";
 import { copyFixture, ensureExists, HARNESS_DIR, percentile, readOpencodeAuthKey, resetDir, round, runCommand, writeJson } from "./util";
@@ -56,7 +57,7 @@ async function runTaskArm(task: AgentTask, arm: AgentArm, fixturePath: string, o
   const stderrPath = resolve(runDir, "opencode.stderr.log");
   mkdirSync(runDir, { recursive: true });
   copyFixture(fixturePath, repoPath);
-  await prepareArm(arm, repoPath, configRoot, options.timeoutMs);
+  await prepareArm(arm, repoPath, configRoot, options.timeoutMs, options.dryRun);
 
   const attemptedModel = options.model;
   let model = attemptedModel;
@@ -119,7 +120,13 @@ async function runTaskArm(task: AgentTask, arm: AgentArm, fixturePath: string, o
   };
 }
 
-async function prepareArm(arm: AgentArm, repoPath: string, configRoot: string, timeoutMs: number): Promise<void> {
+async function prepareArm(
+  arm: AgentArm,
+  repoPath: string,
+  configRoot: string,
+  timeoutMs: number,
+  dryRun: boolean,
+): Promise<void> {
   const opencodeDir = resolve(configRoot, "opencode");
   mkdirSync(opencodeDir, { recursive: true });
   const provider = zenProviderConfig();
@@ -132,6 +139,21 @@ async function prepareArm(arm: AgentArm, repoPath: string, configRoot: string, t
     });
     writeFileSync(resolve(opencodeDir, "aft.jsonc"), '{\n  "experimental_search_index": true,\n  "experimental_semantic_search": true\n}\n');
     writeFileSync(resolve(opencodeDir, "AGENTS.md"), aftInstructions());
+    if (!dryRun) {
+      const storageDir = cortexKitStorageRoot();
+      const warmup = await runCommand(
+        ["aft", "warmup", "--root", repoPath, "--timeout", String(timeoutMs), "--quiet"],
+        HARNESS_DIR,
+        timeoutMs,
+        {
+          AFT_STORAGE_DIR: storageDir,
+          FASTEMBED_CACHE_DIR: join(storageDir, "semantic", "models"),
+        },
+      );
+      if (warmup.exitCode !== 0) {
+        throw new Error(`aft warmup failed: ${warmup.stderr || warmup.stdout}`);
+      }
+    }
     return;
   }
 
@@ -161,6 +183,7 @@ async function invokeOpencode(task: AgentTask, repoPath: string, configRoot: str
     throw new Error("Missing opencode-go auth. Mount ~/.local/share/opencode/auth.json or set OPENCODE_API_KEY.");
   }
   const prompt = benchmarkPrompt(task);
+  const storageDir = cortexKitStorageRoot();
   const result = await runCommand(
     [
       "opencode",
@@ -178,6 +201,11 @@ async function invokeOpencode(task: AgentTask, repoPath: string, configRoot: str
     task.timeoutMs ?? timeoutMs,
     {
       XDG_CONFIG_HOME: configRoot,
+      XDG_DATA_HOME: cortexKitDataHome(),
+      AFT_STORAGE_DIR: storageDir,
+      AFT_WAIT_FOR_SEMANTIC_READY: "1",
+      AFT_WAIT_FOR_SEMANTIC_READY_MS: String(timeoutMs),
+      FASTEMBED_CACHE_DIR: join(storageDir, "semantic", "models"),
       OPENAI_API_KEY: apiKey,
       OPENCODE_API_KEY: apiKey,
       AFT_BENCHMARK: "1",
@@ -373,6 +401,14 @@ function codegraphInstructions(): string {
 
 function codegraphEnv(): Record<string, string> {
   return { CI: "1", CODEGRAPH_NO_WATCH: "1", CODEGRAPH_NO_DAEMON: "1" };
+}
+
+function cortexKitDataHome(): string {
+  return process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
+}
+
+function cortexKitStorageRoot(): string {
+  return join(cortexKitDataHome(), "cortexkit", "aft");
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
