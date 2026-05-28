@@ -80,7 +80,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // Codebase health — needs aft_inspect (recommended+).
   if (hasInspect) {
     sections.push(
-      "**Codebase health**: Use `aft_inspect` when starting in unfamiliar code, before refactors/reviews, or to verify cleanup completeness. It summarizes TODOs, metrics, dead code, unused exports, and duplicates in one call; pass `sections` for focused drill-down, and check `stale_categories` when Tier 2 refreshes are still warming.",
+      "**Codebase health**: Use `aft_inspect` when starting in unfamiliar code, before refactors/reviews, or to verify cleanup completeness. It summarizes TODOs, metrics, dead code, unused exports, and duplicates in one call; pass `sections` for focused drill-down, and treat `stale_categories` as a genuine stale-cache signal while an async Tier 2 refresh catches up.",
     );
   }
 

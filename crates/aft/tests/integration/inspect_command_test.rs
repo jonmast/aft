@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
@@ -58,7 +60,7 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
     serde_json::to_value(response).expect("inspect response serializes")
 }
 
-fn tier2_run(ctx: &AppContext, categories: &[&str]) {
+fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
     let response = handle_inspect_tier2_run(
         &request(json!({
             "id": "tier2-run",
@@ -69,6 +71,78 @@ fn tier2_run(ctx: &AppContext, categories: &[&str]) {
     );
     let value = serde_json::to_value(response).expect("tier2_run response serializes");
     assert_eq!(value["success"], true, "tier2_run failed: {value:#}");
+    value
+}
+
+fn tier2_run(ctx: &AppContext, categories: &[&str]) {
+    enqueue_tier2_run(ctx, categories);
+    wait_for_tier2(ctx, categories);
+}
+
+fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        ctx.inspect_manager().drain_completions();
+        let response = inspect(
+            ctx,
+            json!({
+                "id": "inspect-tier2-wait",
+                "command": "inspect",
+            }),
+        );
+        assert_eq!(
+            response["success"], true,
+            "inspect failed while waiting: {response:#}"
+        );
+
+        let failed = scanner_state_categories(&response, "failed_categories");
+        assert!(
+            failed.is_empty(),
+            "tier2 failed while waiting: {response:#}"
+        );
+
+        let pending = scanner_state_categories(&response, "pending_categories");
+        let stale = scanner_state_categories(&response, "stale_categories");
+        let still_warming = categories.iter().any(|category| {
+            pending.iter().any(|pending| pending == category)
+                || stale.iter().any(|stale| stale == category)
+        });
+        if !still_warming {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for tier2 categories {categories:?}: {response:#}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn scanner_state_categories(response: &Value, key: &str) -> Vec<String> {
+    response["scanner_state"][key]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(category) = item.as_str() {
+                        Some(category.to_string())
+                    } else {
+                        item.get("category")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn scanner_state_contains(response: &Value, key: &str, category: &str) -> bool {
+    scanner_state_categories(response, key)
+        .iter()
+        .any(|value| value == category)
 }
 
 #[test]
@@ -211,6 +285,49 @@ fn inspect_command_dead_code_returns_pending_before_tier2_run() {
     );
 }
 
+#[test]
+fn inspect_tier2_run_returns_promptly_with_background_in_flight() {
+    let (_temp_dir, root) = fixture_project();
+    for index in 0..40 {
+        write_file(
+            &root,
+            &format!("src/file_{index:03}.ts"),
+            &format!(
+                "export function unused_{index}() {{ return {index}; }}
+"
+            ),
+        );
+    }
+    let ctx = configured_context(&root);
+
+    let started = Instant::now();
+    let response = enqueue_tier2_run(&ctx, &["dead_code"]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "inspect_tier2_run should enqueue without scanning inline; elapsed={elapsed:?} response={response:#}"
+    );
+    assert!(
+        response["queued_categories"]
+            .as_array()
+            .expect("queued_categories array")
+            .iter()
+            .any(|category| category.as_str() == Some("dead_code")),
+        "dead_code should be queued: {response:#}"
+    );
+    assert!(
+        response["in_flight_categories"]
+            .as_array()
+            .expect("in_flight_categories array")
+            .iter()
+            .any(|category| category.as_str() == Some("dead_code")),
+        "dead_code should be marked in-flight: {response:#}"
+    );
+
+    wait_for_tier2(&ctx, &["dead_code"]);
+}
+
 fn duplicate_fixture_source() -> &'static str {
     r#"
 export function calculate(input: number) {
@@ -222,6 +339,76 @@ export function calculate(input: number) {
   return fifth + second;
 }
 "#
+}
+
+#[test]
+fn inspect_command_tier2_warm_cache_hit_is_not_stale() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["duplicates"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-duplicates-warm-cache",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert!(
+        !scanner_state_contains(&response, "stale_categories", "duplicates"),
+        "warm duplicate cache hit must not be marked stale: {response:#}"
+    );
+    assert!(
+        !scanner_state_contains(&response, "pending_categories", "duplicates"),
+        "warm duplicate cache hit must not be marked pending: {response:#}"
+    );
+    assert!(
+        response["summary"]["duplicates"]["total_groups"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "duplicates aggregate should be available from cache: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_tier2_changed_file_surfaces_stale_category() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["duplicates"]);
+    write_file(
+        &root,
+        "src/foo.ts",
+        "export function changed(input: number) { return input + 42; }\n",
+    );
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-duplicates-stale-cache",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert!(
+        scanner_state_contains(&response, "stale_categories", "duplicates"),
+        "changed duplicate source should mark cached aggregate stale: {response:#}"
+    );
+    assert!(
+        response["summary"]["duplicates"]["total_groups"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "stale duplicate cache should still expose cached summary: {response:#}"
+    );
 }
 
 fn dead_code_items(response: &Value) -> Vec<(String, String)> {

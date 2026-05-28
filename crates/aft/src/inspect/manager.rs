@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{after, bounded, select, Receiver, Sender};
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -12,9 +13,13 @@ use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
-    normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
-    InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    normalize_path, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution,
+    InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
+    JobOutcome, JobScope,
 };
+use crate::cache_freshness::FileFreshness;
+use crate::callgraph::{CallGraph, EdgeResolution};
+use crate::symbols::SymbolKind;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -23,6 +28,18 @@ type WaiterTx = Sender<JobOutcome>;
 #[derive(Clone)]
 struct Waiter {
     tx: WaiterTx,
+}
+
+struct CachedContributionFreshness {
+    file_path: PathBuf,
+    freshness: FileFreshness,
+}
+
+#[derive(PartialEq, Eq)]
+struct ContributionFingerprint {
+    count: usize,
+    mtime_sum: u128,
+    size_sum: u128,
 }
 
 pub struct InspectManager {
@@ -129,6 +146,44 @@ impl InspectManager {
         Ok(key)
     }
 
+    pub fn submit_tier2_run_with_reuse_background(
+        self: &Arc<Self>,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+    ) -> Result<JobKey, String> {
+        if !category.is_active() {
+            return Err(format!(
+                "inspect category '{category}' is disabled in v0.33"
+            ));
+        }
+        if !category.is_tier2() {
+            return Err(format!(
+                "inspect category '{category}' is not a Tier 2 category"
+            ));
+        }
+
+        let job = self.tier2_reuse_job(snapshot, category, None);
+        let key = job.key.clone();
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
+        if in_flight.contains_key(&key) {
+            return Ok(key);
+        }
+        in_flight.insert(key.clone(), Vec::new());
+        drop(in_flight);
+
+        let manager = Arc::clone(self);
+        let pool = Arc::clone(&self.pool);
+        pool.spawn(move || {
+            let result = manager.tier2_run_with_reuse_job_result(job);
+            manager.route_tier2_reuse_completion(result);
+        });
+
+        Ok(key)
+    }
+
     pub fn drain_completions(&self) -> usize {
         let mut drained = 0usize;
         while let Ok(result) = self.result_rx.try_recv() {
@@ -185,10 +240,10 @@ impl InspectManager {
     }
 
     /// Read-only Tier 2 aggregate lookup for `aft_inspect`. Does NOT run any
-    /// scanner or freshness pass — returns the latest cached aggregate if
-    /// present, otherwise `Pending`. This is the non-blocking variant intended
-    /// for the synchronous `inspect` command path; Tier 2 scans run via
-    /// `tier2_run_with_reuse` triggered by `aft_inspect_tier2_run` on
+    /// scanner — returns the latest cached aggregate if present and verifies
+    /// its contribution freshness so warm cache hits are reported as fresh.
+    /// This is the non-blocking variant intended for the synchronous `inspect`
+    /// command path; Tier 2 scans run via `aft_inspect_tier2_run` on
     /// `session.idle`.
     pub fn tier2_read_cached(
         &self,
@@ -218,18 +273,76 @@ impl InspectManager {
             .map(|guard| guard.contains_key(&key))
             .unwrap_or(false);
         match cache.get_aggregated(&key) {
-            Ok(Some(payload)) => filter_outcome_for_scope(
-                JobOutcome::Stale {
-                    cached: Some(payload),
-                    in_flight,
-                },
-                &caller_scope,
-            ),
+            Ok(Some(payload)) => {
+                match self.tier2_cached_aggregate_is_fresh(&snapshot, category, cache.as_ref()) {
+                    Ok(true) => {
+                        filter_outcome_for_scope(JobOutcome::Fresh { payload }, &caller_scope)
+                    }
+                    Ok(false) => filter_outcome_for_scope(
+                        JobOutcome::Stale {
+                            cached: Some(payload),
+                            in_flight,
+                        },
+                        &caller_scope,
+                    ),
+                    Err(message) => JobOutcome::Failed { message },
+                }
+            }
             Ok(None) => JobOutcome::Pending { in_flight },
             Err(error) => JobOutcome::Failed {
                 message: error.to_string(),
             },
         }
+    }
+
+    fn tier2_cached_aggregate_is_fresh(
+        &self,
+        snapshot: &InspectSnapshot,
+        category: InspectCategory,
+        cache: &InspectCache,
+    ) -> Result<bool, String> {
+        let cached_records = load_contribution_freshness(cache, category)?;
+        let project_scope = JobScope::for_project(snapshot.project_root.clone());
+        let project_files = scope_files(&snapshot.project_root, &project_scope);
+        let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
+        let cached_relative = cached_records
+            .iter()
+            .map(freshness_record_relative_key)
+            .collect::<BTreeSet<_>>();
+
+        for record in &cached_records {
+            let relative = freshness_record_relative_key(record);
+            if !current_by_relative.contains_key(&relative) {
+                return Ok(false);
+            }
+
+            let absolute = if record.file_path.is_absolute() {
+                record.file_path.clone()
+            } else {
+                snapshot.project_root.join(&record.file_path)
+            };
+            match verify_contribution_file(&absolute, &record.freshness) {
+                ContributionFreshness::Fresh {
+                    metadata_changed,
+                    freshness,
+                } => {
+                    if metadata_changed {
+                        cache
+                            .update_content_fresh_metadata(
+                                category,
+                                &PathBuf::from(&relative),
+                                &freshness,
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                ContributionFreshness::Stale | ContributionFreshness::Deleted => return Ok(false),
+            }
+        }
+
+        Ok(current_by_relative
+            .keys()
+            .all(|relative| cached_relative.contains(relative)))
     }
 
     #[doc(hidden)]
@@ -239,28 +352,39 @@ impl InspectManager {
         category: InspectCategory,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> InspectResult {
-        let started = Instant::now();
         let job = self.tier2_reuse_job(snapshot, category, callgraph_snapshot);
+        self.tier2_run_with_reuse_job_result(job)
+    }
 
-        if !category.is_active() {
+    fn tier2_run_with_reuse_job_result(&self, mut job: InspectJob) -> InspectResult {
+        let started = Instant::now();
+        if !job.category.is_active() {
             return InspectResult::failed(
                 &job,
-                format!("inspect category '{category}' is disabled in v0.33"),
+                format!("inspect category '{}' is disabled in v0.33", job.category),
                 started.elapsed(),
             );
         }
-        if !category.is_tier2() {
+        if !job.category.is_tier2() {
             return InspectResult::failed(
                 &job,
-                format!("inspect category '{category}' is not a Tier 2 category"),
+                format!(
+                    "inspect category '{}' is not a Tier 2 category",
+                    job.category
+                ),
                 started.elapsed(),
             );
         }
 
+        let project_scope = JobScope::for_project(job.project_root.clone());
+        job.scope_files = scope_files(&job.project_root, &project_scope);
         let cache = match self.cache_for_paths(job.inspect_dir.clone(), job.project_root.clone()) {
             Ok(cache) => cache,
             Err(message) => return InspectResult::failed(&job, message, started.elapsed()),
         };
+        if let Ok(Some(success)) = self.tier2_quick_reuse_success(&job, cache.as_ref()) {
+            return InspectResult::success(&job, success, started.elapsed());
+        }
 
         match self.tier2_run_with_reuse_job(&job, &cache) {
             Ok(success) => InspectResult::success(&job, success, started.elapsed()),
@@ -274,13 +398,11 @@ impl InspectManager {
         category: InspectCategory,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> InspectJob {
-        let project_scope = JobScope::for_project(snapshot.project_root.clone());
-        let scope_files = scope_files(&snapshot.project_root, &project_scope);
         InspectJob {
             job_id: self.next_job_id.fetch_add(1, Ordering::Relaxed),
             key: JobKey::for_project_category(category),
             category,
-            scope_files,
+            scope_files: Vec::new(),
             project_root: snapshot.project_root,
             inspect_dir: snapshot.inspect_dir,
             config: snapshot.config,
@@ -289,25 +411,53 @@ impl InspectManager {
         }
     }
 
+    fn tier2_quick_reuse_success(
+        &self,
+        job: &InspectJob,
+        cache: &InspectCache,
+    ) -> Result<Option<InspectScanSuccess>, String> {
+        let Some(aggregate) = cache
+            .get_aggregated(&job.key)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let cached = load_contribution_fingerprint(cache, job.category)?;
+        let current = current_file_fingerprint(&job.scope_files)?;
+        if cached != current {
+            return Ok(None);
+        }
+
+        cache
+            .touch_tier2_last_full_run(job.category)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(InspectScanSuccess {
+            scanned_files: Vec::new(),
+            contributions: Vec::new(),
+            aggregate,
+        }))
+    }
+
     fn tier2_run_with_reuse_job(
         &self,
         job: &InspectJob,
         cache: &InspectCache,
     ) -> Result<InspectScanSuccess, String> {
-        let cached_records = cache
-            .load_tier2_contributions(job.category)
-            .map_err(|error| error.to_string())?;
+        let cached_records = load_contribution_freshness(cache, job.category)?;
         let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
         let cached_relative = cached_records
             .iter()
-            .map(record_relative_key)
+            .map(freshness_record_relative_key)
             .collect::<BTreeSet<_>>();
+        #[cfg(debug_assertions)]
+        let cold_cache = cached_relative.is_empty();
 
         let mut updates = Tier2ContributionUpdates::default();
         let mut scan_by_relative = BTreeMap::<String, PathBuf>::new();
+        let mut aggregate_job = job.clone();
 
         for record in cached_records {
-            let relative = record_relative_key(&record);
+            let relative = freshness_record_relative_key(&record);
             let relative_path = PathBuf::from(&relative);
             let Some(current_file) = current_by_relative.get(&relative) else {
                 updates.deletes.push(relative_path);
@@ -345,6 +495,17 @@ impl InspectManager {
             let mut scan_job = job.clone();
             scan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
             scan_job.scope_files = scan_files.clone();
+            if scan_job.category == InspectCategory::DeadCode
+                && scan_job.callgraph_snapshot.is_none()
+            {
+                scan_job.callgraph_snapshot =
+                    Some(build_tier2_callgraph_snapshot(&scan_job.project_root));
+            }
+            aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
+            #[cfg(debug_assertions)]
+            if cold_cache {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let scan_result = run_tier2_scan(&scan_job);
             let scan_success = scan_result.outcome.map_err(|message| {
                 format!("{} incremental scan failed: {message}", job.category)
@@ -355,6 +516,22 @@ impl InspectManager {
         let has_updates = !updates.upserts.is_empty()
             || !updates.deletes.is_empty()
             || !updates.metadata_updates.is_empty();
+        if !has_updates {
+            if let Some(aggregate) = cache
+                .get_aggregated(&job.key)
+                .map_err(|error| error.to_string())?
+            {
+                cache
+                    .touch_tier2_last_full_run(job.category)
+                    .map_err(|error| error.to_string())?;
+                return Ok(InspectScanSuccess {
+                    scanned_files: scan_files,
+                    contributions: Vec::new(),
+                    aggregate,
+                });
+            }
+        }
+
         let contribution_set_hash = if has_updates {
             cache
                 .apply_contribution_updates(job.category, updates)
@@ -380,8 +557,14 @@ impl InspectManager {
             });
         }
 
-        let contributions = load_contributions(cache, job)?;
-        let aggregate = roll_up_tier2_contributions(job, &contributions);
+        if aggregate_job.category == InspectCategory::DeadCode
+            && aggregate_job.callgraph_snapshot.is_none()
+        {
+            aggregate_job.callgraph_snapshot =
+                Some(build_tier2_callgraph_snapshot(&aggregate_job.project_root));
+        }
+        let contributions = load_contributions(cache, &aggregate_job)?;
+        let aggregate = roll_up_tier2_contributions(&aggregate_job, &contributions);
         cache
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
@@ -553,6 +736,24 @@ impl InspectManager {
         }
     }
 
+    fn route_tier2_reuse_completion(&self, result: InspectResult) {
+        let outcome = match result.outcome.clone() {
+            Ok(success) => JobOutcome::Fresh {
+                payload: success.aggregate,
+            },
+            Err(message) => JobOutcome::Failed { message },
+        };
+        let waiters = self
+            .in_flight
+            .lock()
+            .ok()
+            .and_then(|mut in_flight| in_flight.remove(&result.key))
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.tx.send(outcome.clone());
+        }
+    }
+
     fn completion_outcome(&self, result: InspectResult) -> JobOutcome {
         let cache =
             match self.cache_for_paths(result.inspect_dir.clone(), result.project_root.clone()) {
@@ -608,8 +809,232 @@ fn current_project_files(project_root: &Path, files: &[PathBuf]) -> BTreeMap<Str
         .collect()
 }
 
-fn record_relative_key(record: &super::cache::ContributionRecord) -> String {
+fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot> {
+    let mut graph = CallGraph::new(project_root.to_path_buf());
+    let graph_files = graph.project_files().to_vec();
+    let files = graph_files
+        .iter()
+        .map(canonicalize_for_snapshot)
+        .collect::<Vec<_>>();
+
+    let mut exported_symbols = Vec::new();
+    let mut outbound_calls = Vec::new();
+    let mut entry_points = BTreeSet::new();
+
+    for file in &graph_files {
+        let snapshot_file = canonicalize_for_snapshot(file);
+        if is_entry_point_file(project_root, &snapshot_file) {
+            entry_points.insert(snapshot_file.clone());
+        }
+
+        let file_data = match graph.build_file(file) {
+            Ok(file_data) => file_data.clone(),
+            Err(_) => continue,
+        };
+
+        for symbol in &file_data.exported_symbols {
+            let metadata = file_data.symbol_metadata.get(symbol);
+            exported_symbols.push(CallgraphExport {
+                file: snapshot_file.clone(),
+                symbol: symbol.clone(),
+                kind: metadata
+                    .map(|metadata| symbol_kind_name(&metadata.kind))
+                    .unwrap_or("unknown")
+                    .to_string(),
+                line: metadata.map(|metadata| metadata.line).unwrap_or(1),
+            });
+        }
+
+        for calls in file_data.calls_by_symbol.values() {
+            for call in calls {
+                let target = match graph.resolve_cross_file_edge(
+                    &call.full_callee,
+                    &call.callee_name,
+                    file,
+                    &file_data.import_block,
+                ) {
+                    EdgeResolution::Resolved { file, symbol } => {
+                        let file = canonicalize_for_snapshot(&file);
+                        format!("{}::{symbol}", file.display())
+                    }
+                    EdgeResolution::Unresolved { callee_name } => callee_name,
+                };
+                outbound_calls.push(CallgraphOutboundCall {
+                    caller_file: snapshot_file.clone(),
+                    target,
+                    line: call.line,
+                });
+            }
+        }
+    }
+
+    Arc::new(CallgraphSnapshot {
+        generated_at: Some(SystemTime::now()),
+        files,
+        exported_symbols,
+        outbound_calls,
+        entry_points,
+    })
+}
+
+fn canonicalize_for_snapshot(path: &PathBuf) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+}
+
+fn is_entry_point_file(project_root: &Path, file: &Path) -> bool {
+    let relative = file.strip_prefix(project_root).unwrap_or(file);
+    let relative_display = relative.to_string_lossy().replace('\\', "/");
+    if relative_display.starts_with("bin/") || relative_display.contains("/bin/") {
+        return true;
+    }
+
+    let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        file_name,
+        "main.rs"
+            | "main.ts"
+            | "main.tsx"
+            | "main.js"
+            | "main.jsx"
+            | "main.py"
+            | "main.go"
+            | "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.jsx"
+    ) || (file_name == "lib.rs" && project_root.join("Cargo.toml").exists())
+}
+
+fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Class => "class",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Enum => "enum",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Heading => "heading",
+        SymbolKind::FileSummary => "file_summary",
+    }
+}
+
+fn load_contribution_fingerprint(
+    cache: &InspectCache,
+    category: InspectCategory,
+) -> Result<ContributionFingerprint, String> {
+    let conn = Connection::open(cache.sqlite_path()).map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_mtime_ns, file_size              FROM tier2_contributions              WHERE category = ?1 AND project_key = ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![category.as_str(), cache.project_key()], |row| {
+            let mtime_ns: i64 = row.get(0)?;
+            let file_size: i64 = row.get(1)?;
+            Ok((mtime_ns, file_size))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut fingerprint = ContributionFingerprint {
+        count: 0,
+        mtime_sum: 0,
+        size_sum: 0,
+    };
+    for row in rows {
+        let (mtime_ns, file_size) = row.map_err(|error| error.to_string())?;
+        fingerprint.count += 1;
+        fingerprint.mtime_sum = fingerprint.mtime_sum.wrapping_add(mtime_ns.max(0) as u128);
+        fingerprint.size_sum = fingerprint.size_sum.wrapping_add(file_size.max(0) as u128);
+    }
+    Ok(fingerprint)
+}
+
+fn current_file_fingerprint(files: &[PathBuf]) -> Result<ContributionFingerprint, String> {
+    let mut fingerprint = ContributionFingerprint {
+        count: 0,
+        mtime_sum: 0,
+        size_sum: 0,
+    };
+    for file in files {
+        let metadata = std::fs::metadata(file)
+            .map_err(|error| format!("failed to stat {}: {error}", file.display()))?;
+        let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+        fingerprint.count += 1;
+        fingerprint.mtime_sum = fingerprint
+            .mtime_sum
+            .wrapping_add(system_time_to_ns_u128(mtime));
+        fingerprint.size_sum = fingerprint.size_sum.wrapping_add(metadata.len() as u128);
+    }
+    Ok(fingerprint)
+}
+
+fn load_contribution_freshness(
+    cache: &InspectCache,
+    category: InspectCategory,
+) -> Result<Vec<CachedContributionFreshness>, String> {
+    let conn = Connection::open(cache.sqlite_path()).map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_path, file_mtime_ns, file_size, file_hash              FROM tier2_contributions              WHERE category = ?1 AND project_key = ?2              ORDER BY file_path ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![category.as_str(), cache.project_key()], |row| {
+            let file_path: String = row.get(0)?;
+            let mtime_ns: i64 = row.get(1)?;
+            let file_size: i64 = row.get(2)?;
+            let file_hash: String = row.get(3)?;
+            Ok((file_path, mtime_ns, file_size, file_hash))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let (file_path, mtime_ns, file_size, file_hash) = row.map_err(|error| error.to_string())?;
+        records.push(CachedContributionFreshness {
+            file_path: PathBuf::from(file_path),
+            freshness: FileFreshness {
+                mtime: ns_to_system_time(mtime_ns),
+                size: file_size.max(0) as u64,
+                content_hash: hash_from_hex(&file_hash)?,
+            },
+        });
+    }
+    Ok(records)
+}
+
+fn freshness_record_relative_key(record: &CachedContributionFreshness) -> String {
     record.file_path.to_string_lossy().to_string()
+}
+
+fn system_time_to_ns_u128(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos()
+}
+
+fn ns_to_system_time(value: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
+}
+
+fn hash_from_hex(value: &str) -> Result<blake3::Hash, String> {
+    if value.len() != 64 {
+        return Err(format!("inspect cache invalid blake3 hash: {value}"));
+    }
+    let mut bytes = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk)
+            .map_err(|_| format!("inspect cache invalid blake3 hash: {value}"))?;
+        bytes[index] = u8::from_str_radix(hex, 16)
+            .map_err(|_| format!("inspect cache invalid blake3 hash: {value}"))?;
+    }
+    Ok(blake3::Hash::from_bytes(bytes))
 }
 
 fn relative_cache_key(project_root: &Path, path: &Path) -> String {
