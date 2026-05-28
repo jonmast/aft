@@ -37,6 +37,7 @@ pub struct HybridResult {
     pub source: &'static str,
     pub semantic_score: Option<f32>,
     pub lexical_score: Option<f32>,
+    pub hybrid_boosted: bool,
     pub snippet: String,
 }
 
@@ -261,10 +262,11 @@ fn handle_grep_search(
         warnings.push(degraded_warning(ctx));
     }
 
+    let result_source = if literal { "literal" } else { "regex" };
     let result_values = result
         .matches
         .iter()
-        .map(grep_match_to_json)
+        .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
     let interpreted_as = interpreted_as_label(mode);
     let text = format_grep_search_text(&result, project_root, interpreted_as);
@@ -360,6 +362,8 @@ fn handle_semantic_or_hybrid_search(
                 detail.push_str(&format!(" / {}", entries_total));
             }
 
+            let lexical_count = lexical.files.len();
+            let lexical_engine_capped = lexical.engine_capped;
             let results = fuse_hybrid_results(Vec::new(), lexical.files, &shape, top_k);
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
             let note = building_lexical_note(lexical.ready);
@@ -394,8 +398,8 @@ fn handle_semantic_or_hybrid_search(
                         lexical.ready,
                     ),
                     results: result_values,
-                    more_available: false,
-                    engine_capped: lexical.engine_capped,
+                    more_available: lexical_count > top_k || lexical_engine_capped,
+                    engine_capped: lexical_engine_capped,
                     fully_degraded: false,
                     warnings,
                     extras,
@@ -599,7 +603,7 @@ fn semantic_unavailable_or_fallback_response(
                 complete: false,
                 text: format_lexical_unavailable_text(&detail, &results, project_root),
                 results: result_values,
-                more_available: lexical_count > top_k,
+                more_available: lexical_count > top_k || lexical_engine_capped,
                 engine_capped: lexical_engine_capped,
                 fully_degraded: false,
                 warnings,
@@ -701,7 +705,7 @@ fn semantic_unavailable_grep_fallback_response(
     let result_values = result
         .matches
         .iter()
-        .map(grep_match_to_json)
+        .map(|grep_match| grep_match_to_json(grep_match, "literal"))
         .collect::<Vec<_>>();
     let more_available = result.truncated || result.total_matches > result.matches.len();
 
@@ -1050,7 +1054,7 @@ pub fn fuse_hybrid_results(
     if lexical_files.is_empty() {
         return semantic
             .into_iter()
-            .map(|result| hybrid_from_semantic(result, "semantic", None))
+            .map(|result| hybrid_from_semantic(result, None))
             .take(top_k)
             .collect();
     }
@@ -1067,11 +1071,8 @@ pub fn fuse_hybrid_results(
     let mut results: Vec<HybridResult> = semantic
         .into_iter()
         .map(|result| {
-            if let Some(&lexical_score) = lexical_top_files.get(&result.file) {
-                hybrid_from_semantic(result, "hybrid", Some(lexical_score))
-            } else {
-                hybrid_from_semantic(result, "semantic", None)
-            }
+            let lexical_score = lexical_top_files.get(&result.file).copied();
+            hybrid_from_semantic(result, lexical_score)
         })
         .collect();
 
@@ -1102,13 +1103,10 @@ pub fn fuse_hybrid_results(
     results
 }
 
-fn hybrid_from_semantic(
-    result: SemanticResult,
-    source: &'static str,
-    lexical_score: Option<f32>,
-) -> HybridResult {
+fn hybrid_from_semantic(result: SemanticResult, lexical_score: Option<f32>) -> HybridResult {
     let semantic_score = result.score;
-    let score = if source == "hybrid" {
+    let hybrid_boosted = lexical_score.is_some();
+    let score = if hybrid_boosted {
         semantic_score * HYBRID_LEXICAL_BOOST
     } else {
         semantic_score
@@ -1123,9 +1121,10 @@ fn hybrid_from_semantic(
         exported: result.exported,
         snippet: result.snippet,
         score,
-        source,
+        source: "semantic",
         semantic_score: Some(semantic_score),
         lexical_score,
+        hybrid_boosted,
     }
 }
 
@@ -1145,6 +1144,7 @@ fn lexical_only_result(file: PathBuf, lexical_score: f32, shape: &QueryShape) ->
         source: "lexical",
         semantic_score: None,
         lexical_score: Some(lexical_score),
+        hybrid_boosted: false,
         snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
     }
 }
@@ -1348,13 +1348,15 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
         "source": result.source,
         "semantic_score": result.semantic_score,
         "lexical_score": result.lexical_score,
+        "hybrid_boosted": result.hybrid_boosted,
         "snippet": result.snippet,
     })
 }
 
-fn grep_match_to_json(grep_match: &GrepMatch) -> serde_json::Value {
+fn grep_match_to_json(grep_match: &GrepMatch, source: &'static str) -> serde_json::Value {
     serde_json::json!({
         "kind": "GrepLine",
+        "source": source,
         "file": grep_match.file.display().to_string(),
         "line": grep_match.line,
         "column": grep_match.column,
@@ -1746,6 +1748,7 @@ mod tests {
             source: "semantic",
             semantic_score: Some(0.75),
             lexical_score: None,
+            hybrid_boosted: false,
         }];
 
         let text = format_semantic_text(&results, project_root);
@@ -1768,6 +1771,7 @@ mod tests {
             source: "semantic",
             semantic_score: Some(0.75),
             lexical_score: None,
+            hybrid_boosted: false,
         };
 
         let json = result_to_json(&result);
