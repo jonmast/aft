@@ -101,6 +101,15 @@ export function buildSemanticSections(
 
       const score = asNumber(result.score);
       const source = asString(result.source);
+      const kind = asString(result.kind) ?? "symbol";
+      const location = asString(result.location);
+      if (kind === "file_summary" || location === "[file summary]") {
+        const summary = asString(result.snippet) ?? asString(result.name) ?? "(no summary)";
+        lines.push(
+          `  ↳ ${summary} ${theme.fg("muted", `[file summary${score !== undefined ? ` score ${score.toFixed(3)}` : ""}]`)}`,
+        );
+        return;
+      }
       if (source === "lexical") {
         lines.push(
           `  ↳ ${theme.fg("muted", `[lexical match${score !== undefined ? ` — score ${score.toFixed(3)}` : ""}]`)}`,
@@ -117,7 +126,6 @@ export function buildSemanticSections(
         startLine !== undefined
           ? `${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ""}`
           : "?";
-      const kind = asString(result.kind) ?? "symbol";
       const name = asString(result.name) ?? "(unknown)";
       lines.push(
         `  ↳ ${name} ${theme.fg("muted", `[${kind}] lines ${range}${score !== undefined ? ` score ${score.toFixed(3)}` : ""}`)}`,

@@ -52,6 +52,39 @@ describe("semantic renderer", () => {
     expect(output).toContain("login [function] lines 4-8 score 0.910");
   });
 
+  test("renderSemanticResult renders file_summary results as summaries", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "semantic",
+          results: [
+            {
+              file: "/repo/src/auth.ts",
+              name: "auth.ts",
+              kind: "file_summary",
+              start_line: null,
+              end_line: null,
+              location: "[file summary]",
+              score: 0.82,
+              source: "semantic",
+              snippet: "Exports login and session helpers.",
+            },
+          ],
+        }),
+        { query: "auth", topK: 5 },
+        mockTheme,
+        makeContext({ query: "auth", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain("src/auth.ts");
+    expect(output).toContain("Exports login and session helpers.");
+    expect(output).toContain("[file summary score 0.820]");
+    expect(output).not.toContain("lines ?");
+  });
+
   test("renderSemanticResult renders GrepLine results", () => {
     const output = renderToString(
       renderSemanticResult(
