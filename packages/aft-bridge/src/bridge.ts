@@ -157,6 +157,16 @@ class BridgeReplacedDuringVersionCheck extends Error {
 export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
+  /**
+   * Extra environment variables to set on the spawned `aft` child process,
+   * applied on top of the inherited `process.env` at spawn time. Use this to
+   * scope per-bridge child env (e.g. `AFT_CACHE_DIR` in tests) WITHOUT mutating
+   * the shared process-global `process.env` — mutating `process.env` races
+   * across concurrent bridges and, because spawn is lazy (first `send()`), is
+   * easily restored before the child actually inherits it. A value of
+   * `undefined` deletes the key from the child env.
+   */
+  childEnv?: Record<string, string | undefined>;
   /** Maximum restart attempts before giving up. Default: 3 */
   maxRestarts?: number;
   /** Minimum binary version required (semver). If the binary is older, onVersionMismatch is called. */
@@ -317,6 +327,7 @@ export class BinaryBridge {
   private consecutiveRequestTimeouts = 0;
   private errorPrefix: string;
   private readonly logger: Logger | undefined;
+  private readonly childEnv: Record<string, string | undefined> | undefined;
 
   constructor(
     binaryPath: string,
@@ -337,6 +348,7 @@ export class BinaryBridge {
     this.onBashPatternMatch = options?.onBashPatternMatch;
     this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
     this.logger = options?.logger;
+    this.childEnv = options?.childEnv;
   }
 
   private logVia(message: string, meta?: LogMeta): void {
@@ -955,6 +967,19 @@ export class BinaryBridge {
       } else if (ortLibraryPath) {
         env.ORT_DYLIB_PATH = ortLibraryPath;
         this.logVia(`ORT_DYLIB_PATH set from managed ONNX Runtime: ${ortLibraryPath}`);
+      }
+    }
+
+    // Per-bridge child env overrides (e.g. AFT_CACHE_DIR in tests). Applied last
+    // so they win over inherited/derived values, and scoped to THIS child only —
+    // no shared process.env mutation, so concurrent bridges can't race.
+    if (this.childEnv) {
+      for (const [key, value] of Object.entries(this.childEnv)) {
+        if (value === undefined) {
+          delete env[key];
+        } else {
+          env[key] = value;
+        }
       }
     }
 

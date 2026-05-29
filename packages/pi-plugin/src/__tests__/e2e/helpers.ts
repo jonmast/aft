@@ -17,7 +17,6 @@ import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, setActiveLogger } from "@cortexkit/aft-bridge";
-import { acquireEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
@@ -162,22 +161,22 @@ export async function createHarness(
   };
 
   // Redirect AFT caches/indexes to temp so tests don't pollute user data.
-  // process.env is process-global in Bun, so serialize the env-sensitive bridge startup only.
-  const releaseEnv = await acquireEnv({ AFT_CACHE_DIR: join(tempDir, ".aft-cache") });
-  let pool: BridgePool;
-  let bridge: BinaryBridge;
-  try {
-    pool = new BridgePool(
-      preparedBinary.binaryPath,
-      { timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
-      // Forward the full config to configure so indexing/restrict/etc. match prod.
-      { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
-    );
+  // Pass AFT_CACHE_DIR via the bridge's per-child env (childEnv) rather than
+  // mutating process.env: bridges spawn lazily and process.env is process-global,
+  // so a construction-scoped mutation would race concurrent harnesses and be
+  // restored before the child inherits it. childEnv is applied at spawn time,
+  // scoped to this child only.
+  const pool = new BridgePool(
+    preparedBinary.binaryPath,
+    {
+      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
+    },
+    // Forward the full config to configure so indexing/restrict/etc. match prod.
+    { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
+  );
 
-    bridge = pool.getBridge(tempDir);
-  } finally {
-    releaseEnv();
-  }
+  const bridge = pool.getBridge(tempDir);
   const storageDir = join(tempDir, ".aft-storage");
   const ctx: PluginContext = { pool, config, storageDir };
 

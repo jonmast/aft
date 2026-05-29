@@ -4,7 +4,6 @@ import { access, cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { BinaryBridge, type BridgeOptions, setActiveLogger } from "@cortexkit/aft-bridge";
-import { acquireEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
@@ -123,22 +122,23 @@ export async function createHarness(
   try {
     await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
-    // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/.
-    // process.env is process-global in Bun, so serialize the env-sensitive bridge startup only.
-    const releaseEnv = await acquireEnv({ AFT_CACHE_DIR: join(tempDir, ".aft-cache") });
-    try {
-      bridge = new BinaryBridge(
-        preparedBinary.binaryPath,
-        tempDir,
-        {
-          timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-          ...(options?.bridgeOptions ?? {}),
-        },
-        { harness: "opencode" },
-      );
-    } finally {
-      releaseEnv();
-    }
+    // Redirect the search index cache to a temp dir so tests don't pollute the
+    // user's ~/.cache/aft/index/. Pass AFT_CACHE_DIR via the bridge's per-child
+    // env instead of mutating process.env: the child spawns lazily on the first
+    // send(), so a process.env mutation scoped to construction would be restored
+    // before the child ever inherits it — and process.env is process-global, so
+    // concurrent harnesses would race. childEnv is applied at spawn time, scoped
+    // to this child only.
+    bridge = new BinaryBridge(
+      preparedBinary.binaryPath,
+      tempDir,
+      {
+        timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
+        ...(options?.bridgeOptions ?? {}),
+      },
+      { harness: "opencode" },
+    );
   } catch (err) {
     await rm(tempDir, { recursive: true, force: true });
     throw err;
