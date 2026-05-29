@@ -99,6 +99,7 @@ impl InspectManager {
         let key = JobKey::for_category_scope(category, &caller_scope);
         let (waiter_tx, waiter_rx) = bounded(1);
 
+        let wait_snapshot = snapshot.clone();
         match self.enqueue_with_waiter(
             snapshot,
             category,
@@ -107,7 +108,7 @@ impl InspectManager {
             waiter_tx,
             callgraph_snapshot,
         ) {
-            Ok(()) => self.wait_for_outcome(key, caller_scope, cache, waiter_rx),
+            Ok(()) => self.wait_for_outcome(key, caller_scope, cache, waiter_rx, wait_snapshot),
             Err(message) => JobOutcome::Failed { message },
         }
     }
@@ -227,14 +228,24 @@ impl InspectManager {
         caller_scope: JobScope,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> JobOutcome {
-        let result = self.tier2_run_with_reuse_result(snapshot, category, callgraph_snapshot);
+        let result =
+            self.tier2_run_with_reuse_result(snapshot.clone(), category, callgraph_snapshot);
         let outcome = match result.outcome {
             Ok(success) => JobOutcome::Fresh {
                 payload: success.aggregate,
             },
             Err(message) => JobOutcome::Failed { message },
         };
-        filter_outcome_for_scope(outcome, &caller_scope)
+        match self.cache_for_snapshot(&snapshot) {
+            Ok(cache) => filter_outcome_for_scope_with_contributions(
+                outcome,
+                &snapshot,
+                category,
+                cache.as_ref(),
+                &caller_scope,
+            ),
+            Err(message) => JobOutcome::Failed { message },
+        }
     }
 
     /// Read-only Tier 2 aggregate lookup for `aft_inspect`. Does NOT run any
@@ -273,14 +284,21 @@ impl InspectManager {
         match cache.get_aggregated(&key) {
             Ok(Some(payload)) => {
                 match self.tier2_cached_aggregate_is_fresh(&snapshot, category, cache.as_ref()) {
-                    Ok(true) => {
-                        filter_outcome_for_scope(JobOutcome::Fresh { payload }, &caller_scope)
-                    }
-                    Ok(false) => filter_outcome_for_scope(
+                    Ok(true) => filter_outcome_for_scope_with_contributions(
+                        JobOutcome::Fresh { payload },
+                        &snapshot,
+                        category,
+                        cache.as_ref(),
+                        &caller_scope,
+                    ),
+                    Ok(false) => filter_outcome_for_scope_with_contributions(
                         JobOutcome::Stale {
                             cached: Some(payload),
                             in_flight,
                         },
+                        &snapshot,
+                        category,
+                        cache.as_ref(),
                         &caller_scope,
                     ),
                     Err(message) => JobOutcome::Failed { message },
@@ -679,6 +697,7 @@ impl InspectManager {
         caller_scope: JobScope,
         cache: Arc<InspectCache>,
         waiter_rx: Receiver<JobOutcome>,
+        snapshot: InspectSnapshot,
     ) -> JobOutcome {
         let timeout = after(self.soft_deadline);
         let result_rx = self.result_rx.clone();
@@ -686,18 +705,24 @@ impl InspectManager {
             select! {
                 recv(waiter_rx) -> outcome => {
                     return match outcome {
-                        Ok(outcome) => filter_outcome_for_scope(outcome, &caller_scope),
-                        Err(_) => self.timeout_outcome(&key, &caller_scope, &cache),
+                        Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                            outcome,
+                            &snapshot,
+                            key.category,
+                            cache.as_ref(),
+                            &caller_scope,
+                        ),
+                        Err(_) => self.timeout_outcome(&key, &caller_scope, &cache, &snapshot),
                     };
                 }
                 recv(result_rx) -> result => {
                     match result {
                         Ok(result) => self.route_completion(result),
-                        Err(_) => return self.timeout_outcome(&key, &caller_scope, &cache),
+                        Err(_) => return self.timeout_outcome(&key, &caller_scope, &cache, &snapshot),
                     }
                 }
                 recv(timeout) -> _ => {
-                    return self.timeout_outcome(&key, &caller_scope, &cache);
+                    return self.timeout_outcome(&key, &caller_scope, &cache, &snapshot);
                 }
             }
         }
@@ -708,12 +733,19 @@ impl InspectManager {
         key: &JobKey,
         caller_scope: &JobScope,
         cache: &InspectCache,
+        snapshot: &InspectSnapshot,
     ) -> JobOutcome {
         match cache.get_aggregated(key) {
-            Ok(Some(cached)) => JobOutcome::Stale {
-                cached: Some(filter_payload_for_scope(cached, caller_scope)),
-                in_flight: true,
-            },
+            Ok(Some(cached)) => filter_outcome_for_scope_with_contributions(
+                JobOutcome::Stale {
+                    cached: Some(cached),
+                    in_flight: true,
+                },
+                snapshot,
+                key.category,
+                cache,
+                caller_scope,
+            ),
             Ok(None) => JobOutcome::Pending { in_flight: true },
             Err(error) => JobOutcome::Failed {
                 message: error.to_string(),
@@ -1048,10 +1080,24 @@ fn run_tier2_scan(job: &InspectJob) -> InspectResult {
 }
 
 fn roll_up_tier2_contributions(job: &InspectJob, contributions: &[FileContribution]) -> Value {
+    roll_up_tier2_contributions_with_limit(job, contributions, Some(MAX_DRILL_DOWN_ITEMS))
+}
+
+fn roll_up_tier2_contributions_with_limit(
+    job: &InspectJob,
+    contributions: &[FileContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
     match job.category {
-        InspectCategory::DeadCode => roll_up_dead_code_contributions(job, contributions),
-        InspectCategory::UnusedExports => roll_up_unused_exports_contributions(job, contributions),
-        InspectCategory::Duplicates => roll_up_duplicate_contributions(job, contributions),
+        InspectCategory::DeadCode => {
+            roll_up_dead_code_contributions(job, contributions, drill_down_limit)
+        }
+        InspectCategory::UnusedExports => {
+            roll_up_unused_exports_contributions(job, contributions, drill_down_limit)
+        }
+        InspectCategory::Duplicates => {
+            roll_up_duplicate_contributions(job, contributions, drill_down_limit)
+        }
         _ => json!({
             "count": 0,
             "items": [],
@@ -1060,18 +1106,65 @@ fn roll_up_tier2_contributions(job: &InspectJob, contributions: &[FileContributi
     }
 }
 
-fn roll_up_dead_code_contributions(job: &InspectJob, contributions: &[FileContribution]) -> Value {
+fn scoped_tier2_payload_from_contributions(
+    snapshot: &InspectSnapshot,
+    category: InspectCategory,
+    cache: &InspectCache,
+    project_payload: Value,
+    scope: &JobScope,
+) -> Result<Value, String> {
+    if scope.is_project_wide() {
+        return Ok(project_payload);
+    }
+
+    let project_scope = JobScope::for_project(snapshot.project_root.clone());
+    let rollup_job = scoped_tier2_rollup_job(snapshot, category, &project_scope);
+    let contributions = load_contributions(cache, &rollup_job)?;
+    let full_payload = roll_up_tier2_contributions_with_limit(&rollup_job, &contributions, None);
+    let scoped_payload = filter_payload_for_scope(full_payload, scope);
+    Ok(cap_payload_drill_down(scoped_payload, MAX_DRILL_DOWN_ITEMS))
+}
+
+fn scoped_tier2_rollup_job(
+    snapshot: &InspectSnapshot,
+    category: InspectCategory,
+    scope: &JobScope,
+) -> InspectJob {
+    InspectJob {
+        job_id: 0,
+        key: JobKey::for_project_category(category),
+        category,
+        scope_files: scope_files(&snapshot.project_root, scope),
+        project_root: snapshot.project_root.clone(),
+        inspect_dir: snapshot.inspect_dir.clone(),
+        config: Arc::clone(&snapshot.config),
+        symbol_cache: Arc::clone(&snapshot.symbol_cache),
+        callgraph_snapshot: (category == InspectCategory::DeadCode)
+            .then(|| Arc::new(CallgraphSnapshot::default())),
+    }
+}
+
+fn roll_up_dead_code_contributions(
+    job: &InspectJob,
+    contributions: &[FileContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
     if job.callgraph_snapshot.is_none() {
         return super::scanners::dead_code::callgraph_unavailable_aggregate(job.scope_files.len());
     }
 
     let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);
-    super::scanners::dead_code::aggregate_dead_code_contributions(contributions, &public_api_files)
+    super::scanners::dead_code::aggregate_dead_code_contributions_with_limit(
+        contributions,
+        &public_api_files,
+        drill_down_limit,
+    )
 }
 
 fn roll_up_unused_exports_contributions(
     job: &InspectJob,
     contributions: &[FileContribution],
+    drill_down_limit: Option<usize>,
 ) -> Value {
     let parsed = contributions
         .iter()
@@ -1127,7 +1220,7 @@ fn roll_up_unused_exports_contributions(
             }
 
             count += 1;
-            if items.len() < MAX_DRILL_DOWN_ITEMS {
+            if drill_down_limit.is_none_or(|limit| items.len() < limit) {
                 items.push(json!({
                     "file": scan.file,
                     "symbol": export.symbol,
@@ -1141,7 +1234,7 @@ fn roll_up_unused_exports_contributions(
     let mut aggregate = json!({
         "count": count,
         "items": items,
-        "drill_down_capped": count > MAX_DRILL_DOWN_ITEMS,
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
     });
@@ -1151,11 +1244,32 @@ fn roll_up_unused_exports_contributions(
     aggregate
 }
 
-fn roll_up_duplicate_contributions(job: &InspectJob, contributions: &[FileContribution]) -> Value {
-    super::scanners::duplicates::aggregate_duplicate_contributions(
+fn roll_up_duplicate_contributions(
+    job: &InspectJob,
+    contributions: &[FileContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
+    super::scanners::duplicates::aggregate_duplicate_contributions_with_limit(
         contributions,
         skipped_languages(&job.scope_files, LanguageSkipMode::Duplicates),
+        drill_down_limit,
     )
+}
+
+fn cap_payload_drill_down(mut payload: Value, limit: usize) -> Value {
+    let mut capped = false;
+    if let Some(items) = payload.get_mut("items").and_then(Value::as_array_mut) {
+        capped |= items.len() > limit;
+        items.truncate(limit);
+    }
+    if let Some(groups) = payload.get_mut("groups").and_then(Value::as_array_mut) {
+        capped |= groups.len() > limit;
+        groups.truncate(limit);
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("drill_down_capped".to_string(), json!(capped));
+    }
+    payload
 }
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
@@ -1392,6 +1506,47 @@ fn relative_display_path(project_root: &Path, path: &Path) -> String {
         .unwrap_or(normalized.as_path())
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn filter_outcome_for_scope_with_contributions(
+    outcome: JobOutcome,
+    snapshot: &InspectSnapshot,
+    category: InspectCategory,
+    cache: &InspectCache,
+    scope: &JobScope,
+) -> JobOutcome {
+    if !category.is_tier2() || scope.is_project_wide() {
+        return filter_outcome_for_scope(outcome, scope);
+    }
+
+    match outcome {
+        JobOutcome::Fresh { payload } => {
+            match scoped_tier2_payload_from_contributions(snapshot, category, cache, payload, scope)
+            {
+                Ok(payload) => JobOutcome::Fresh { payload },
+                Err(message) => JobOutcome::Failed { message },
+            }
+        }
+        JobOutcome::Stale { cached, in_flight } => match cached {
+            Some(payload) => {
+                match scoped_tier2_payload_from_contributions(
+                    snapshot, category, cache, payload, scope,
+                ) {
+                    Ok(payload) => JobOutcome::Stale {
+                        cached: Some(payload),
+                        in_flight,
+                    },
+                    Err(message) => JobOutcome::Failed { message },
+                }
+            }
+            None => JobOutcome::Stale {
+                cached: None,
+                in_flight,
+            },
+        },
+        JobOutcome::Pending { in_flight } => JobOutcome::Pending { in_flight },
+        JobOutcome::Failed { message } => JobOutcome::Failed { message },
+    }
 }
 
 fn filter_outcome_for_scope(outcome: JobOutcome, scope: &JobScope) -> JobOutcome {

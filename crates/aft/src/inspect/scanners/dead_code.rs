@@ -171,6 +171,18 @@ pub(crate) fn aggregate_dead_code_contributions(
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
 ) -> serde_json::Value {
+    aggregate_dead_code_contributions_with_limit(
+        contributions,
+        public_api_files,
+        Some(MAX_DRILL_DOWN_ITEMS),
+    )
+}
+
+pub(crate) fn aggregate_dead_code_contributions_with_limit(
+    contributions: &[FileContribution],
+    public_api_files: &BTreeSet<String>,
+    drill_down_limit: Option<usize>,
+) -> serde_json::Value {
     let parsed = contributions
         .iter()
         .filter_map(|contribution| {
@@ -205,8 +217,10 @@ pub(crate) fn aggregate_dead_code_contributions(
     }
 
     let count = dead_items.len();
-    let drill_down_capped = count > MAX_DRILL_DOWN_ITEMS;
-    dead_items.truncate(MAX_DRILL_DOWN_ITEMS);
+    let drill_down_capped = drill_down_limit.is_some_and(|limit| count > limit);
+    if let Some(limit) = drill_down_limit {
+        dead_items.truncate(limit);
+    }
 
     json!({
         "count": count,

@@ -313,6 +313,18 @@ pub(crate) fn aggregate_duplicate_contributions(
     contributions: &[FileContribution],
     languages_skipped: Vec<String>,
 ) -> serde_json::Value {
+    aggregate_duplicate_contributions_with_limit(
+        contributions,
+        languages_skipped,
+        Some(MAX_GROUP_ITEMS),
+    )
+}
+
+pub(crate) fn aggregate_duplicate_contributions_with_limit(
+    contributions: &[FileContribution],
+    languages_skipped: Vec<String>,
+    drill_down_limit: Option<usize>,
+) -> serde_json::Value {
     let parsed = contributions
         .iter()
         .filter_map(|contribution| {
@@ -360,8 +372,11 @@ pub(crate) fn aggregate_duplicate_contributions(
     });
 
     let groups_count = groups.len();
-    let drill_down_capped = groups_count > MAX_GROUP_ITEMS;
-    let items = groups.into_iter().take(MAX_GROUP_ITEMS).collect::<Vec<_>>();
+    let drill_down_capped = drill_down_limit.is_some_and(|limit| groups_count > limit);
+    let items = match drill_down_limit {
+        Some(limit) => groups.into_iter().take(limit).collect::<Vec<_>>(),
+        None => groups,
+    };
 
     json!({
         "count": groups_count,

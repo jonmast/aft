@@ -945,6 +945,155 @@ fn inspect_command_duplicates_file_scope_matches_occurrence_labels() {
 }
 
 #[test]
+fn inspect_command_unused_exports_scope_filters_full_contributions_before_cap() {
+    let (_temp_dir, root) = fixture_project();
+    for index in 0..120 {
+        write_file(
+            &root,
+            &format!("aaa_global/file_{index:03}.ts"),
+            &format!("export function global_{index:03}() {{ return {index}; }}\n"),
+        );
+    }
+    for index in 0..3 {
+        write_file(
+            &root,
+            &format!("zzz_scoped/file_{index:03}.ts"),
+            &format!("export function scoped_{index:03}() {{ return {index}; }}\n"),
+        );
+    }
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["unused_exports"]);
+    let scoped = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-exports-scoped-after-cap",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "scope": "zzz_scoped",
+            "topK": 100,
+        }),
+    );
+
+    assert_eq!(scoped["success"], true, "inspect failed: {scoped:#}");
+    assert_eq!(
+        scoped["summary"]["unused_exports"]["count"], 3,
+        "scoped count should come from full contributions, not the capped project aggregate: {scoped:#}"
+    );
+    let scoped_details = scoped["details"]["unused_exports"]
+        .as_array()
+        .expect("unused_exports details");
+    assert_eq!(
+        scoped_details.len(),
+        3,
+        "scoped details should include all scoped items beyond the project cap: {scoped:#}"
+    );
+    assert!(
+        scoped_details.iter().all(|item| item["file"]
+            .as_str()
+            .is_some_and(|file| file.starts_with("zzz_scoped/"))),
+        "scoped details should only include scoped files: {scoped:#}"
+    );
+
+    let project = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-exports-project-cap",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "topK": 100,
+        }),
+    );
+
+    assert_eq!(project["success"], true, "inspect failed: {project:#}");
+    assert_eq!(
+        project["summary"]["unused_exports"]["count"], 123,
+        "project-wide count should keep the full aggregate count: {project:#}"
+    );
+    let project_details = project["details"]["unused_exports"]
+        .as_array()
+        .expect("unused_exports details");
+    assert_eq!(
+        project_details.len(),
+        100,
+        "project-wide details should still be capped at 100: {project:#}"
+    );
+    assert!(
+        project_details
+            .iter()
+            .all(|item| item["file"].as_str().is_some_and(|file| file.starts_with("aaa_global/"))),
+        "project-wide cap should be applied before later zzz_scoped files appear in details: {project:#}"
+    );
+}
+
+fn many_duplicate_groups_source() -> String {
+    let mut source = String::new();
+    for index in 0..130 {
+        source.push_str(&format!(
+            r#"export function duplicate_group_{index:03}(input: number) {{
+  const first = input + {index};
+  const second = first * {};
+  const third = second - {};
+  const label = "group_{index:03}";
+  if (third > {}) {{
+    return label + third.toString();
+  }}
+  return label + first.toString();
+}}
+"#,
+            index + 3,
+            index + 7,
+            index + 11
+        ));
+    }
+    source
+}
+
+#[test]
+fn inspect_command_duplicates_project_wide_cap_preserves_total_groups() {
+    let (_temp_dir, root) = fixture_project();
+    let source = many_duplicate_groups_source();
+    write_file(&root, "src/left.ts", &source);
+    write_file(&root, "src/right.ts", &source);
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["duplicates"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-duplicates-project-cap",
+            "command": "inspect",
+            "sections": "duplicates",
+            "topK": 100,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let count = response["summary"]["duplicates"]["count"]
+        .as_u64()
+        .expect("duplicates count");
+    let total_groups = response["summary"]["duplicates"]["total_groups"]
+        .as_u64()
+        .expect("duplicates total_groups");
+    assert!(
+        count > 100,
+        "fixture should produce more groups than the drill-down cap: {response:#}"
+    );
+    assert_eq!(
+        total_groups, count,
+        "project-wide total_groups should retain the full group count: {response:#}"
+    );
+    assert_eq!(
+        response["details"]["duplicates"]
+            .as_array()
+            .expect("duplicates details")
+            .len(),
+        100,
+        "project-wide duplicate details should still be capped at 100: {response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_tier2_last_run_updates_on_hash_match_reuse() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "src/foo.ts", duplicate_fixture_source());
