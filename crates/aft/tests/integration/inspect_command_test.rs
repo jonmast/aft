@@ -726,6 +726,107 @@ fn inspect_command_tier2_changed_file_surfaces_stale_category() {
 }
 
 #[test]
+fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/index.ts",
+        "import { used } from './lib';\nused();\n",
+    );
+    let lib = write_file(
+        &root,
+        "src/lib.ts",
+        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["dead_code"]);
+    let before = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-dead-code-before-hash-miss",
+            "command": "inspect",
+            "sections": "dead_code",
+            "topK": 10,
+        }),
+    );
+    assert_eq!(before["success"], true, "inspect failed: {before:#}");
+    assert!(
+        !scanner_state_contains(&before, "stale_categories", "dead_code"),
+        "freshly computed dead_code aggregate should not be stale: {before:#}"
+    );
+    assert!(
+        !scanner_state_contains(&before, "pending_categories", "dead_code"),
+        "freshly computed dead_code aggregate should not be pending: {before:#}"
+    );
+    let before_count = before["summary"]["dead_code"]["count"]
+        .as_u64()
+        .expect("dead_code count");
+    assert!(
+        before_count > 0,
+        "dead_code should have cached results: {before:#}"
+    );
+    assert!(
+        dead_code_items(&before).contains(&("src/lib.ts".to_string(), "unused".to_string())),
+        "dead_code fixture should report the intentionally unused export: {before:#}"
+    );
+
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function used() { return 10; }\nexport function unused() { return 20; }\n",
+    );
+
+    // Simulate the restarted-process hash-miss case: a changed source file has
+    // fresh per-file contribution metadata in SQLite, while the aggregate row is
+    // still the previous contribution_set_hash. Old behavior returned Pending
+    // here because get_aggregated() misses the exact hash and ignored the
+    // persisted aggregate row.
+    let cache = InspectCache::open(ctx.inspect_dir(), root.clone()).expect("open inspect cache");
+    let changed_freshness = cache_freshness::collect(&lib).expect("collect changed freshness");
+    cache
+        .update_content_fresh_metadata(
+            InspectCategory::DeadCode,
+            Path::new("src/lib.ts"),
+            &changed_freshness,
+        )
+        .expect("update contribution metadata to force aggregate hash miss");
+    assert!(
+        cache
+            .get_aggregated(&JobKey::for_project_category(InspectCategory::DeadCode))
+            .expect("hash-aware aggregate lookup")
+            .is_none(),
+        "test setup must force the exact-hash aggregate lookup to miss"
+    );
+
+    let restarted_ctx = configured_context(&root);
+    let after = inspect(
+        &restarted_ctx,
+        json!({
+            "id": "inspect-dead-code-after-restart-hash-miss",
+            "command": "inspect",
+            "sections": "dead_code",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(after["success"], true, "inspect failed: {after:#}");
+    assert!(
+        scanner_state_contains(&after, "stale_categories", "dead_code"),
+        "hash-miss fallback should surface the last-known aggregate as stale: {after:#}"
+    );
+    assert!(
+        !scanner_state_contains(&after, "pending_categories", "dead_code"),
+        "hash-miss fallback should not drop to pending when an aggregate exists: {after:#}"
+    );
+    assert_summary_status(&after, "dead_code", "stale");
+    assert!(
+        dead_code_items(&after).contains(&("src/lib.ts".to_string(), "unused".to_string())),
+        "stale hash-miss response should retain previous details: {after:#}"
+    );
+}
+
+#[test]
 fn inspect_command_tier2_aggregate_hash_mismatch_is_cache_miss() {
     let (_temp_dir, root) = fixture_project();
     let file = write_file(&root, "src/foo.ts", duplicate_fixture_source());

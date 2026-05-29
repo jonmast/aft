@@ -304,7 +304,22 @@ impl InspectManager {
                     Err(message) => JobOutcome::Failed { message },
                 }
             }
-            Ok(None) => JobOutcome::Pending { in_flight },
+            Ok(None) => match cache.latest_aggregate_any_hash(category) {
+                Ok(Some(payload)) => filter_outcome_for_scope_with_contributions(
+                    JobOutcome::Stale {
+                        cached: Some(payload),
+                        in_flight,
+                    },
+                    &snapshot,
+                    category,
+                    cache.as_ref(),
+                    &caller_scope,
+                ),
+                Ok(None) => JobOutcome::Pending { in_flight },
+                Err(error) => JobOutcome::Failed {
+                    message: error.to_string(),
+                },
+            },
             Err(error) => JobOutcome::Failed {
                 message: error.to_string(),
             },

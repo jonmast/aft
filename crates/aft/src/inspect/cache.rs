@@ -611,6 +611,33 @@ impl InspectCache {
         }
     }
 
+    pub(crate) fn latest_aggregate_any_hash(
+        &self,
+        category: InspectCategory,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        let payload = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            conn.query_row(
+                "SELECT aggregate FROM tier2_aggregates \
+                 WHERE category = ?1 AND project_key = ?2 \
+                 ORDER BY generated_at DESC LIMIT 1",
+                params![category.as_str(), self.project_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        };
+
+        match payload {
+            Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(Some)
+                .map_err(InspectCacheError::from),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn touch_tier2_last_full_run(
         &self,
         category: InspectCategory,
