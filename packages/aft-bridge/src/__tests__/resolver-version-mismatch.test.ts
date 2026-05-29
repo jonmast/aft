@@ -11,32 +11,25 @@
  * resolver would happily run that older binary, producing stale behavior
  * (in the original repro: `bgb-` task slugs instead of `bash-`).
  *
- * No module mocking — uses a real fake binary directory and writes a shell
- * script that emits a controlled `--version` output. The npm-package
+ * No module mocking — uses a real fake binary directory and writes a small
+ * executable fixture that emits a controlled `--version` output. The npm-package
  * resolution leg cannot be exercised without `node_modules/@cortexkit/aft-*`
  * present, so this test focuses on the version-check helper directly.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { findBinarySync, readBinaryVersion, __test__ as resolverTest } from "../resolver.js";
+import { writeAftFixture, writeAftVersionFixture } from "./test-utils/aft-executable-fixture.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
-// On the Ubuntu GitHub Actions runner Bun's `spawnSync` reproducibly returns
-// the literal string `"failed"` in stdout/stderr instead of executing the
-// shebang-prefixed shell script the test creates via `writeFileSync` +
-// `chmodSync`. The same code runs cleanly on macOS, Windows, and on every
-// developer's local Linux; production `aft` plugin loaders also call
-// `readBinaryVersion` against real binaries on Linux CI without issue. This
-// is an environmental flake in the Bun-on-Ubuntu test fixture path, not a
-// product bug. Skip the entire describe block on Linux CI and rely on the
-// macOS + Windows + local runs for the coverage; the v0.27.1 follow-up
-// should diagnose the root cause and re-enable.
-const skipLinuxCi = process.platform === "linux" && process.env.CI === "true";
-const skipShellFixture = skipLinuxCi || process.platform === "win32";
+// PATH/cargo resolution below hard-codes POSIX path layout and `aft` (without
+// `.exe`) fixture names. The direct version/cache tests use native executable
+// fixtures on POSIX so they do not depend on shebang shell-script dispatch.
+const skipPosixPathLookup = process.platform === "win32";
 
-describe.skipIf(skipLinuxCi)("readBinaryVersion", () => {
+describe("readBinaryVersion", () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -48,37 +41,27 @@ describe.skipIf(skipLinuxCi)("readBinaryVersion", () => {
   });
 
   test("parses 'aft 0.22.1' style output", () => {
-    const fakeBin = join(tmpDir, "fake-aft.sh");
-    writeFileSync(fakeBin, '#!/bin/sh\necho "aft 0.22.1"\n');
-    chmodSync(fakeBin, 0o755);
+    const fakeBin = writeAftVersionFixture(join(tmpDir, "fake-aft"), "0.22.1");
     expect(readBinaryVersion(fakeBin)).toBe("0.22.1");
   });
 
   test("parses 'aft 0.19.5' (older pre-rename version)", () => {
-    const fakeBin = join(tmpDir, "fake-aft.sh");
-    writeFileSync(fakeBin, '#!/bin/sh\necho "aft 0.19.5"\n');
-    chmodSync(fakeBin, 0o755);
+    const fakeBin = writeAftVersionFixture(join(tmpDir, "fake-aft"), "0.19.5");
     expect(readBinaryVersion(fakeBin)).toBe("0.19.5");
   });
 
   test("returns null for empty output", () => {
-    const fakeBin = join(tmpDir, "fake-aft.sh");
-    writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n");
-    chmodSync(fakeBin, 0o755);
+    const fakeBin = writeAftFixture(join(tmpDir, "fake-aft"), { exitCode: 0 });
     expect(readBinaryVersion(fakeBin)).toBeNull();
   });
 
   test("parses stderr-only version output when stdout is empty", () => {
-    const fakeBin = join(tmpDir, "fake-aft.sh");
-    writeFileSync(fakeBin, '#!/bin/sh\necho "aft 0.74.0" >&2\n');
-    chmodSync(fakeBin, 0o755);
+    const fakeBin = writeAftFixture(join(tmpDir, "fake-aft"), { stderr: "aft 0.74.0\n" });
     expect(readBinaryVersion(fakeBin)).toBe("0.74.0");
   });
 
   test("returns null for binaries that fail", () => {
-    const fakeBin = join(tmpDir, "fake-aft.sh");
-    writeFileSync(fakeBin, "#!/bin/sh\nexit 1\n");
-    chmodSync(fakeBin, 0o755);
+    const fakeBin = writeAftFixture(join(tmpDir, "fake-aft"), { exitCode: 1 });
     // Non-zero exit with no stdout is null
     expect(readBinaryVersion(fakeBin)).toBeNull();
   });
@@ -93,14 +76,12 @@ describe.skipIf(skipLinuxCi)("readBinaryVersion", () => {
     // findBinarySync's version-mismatch check) compare bare versions, so this
     // is the load-bearing contract: pluginVersion="0.22.1" must equal
     // readBinaryVersion(npm-binary) when no leading "v" is involved.
-    const fakeBin = join(tmpDir, "fake-aft.sh");
-    writeFileSync(fakeBin, '#!/bin/sh\necho "aft 0.22.1"\n');
-    chmodSync(fakeBin, 0o755);
+    const fakeBin = writeAftVersionFixture(join(tmpDir, "fake-aft"), "0.22.1");
     expect(readBinaryVersion(fakeBin)).toBe("0.22.1"); // not "v0.22.1"
   });
 });
 
-describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => {
+describe("findBinarySync versioned cache validation", () => {
   let tmpDir: string;
   let releaseEnv: (() => void) | undefined;
 
@@ -129,10 +110,7 @@ describe.skipIf(skipLinuxCi)("findBinarySync versioned cache validation", () => 
       dirVersion,
       process.platform === "win32" ? "aft.exe" : "aft",
     );
-    mkdirSync(join(tmpDir, "aft", "bin", dirVersion), { recursive: true });
-    writeFileSync(binaryPath, `#!/bin/sh\necho "aft ${reportedVersion}"\n`);
-    chmodSync(binaryPath, 0o755);
-    return binaryPath;
+    return writeAftVersionFixture(binaryPath, reportedVersion);
   }
 
   test("returns exact-version cached binary after probing --version", () => {
@@ -164,7 +142,7 @@ describe("findBinarySync PATH lookup parsing", () => {
   });
 });
 
-describe.skipIf(skipShellFixture)("findBinarySync PATH/cargo validation", () => {
+describe.skipIf(skipPosixPathLookup)("findBinarySync PATH/cargo validation", () => {
   let tmpDir: string;
   let releaseEnv: (() => void) | undefined;
 
@@ -186,9 +164,7 @@ describe.skipIf(skipShellFixture)("findBinarySync PATH/cargo validation", () => 
   });
 
   function writeFakeAft(path: string, reportedVersion: string): void {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `#!/bin/sh\necho "aft ${reportedVersion}"\n`);
-    chmodSync(path, 0o755);
+    writeAftVersionFixture(path, reportedVersion);
   }
 
   test("skips mismatched PATH candidate and falls through to matching cargo binary", () => {

@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,17 +9,10 @@ import {
   resolveCortexKitStorageRoot,
   resolveLegacyStorageRoot,
 } from "../migration.js";
+import { type AftFixtureBehavior, writeAftFixture } from "./test-utils/aft-executable-fixture.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
-// Skip on Linux CI: Bun-on-Ubuntu reproducibly returns the literal string
-// "failed" from spawn of shebang-prefixed shell scripts under the test
-// fixture path. The same code runs cleanly on macOS, Windows, and on every
-// developer's local Linux; production `aft` migration spawns against real
-// binaries on Linux CI without issue. See sibling describe in
-// resolver-version-mismatch.test.ts for the broader pattern.
-const skipLinuxCi = process.platform === "linux" && process.env.CI === "true";
-
-describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
+describe("storage migration bootstrap", () => {
   let tempDir: string;
   let releaseEnv: (() => void) | undefined;
 
@@ -37,11 +30,9 @@ describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function binary(contents: string): string {
-    const path = join(tempDir, `aft-${Math.random().toString(16).slice(2)}.sh`);
-    writeFileSync(path, contents, "utf8");
-    chmodSync(path, 0o755);
-    return path;
+  function binary(behavior: AftFixtureBehavior): string {
+    const path = join(tempDir, `aft-${Math.random().toString(16).slice(2)}`);
+    return writeAftFixture(path, behavior);
   }
 
   test("ensureStorageMigrated_no_legacy_is_noop", async () => {
@@ -54,7 +45,7 @@ describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
     mkdirSync(legacyRoot, { recursive: true });
     writeFileSync(join(legacyRoot, ".migrated_to_cortexkit"), "{}", "utf8");
-    const aft = binary("#!/bin/sh\nexit 0\n");
+    const aft = binary({ exitCode: 0 });
 
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
@@ -65,7 +56,7 @@ describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
     mkdirSync(legacyRoot, { recursive: true });
     writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
-    const aft = binary("#!/bin/sh\nexit 0\n");
+    const aft = binary({ exitCode: 0 });
 
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
@@ -76,7 +67,7 @@ describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
     mkdirSync(legacyRoot, { recursive: true });
     writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
-    const aft = binary("#!/bin/sh\necho failed >&2\nexit 5\n");
+    const aft = binary({ stderr: "failed\n", exitCode: 5 });
 
     await expect(ensureStorageMigrated({ harness: "opencode", binaryPath: aft })).rejects.toThrow(
       /exit 5.*logs\/migration\/opencode-/,
@@ -87,7 +78,7 @@ describe.skipIf(skipLinuxCi)("storage migration bootstrap", () => {
     const legacyRoot = resolveLegacyStorageRoot("opencode");
     mkdirSync(legacyRoot, { recursive: true });
     writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
-    const aft = binary("#!/bin/sh\nsleep 1\nexit 0\n");
+    const aft = binary({ sleepMs: 1_000 });
 
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft, timeoutMs: 10 }),
