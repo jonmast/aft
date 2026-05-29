@@ -50,7 +50,11 @@ type StringOrStringArray = string | string[];
 
 const TIER2_INSPECT_CATEGORIES = new Set(["dead_code", "unused_exports", "duplicates"]);
 const INSPECT_TIER2_RUN_TIMEOUT_MS = 5 * 60_000;
+// Pi has no session.idle hook like OpenCode, so on-demand Tier 2 warmups are
+// rate-limited per bridge/category to the same default idle window (4 minutes).
+const INSPECT_TIER2_MIN_TRIGGER_INTERVAL_MS = 4 * 60_000;
 const runningTier2Categories = new WeakMap<object, Set<string>>();
+const lastTier2TriggerAtByBridge = new WeakMap<object, Map<string, number>>();
 
 function normalizeStringOrArray(value: unknown): StringOrStringArray | undefined {
   return isEmptyParam(value) ? undefined : (value as StringOrStringArray);
@@ -179,20 +183,31 @@ function runPendingTier2Categories(
   categories: string[],
   extCtx: ExtensionContext,
 ): void {
+  const now = Date.now();
   const running = runningTier2Categories.get(bridge) ?? new Set<string>();
-  const toRun = categories.filter((category) => !running.has(category));
+  const lastTriggerAt = lastTier2TriggerAtByBridge.get(bridge) ?? new Map<string, number>();
+  const toRun = categories.filter((category) => {
+    if (running.has(category)) return false;
+    const previousTriggerAt = lastTriggerAt.get(category);
+    return (
+      previousTriggerAt === undefined ||
+      previousTriggerAt + INSPECT_TIER2_MIN_TRIGGER_INTERVAL_MS <= now
+    );
+  });
   if (toRun.length === 0) return;
 
   for (const category of toRun) {
     running.add(category);
+    lastTriggerAt.set(category, now);
   }
   runningTier2Categories.set(bridge, running);
+  lastTier2TriggerAtByBridge.set(bridge, lastTriggerAt);
 
   void callBridge(bridge, "inspect_tier2_run", { categories: toRun }, extCtx, {
     transportTimeoutMs: INSPECT_TIER2_RUN_TIMEOUT_MS,
   })
     .catch(() => {
-      // Quiet background warmup: the next aft_inspect call can retry if this fails.
+      // Quiet background warmup: a later aft_inspect call can retry after the cooldown.
     })
     .finally(() => {
       const active = runningTier2Categories.get(bridge);
@@ -289,7 +304,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     label: "inspect",
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]` or stale `stale_categories: [...]`, Pi quietly starts a background Tier 2 warmup. The current call may still return pending results while the cache warms; the next call can use cached data.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]` or stale `stale_categories: [...]`, Pi quietly starts a background Tier 2 warmup (deduped while in-flight and rate-limited per category to at most once every 4 minutes, matching OpenCode's default idle window). The current call may still return pending results while the cache warms; a later call can use cached data.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.",
     parameters: InspectParams,
     async execute(
