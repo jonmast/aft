@@ -406,7 +406,9 @@ describe("deliverConfigureWarnings", () => {
     expect(Object.values(merged)).toEqual([true, true]);
   });
 
-  test("hasWarnedFor_returns_false_when_bridge_returns_null", async () => {
+  test("delivers_once_when_state_read_succeeds_with_empty_value", async () => {
+    // db_get_state succeeds with a null value (configured bridge, nothing
+    // recorded yet) → "fresh" → deliver once.
     const storageDir = createStorageDir();
     const { client, messages } = createClient();
     const { bridge } = createStateBridge(null);
@@ -426,7 +428,38 @@ describe("deliverConfigureWarnings", () => {
     expect(messages).toHaveLength(1);
   });
 
-  test("hasWarnedFor_returns_true_when_bridge_value_contains_key", async () => {
+  test("does_not_deliver_when_state_read_fails_success_false", async () => {
+    // Regression for the "LSP/formatter warning shows every session" bug:
+    // when db_get_state returns success:false (bridge not configured yet),
+    // the dedup state is UNKNOWN. Delivering anyway is what re-fired the
+    // warning every session. The gate must treat unknown as "skip" and let a
+    // later configured call deliver once.
+    const storageDir = createStorageDir();
+    const { client, messages } = createClient();
+    const send = mock(async (command: string) => {
+      if (command === "db_get_state") return { success: false };
+      return { success: true };
+    });
+    const bridge = { send } as unknown as Pick<BinaryBridge, "send">;
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+      },
+      [baseWarning()],
+    );
+
+    expect(messages).toHaveLength(0);
+    // And it must NOT record a warning (no blind write that would clobber state).
+    expect(send.mock.calls.some((call) => call[0] === "db_set_state")).toBe(false);
+  });
+
+  test("skips_redelivery_when_key_already_recorded", async () => {
     const storageDir = createStorageDir();
     const firstClient = createClient();
     const first = createStateBridge();
@@ -460,7 +493,13 @@ describe("deliverConfigureWarnings", () => {
     expect(messages).toHaveLength(0);
   });
 
-  test("recordWarning_continues_on_bridge_error", async () => {
+  test("bridge_error_suppresses_delivery_and_is_non_fatal", async () => {
+    // A throwing bridge means the dedup state is UNKNOWN. Previously the
+    // gate treated an unreadable state as "never warned" and delivered
+    // anyway, which re-fired the same warning every session. Now an
+    // unreadable state suppresses delivery (a later configured call delivers
+    // once), while remaining non-fatal — deliverConfigureWarnings must still
+    // resolve cleanly.
     const storageDir = createStorageDir();
     const { client, messages } = createClient();
     const { bridge } = createFailingBridge();
@@ -478,7 +517,7 @@ describe("deliverConfigureWarnings", () => {
         [baseWarning()],
       ),
     ).resolves.toBeUndefined();
-    expect(messages).toHaveLength(1);
+    expect(messages).toHaveLength(0);
   });
 });
 

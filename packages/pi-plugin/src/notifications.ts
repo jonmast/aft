@@ -48,16 +48,34 @@ function sendIgnoredMessage(client: unknown, sessionId: string, text: string): b
   }
 }
 
+/**
+ * Reads the persisted `warned_tools` dedup map.
+ *
+ * Returns `null` when the state could NOT be read (bridge not configured yet /
+ * RPC error) — distinct from `{}` which means "read succeeded, nothing recorded
+ * yet". The caller must treat `null` as "unknown" and NOT as "never warned":
+ * conflating the two re-fired the same `lsp_binary_missing` warning on every
+ * session, because a read that raced the not-configured window returned `{}`,
+ * the gate read "never warned", and the warning was delivered again.
+ *
+ * A read that SUCCEEDS but returns a malformed/corrupt value is treated as a
+ * recoverable empty `{}` (deliver once, then recordWarning overwrites the bad
+ * value) — only a genuine read failure is `null`.
+ */
 async function readWarnedTools(
   bridge: Pick<BinaryBridge, "send">,
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown> | null> {
+  let resp: Awaited<ReturnType<Pick<BinaryBridge, "send">["send"]>>;
   try {
-    const resp = await bridge.send("db_get_state", { key: "warned_tools" });
-    if (resp.success === false) return {};
+    resp = await bridge.send("db_get_state", { key: "warned_tools" });
+  } catch {
+    return null;
+  }
+  if (resp.success === false) return null;
 
-    const value = (resp.data as { value?: unknown } | undefined)?.value;
-    if (typeof value !== "string") return {};
-
+  const value = (resp.data as { value?: unknown } | undefined)?.value;
+  if (typeof value !== "string") return {};
+  try {
     const parsed = JSON.parse(value) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;
@@ -66,13 +84,25 @@ async function readWarnedTools(
   }
 }
 
-async function hasWarnedFor(bridge: Pick<BinaryBridge, "send">, key: string): Promise<boolean> {
+/**
+ * Tri-state dedup check:
+ *   - "warned": key recorded — skip.
+ *   - "fresh": state read OK, key absent — deliver + record.
+ *   - "unknown": state unreadable — do NOT deliver (can't dedup); a later
+ *     configured call delivers once.
+ */
+async function warnedStatus(
+  bridge: Pick<BinaryBridge, "send">,
+  key: string,
+): Promise<"warned" | "fresh" | "unknown"> {
   const warned = await readWarnedTools(bridge);
-  return warned[key] === true || typeof warned[key] === "string";
+  if (warned === null) return "unknown";
+  return warned[key] === true || typeof warned[key] === "string" ? "warned" : "fresh";
 }
 
 async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
   const warned = await readWarnedTools(bridge);
+  if (warned === null) return;
   warned[key] = true;
 
   try {
@@ -135,7 +165,10 @@ export async function deliverConfigureWarnings(
   // add a bridge-side atomic update command rather than reviving file locks.
   for (const warning of warnings) {
     const key = warningKey(warning, opts.projectRoot);
-    if (await hasWarnedFor(opts.bridge, key)) continue;
+    // "warned" → already shown once; "unknown" → dedup state unreadable
+    // (bridge not configured yet), so do NOT deliver — delivering on unknown
+    // is what re-fired the warning every session. Only "fresh" delivers.
+    if ((await warnedStatus(opts.bridge, key)) !== "fresh") continue;
 
     if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
 
