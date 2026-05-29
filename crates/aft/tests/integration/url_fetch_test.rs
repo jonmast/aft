@@ -418,6 +418,38 @@ fn ipv4_mapped_ipv6_ssrf_blocked() {
 }
 
 #[test]
+fn rfc6598_and_rfc2544_ranges_blocked() {
+    // RFC 6598 Shared Address Space (CGNAT) 100.64.0.0/10 and RFC 2544
+    // benchmark subnet 198.18.0.0/15 are non-routable and must be treated as
+    // private to block SSRF, including via IPv4-mapped IPv6.
+    for ip in [
+        "100.64.0.1",
+        "100.64.1.1",
+        "100.100.50.1",
+        "100.127.255.255",
+        "198.18.0.1",
+        "198.19.255.255",
+        "::ffff:100.64.0.1",
+        "::ffff:198.18.0.1",
+    ] {
+        let parsed = ip.parse::<IpAddr>().expect("parse test address");
+        assert!(is_private_ip_for_test(parsed), "{ip} should be private");
+    }
+
+    // Boundary check: addresses just outside the reserved ranges stay public.
+    for ip in [
+        "100.63.255.255", // just below 100.64.0.0/10
+        "100.128.0.1",    // just above 100.127.255.255
+        "198.17.255.255", // just below 198.18.0.0/15
+        "198.20.0.1",     // just above 198.19.255.255
+        "8.8.8.8",        // canonical public
+    ] {
+        let parsed = ip.parse::<IpAddr>().expect("parse test address");
+        assert!(!is_private_ip_for_test(parsed), "{ip} should be public");
+    }
+}
+
+#[test]
 fn concurrent_fetches_do_not_collide() {
     let storage = TempDir::new().unwrap();
     let server = spawn_mock_server(2, |_path, stream| {

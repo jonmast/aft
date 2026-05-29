@@ -472,6 +472,12 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
         || (a == 169 && b == 254)
+        // RFC 6598 Shared Address Space (CGNAT): 100.64.0.0/10. Not globally
+        // routable; used for provider/VPC-internal endpoints — must not be
+        // reachable via SSRF.
+        || (a == 100 && (64..=127).contains(&b))
+        // RFC 2544 benchmark subnet: 198.18.0.0/15. Reserved, non-routable.
+        || (a == 198 && (18..=19).contains(&b))
         || a >= 224
 }
 
