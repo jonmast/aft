@@ -80,6 +80,8 @@ struct MemoryAggregate {
     generated_at: i64,
 }
 
+const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
+
 #[derive(Debug, Clone)]
 struct Tier1MemoEntry<T> {
     freshness: FileFreshness,
@@ -87,14 +89,63 @@ struct Tier1MemoEntry<T> {
 }
 
 #[derive(Debug)]
+struct Tier1MemoState<T> {
+    entries: HashMap<PathBuf, Tier1MemoEntry<T>>,
+    lru: std::collections::VecDeque<PathBuf>,
+}
+
+impl<T> Default for Tier1MemoState<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<T> Tier1MemoState<T> {
+    fn insert(&mut self, path: PathBuf, entry: Tier1MemoEntry<T>) {
+        self.entries.insert(path.clone(), entry);
+        self.touch(&path);
+        self.evict_lru();
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.entries.remove(path);
+        self.remove_from_lru(path);
+    }
+
+    fn touch(&mut self, path: &Path) {
+        if !self.entries.contains_key(path) {
+            return;
+        }
+        self.remove_from_lru(path);
+        self.lru.push_back(path.to_path_buf());
+    }
+
+    fn remove_from_lru(&mut self, path: &Path) {
+        self.lru.retain(|cached_path| cached_path.as_path() != path);
+    }
+
+    fn evict_lru(&mut self) {
+        while self.entries.len() > TIER1_FILE_MEMO_MAX_ENTRIES {
+            let Some(path) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&path);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct Tier1FileMemo<T> {
-    entries: Mutex<HashMap<PathBuf, Tier1MemoEntry<T>>>,
+    state: Mutex<Tier1MemoState<T>>,
 }
 
 impl<T> Default for Tier1FileMemo<T> {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(Tier1MemoState::default()),
         }
     }
 }
@@ -109,9 +160,9 @@ impl<T: Clone> Tier1FileMemo<T> {
         }
 
         let (freshness, value) = scan(path);
-        if let Ok(mut entries) = self.entries.lock() {
+        if let Ok(mut state) = self.state.lock() {
             if let Some(freshness) = freshness {
-                entries.insert(
+                state.insert(
                     path.to_path_buf(),
                     Tier1MemoEntry {
                         freshness,
@@ -119,7 +170,7 @@ impl<T: Clone> Tier1FileMemo<T> {
                     },
                 );
             } else {
-                entries.remove(path);
+                state.remove(path);
             }
         }
         value
@@ -127,13 +178,18 @@ impl<T: Clone> Tier1FileMemo<T> {
 
     fn cached_value(&self, path: &Path) -> Option<T> {
         let mut cached = self
-            .entries
+            .state
             .lock()
             .ok()
-            .and_then(|entries| entries.get(path).cloned())?;
+            .and_then(|state| state.entries.get(path).cloned())?;
 
         match crate::cache_freshness::verify_file(path, &cached.freshness) {
-            FreshnessVerdict::HotFresh => Some(cached.value),
+            FreshnessVerdict::HotFresh => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.touch(path);
+                }
+                Some(cached.value)
+            }
             FreshnessVerdict::ContentFresh {
                 new_mtime,
                 new_size,
@@ -141,15 +197,15 @@ impl<T: Clone> Tier1FileMemo<T> {
                 cached.freshness.mtime = new_mtime;
                 cached.freshness.size = new_size;
                 let value = cached.value.clone();
-                if let Ok(mut entries) = self.entries.lock() {
-                    entries.insert(path.to_path_buf(), cached);
+                if let Ok(mut state) = self.state.lock() {
+                    state.insert(path.to_path_buf(), cached);
                 }
                 Some(value)
             }
             FreshnessVerdict::Stale => None,
             FreshnessVerdict::Deleted => {
-                if let Ok(mut entries) = self.entries.lock() {
-                    entries.remove(path);
+                if let Ok(mut state) = self.state.lock() {
+                    state.remove(path);
                 }
                 None
             }
@@ -756,4 +812,93 @@ fn unix_seconds_now() -> i64 {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
         .min(i64::MAX as u64) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::fs;
+    use std::path::Path;
+
+    fn collect_freshness(path: &Path) -> FileFreshness {
+        crate::cache_freshness::collect(path).unwrap()
+    }
+
+    #[test]
+    fn tier1_file_memo_evicts_lru_and_keeps_recent_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let memo = Tier1FileMemo::<usize>::default();
+        let mut paths = Vec::with_capacity(TIER1_FILE_MEMO_MAX_ENTRIES);
+
+        for index in 0..TIER1_FILE_MEMO_MAX_ENTRIES {
+            let path = temp.path().join(format!("file-{index}.txt"));
+            fs::write(&path, index.to_string()).unwrap();
+            let value =
+                memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), index));
+            assert_eq!(value, index);
+            paths.push(path);
+        }
+
+        let recent_path = paths[0].clone();
+        let recent_value = memo.get_or_insert_with(&recent_path, |_| {
+            panic!("recently inserted entry should hit before eviction")
+        });
+        assert_eq!(recent_value, 0);
+
+        let evicting_path = temp.path().join("new-file.txt");
+        fs::write(&evicting_path, "new").unwrap();
+        let evicting_value = memo.get_or_insert_with(&evicting_path, |path| {
+            (Some(collect_freshness(path)), TIER1_FILE_MEMO_MAX_ENTRIES)
+        });
+        assert_eq!(evicting_value, TIER1_FILE_MEMO_MAX_ENTRIES);
+
+        let state = memo.state.lock().unwrap();
+        assert_eq!(state.entries.len(), TIER1_FILE_MEMO_MAX_ENTRIES);
+        assert!(state.entries.contains_key(&recent_path));
+        assert!(state.entries.contains_key(&evicting_path));
+        assert!(!state.entries.contains_key(&paths[1]));
+        drop(state);
+
+        let recent_value = memo.get_or_insert_with(&recent_path, |_| {
+            panic!("recently used entry should survive eviction")
+        });
+        assert_eq!(recent_value, 0);
+    }
+
+    #[test]
+    fn tier1_file_memo_reuses_fresh_entries_and_rescans_stale_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("memo.txt");
+        fs::write(&path, "first").unwrap();
+
+        let memo = Tier1FileMemo::<String>::default();
+        let scans = Cell::new(0);
+
+        let first = memo.get_or_insert_with(&path, |path| {
+            scans.set(scans.get() + 1);
+            (Some(collect_freshness(path)), "first scan".to_string())
+        });
+        assert_eq!(first, "first scan");
+        assert_eq!(scans.get(), 1);
+
+        let unchanged =
+            memo.get_or_insert_with(&path, |_| panic!("unchanged file should reuse Tier-1 memo"));
+        assert_eq!(unchanged, "first scan");
+        assert_eq!(scans.get(), 1);
+
+        fs::write(&path, "changed file contents").unwrap();
+        let changed = memo.get_or_insert_with(&path, |path| {
+            scans.set(scans.get() + 1);
+            (Some(collect_freshness(path)), "second scan".to_string())
+        });
+        assert_eq!(changed, "second scan");
+        assert_eq!(scans.get(), 2);
+
+        let fresh_after_rescan = memo.get_or_insert_with(&path, |_| {
+            panic!("rescanned file should reuse refreshed Tier-1 memo")
+        });
+        assert_eq!(fresh_after_rescan, "second scan");
+        assert_eq!(scans.get(), 2);
+    }
 }
