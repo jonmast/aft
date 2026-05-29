@@ -353,8 +353,14 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             if let Some(brace_pos) = mp.find("::{") {
                 let prefix = mp[..brace_pos].to_string();
                 let items_str = &mp[brace_pos + 3..mp.len() - 1]; // strip ::{ and }
-                let items: Vec<String> = items_str
-                    .split(',')
+                                                                  // Split on TOP-LEVEL commas only. A naive split(',') corrupts
+                                                                  // nested use trees like `hash_map::{Entry, HashMap}, BTreeMap`
+                                                                  // into `hash_map::{Entry` / `HashMap}` / `BTreeMap`, which then
+                                                                  // sort and regroup into invalid Rust. Brace-aware splitting keeps
+                                                                  // each nested subtree intact as one opaque item, so re-emitting
+                                                                  // `prefix::{items}` stays syntactically valid.
+                let items: Vec<String> = split_top_level_commas(items_str)
+                    .into_iter()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
@@ -487,6 +493,31 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
     }
 
     (organized, removed)
+}
+
+/// Split a Rust use-list body on TOP-LEVEL commas only, treating nested
+/// `{...}` (and defensively `[...]`/`(...)`) as opaque so commas inside a
+/// nested subtree do not split it.
+///
+/// `"hash_map::{Entry, HashMap}, BTreeMap"` -> `["hash_map::{Entry, HashMap}", "BTreeMap"]`
+/// `"Deserialize, Serialize"`               -> `["Deserialize", "Serialize"]`
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(s[start..].to_string());
+    items
 }
 
 /// Generate the full organized import block text.

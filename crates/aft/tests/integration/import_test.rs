@@ -1206,6 +1206,65 @@ fn main() {}
 }
 
 #[test]
+fn organize_imports_rs_preserves_nested_use_tree() {
+    // Regression: a nested use tree like
+    //   use std::collections::{hash_map::{Entry, HashMap}, BTreeMap};
+    // was split on raw commas, corrupting the nested subtree into
+    //   `hash_map::{Entry` / `HashMap}` / `BTreeMap`, which regrouped into
+    //   `use std::collections::{BTreeMap, HashMap}, hash_map::{Entry};`
+    // — invalid Rust. Brace-aware splitting must keep the subtree intact.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let file = dir.path().join(format!("organize_rs_nested_{}.rs", n));
+
+    fs::write(
+        &file,
+        "\
+use std::collections::{hash_map::{Entry, HashMap}, BTreeMap};
+use std::fmt;
+
+fn main() {}
+",
+    )
+    .unwrap();
+
+    let file_str = file.display().to_string();
+    let resp = send_organize_imports(&mut aft, "org-rs-nested", &file_str);
+
+    assert_eq!(
+        resp["success"], true,
+        "organize_imports should succeed: {resp:?}"
+    );
+    assert_eq!(
+        resp["syntax_valid"], true,
+        "organized Rust must stay syntactically valid: {resp:?}"
+    );
+
+    let content = fs::read_to_string(&file).unwrap();
+
+    // The nested subtree must survive as one item, not be exploded into
+    // sibling top-level entries.
+    assert!(
+        content.contains("hash_map::{Entry, HashMap}"),
+        "nested subtree must be preserved intact. content:\n{content}"
+    );
+    // The corruption signature must NOT appear: a brace tree followed by a
+    // comma and another path at the same level inside one use statement.
+    assert!(
+        !content.contains("}, hash_map::{Entry};")
+            && !content.contains("{BTreeMap, HashMap}, hash_map"),
+        "must not produce invalid comma-joined brace trees. content:\n{content}"
+    );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
 fn organize_imports_rs_preserves_pub_use_and_private_use_pair() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
