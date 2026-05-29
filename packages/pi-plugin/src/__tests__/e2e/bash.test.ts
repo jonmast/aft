@@ -9,7 +9,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import { registerBashTool } from "../../tools/bash.js";
@@ -470,4 +470,17 @@ async function waitForToolStatus(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`timed out waiting for ${expected}`);
+}
+
+async function waitForFileText(path: string, expected: string, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      if ((await readFile(path, "utf8")).includes(expected)) return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${path} to contain ${expected}`);
 }

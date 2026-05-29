@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cleanupPiIsolatedEnv,
@@ -155,7 +155,7 @@ describe("background bash lifecycle (real Pi RPC)", () => {
         toolCalls: [
           {
             name: "bash",
-            arguments: { command: "echo bg-done", background: true },
+            arguments: { command: "echo bg-done | tee bg-marker.txt", background: true },
           },
         ],
         followupText: "Started.",
@@ -193,7 +193,7 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       const taskId = String(resultDetails(bgEnd).task_id);
       expect(taskId).toEqual(expect.stringMatching(BASH_TASK_ID));
       await client.waitForEvent((event) => event.type === "agent_end", 30_000);
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await waitForFileText(join(env.workdir, "bg-marker.txt"), "bg-done", 30_000);
 
       expect(
         (
@@ -228,3 +228,16 @@ describe("background bash lifecycle (real Pi RPC)", () => {
     }
   }, 120_000);
 });
+
+async function waitForFileText(path: string, expected: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if ((await readFile(path, "utf8")).includes(expected)) return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${path} to contain ${expected}`);
+}

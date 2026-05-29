@@ -127,7 +127,7 @@ describe("Pi Lane G plugin orchestration regressions", () => {
 
     const first = handler("1.0.0", "1.2.3");
     const second = handler("1.0.1", "1.2.3");
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.resolve();
     resolveEnsure("/cache/aft/v1.2.3/aft");
 
     await expect(Promise.all([first, second])).resolves.toEqual([

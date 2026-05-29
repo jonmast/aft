@@ -324,7 +324,7 @@ describe("BinaryBridge lifecycle", () => {
     proc.kill("SIGKILL");
 
     // Wait for crash detection
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForBridgeProcessExit(bridge, proc.pid);
 
     // Next send should spawn a fresh process (ensureSpawned) — but then kill it again
     // Actually with maxRestarts=0, handleCrash won't restart, but ensureSpawned
@@ -396,7 +396,7 @@ describe("BinaryBridge lifecycle", () => {
       if (proc) {
         proc.kill("SIGKILL");
         // Wait for the exit event to fire and handleCrash to run
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await waitForBridgeProcessExit(this, proc.pid);
       }
       // Return normally — simulates checkVersion swallowing the error
     };

@@ -1,7 +1,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
@@ -313,10 +313,20 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
   test("background completions are no longer appended by the bash adapter", async () => {
     const { h, bash, pool } = await pluginHarness({ experimental_bash_background: true });
-    const pluginBridge = pool.getBridge(await realPath(h.tempDir));
-    const spawned = await pluginBridge.send("bash", { command: "echo bg-done", background: true });
+    await h.bridge.send("configure", {
+      project_root: h.tempDir,
+      harness: "opencode",
+      restrict_to_project_root: true,
+      bash_permissions: false,
+      storage_dir: join(h.tempDir, ".aft-storage"),
+      experimental_bash_background: true,
+    });
+    const spawned = await h.bridge.send("bash", {
+      command: "echo bg-done | tee bg-marker.txt",
+      background: true,
+    });
     const taskId = String(spawned.task_id);
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await waitForFileText(join(h.tempDir, "bg-marker.txt"), "bg-done", 5_000);
 
     const result = await callPluginBash(bash, h, { command: "echo foreground" });
 
@@ -503,4 +513,17 @@ async function waitForStatus(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`timed out waiting for ${expected}`);
+}
+
+async function waitForFileText(path: string, expected: string, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      if ((await readFile(path, "utf8")).includes(expected)) return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${path} to contain ${expected}`);
 }

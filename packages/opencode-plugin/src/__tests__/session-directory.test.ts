@@ -157,8 +157,7 @@ describe("session-directory", () => {
     expect(getSessionDirectoryCached("ses_warm")).toBeUndefined(); // still pending
 
     resolverHolder.resolve?.({ data: { directory: "/warmed" } });
-    // Give the microtask a chance to settle.
-    await new Promise((r) => setTimeout(r, 5));
+    await waitForCachedSession("ses_warm", "/warmed");
     expect(getSessionDirectoryCached("ses_warm")).toBe("/warmed");
   });
 
@@ -175,7 +174,7 @@ describe("session-directory", () => {
     await getSessionDirectory(client, "ses_w2", "/cwd");
     expect(calls).toBe(1);
     warmSessionDirectory(client, "ses_w2", "/cwd");
-    await new Promise((r) => setTimeout(r, 5));
+    await Promise.resolve();
     expect(calls).toBe(1);
   });
 
@@ -194,3 +193,17 @@ describe("session-directory", () => {
     expect(calls).toBe(0);
   });
 });
+
+async function waitForCachedSession(
+  sessionID: string,
+  expected: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const started = Date.now();
+  while (getSessionDirectoryCached(sessionID) !== expected) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for cached session ${sessionID}`);
+    }
+    await Promise.resolve();
+  }
+}
