@@ -87,10 +87,10 @@ fn verify_file_inner(
     let new_size = metadata.len();
     let new_mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
     if new_size == cached.size && new_mtime == cached.mtime {
-        if hash_matching_metadata
-            && new_size <= CONTENT_HASH_SIZE_CAP
-            && cached.content_hash != zero_hash()
-        {
+        if hash_matching_metadata {
+            if new_size > CONTENT_HASH_SIZE_CAP || cached.content_hash == zero_hash() {
+                return FreshnessVerdict::Stale;
+            }
             return match hash_file_if_small(path, new_size) {
                 Ok(Some(hash)) if hash == cached.content_hash => FreshnessVerdict::HotFresh,
                 _ => FreshnessVerdict::Stale,
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_detects_same_mtime_same_size_content_change() {
+    fn strict_hashes_small_file_when_metadata_matches() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
@@ -137,9 +137,30 @@ mod tests {
         filetime::set_file_mtime(&path, original_mtime).unwrap();
         let fresh = collect(&path).unwrap();
 
+        assert_eq!(
+            verify_file_strict(&path, &fresh),
+            FreshnessVerdict::HotFresh
+        );
+
         write(&path, b"bravo");
         filetime::set_file_mtime(&path, original_mtime).unwrap();
 
+        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
+        assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
+    }
+
+    #[test]
+    fn strict_stale_when_large_file_hash_was_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(CONTENT_HASH_SIZE_CAP + 1).unwrap();
+        filetime::set_file_mtime(&path, original_mtime).unwrap();
+        let fresh = collect(&path).unwrap();
+
+        assert_eq!(fresh.size, CONTENT_HASH_SIZE_CAP + 1);
+        assert_eq!(fresh.content_hash, zero_hash());
         assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
         assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
     }
