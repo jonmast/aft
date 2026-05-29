@@ -85,6 +85,39 @@ describe("semantic renderer", () => {
     expect(output).not.toContain("lines ?");
   });
 
+  test("renderSemanticResult renders lexical file_summary results as lexical matches", () => {
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "ready",
+          interpreted_as: "hybrid",
+          results: [
+            {
+              file: "/repo/src/auth.ts",
+              name: "auth.ts",
+              kind: "file_summary",
+              start_line: null,
+              end_line: null,
+              location: "[lexical match]",
+              score: 0.77,
+              source: "lexical",
+              snippet: "Exports login and session helpers.",
+            },
+          ],
+        }),
+        { query: "login", topK: 5 },
+        mockTheme,
+        makeContext({ query: "login", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain("src/auth.ts");
+    expect(output).toContain("[lexical match — score 0.770]");
+    expect(output).toContain("Exports login and session helpers.");
+    expect(output).not.toContain("[file summary");
+  });
+
   test("renderSemanticResult renders GrepLine results", () => {
     const output = renderToString(
       renderSemanticResult(
