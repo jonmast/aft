@@ -717,6 +717,241 @@ fn dead_code_items(response: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+fn unused_export_items(response: &Value) -> Vec<(String, String)> {
+    response["details"]["unused_exports"]
+        .as_array()
+        .expect("unused_exports details array")
+        .iter()
+        .map(|item| {
+            (
+                item["file"]
+                    .as_str()
+                    .expect("unused export file")
+                    .to_string(),
+                item["symbol"]
+                    .as_str()
+                    .expect("unused export symbol")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn inspect_command_dead_code_uses_cargo_manifest_targets_not_nested_main_files() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[[bin]]
+name = "fixture-cli"
+path = "src/bin/app.rs"
+"#,
+    );
+    write_file(
+        &root,
+        "src/bin/app.rs",
+        "pub fn declared_bin_entry() -> u32 { 1 }\n",
+    );
+    write_file(
+        &root,
+        "tools/main.rs",
+        "pub fn nested_only() -> u32 { 2 }\npub fn nested_main() -> u32 { nested_only() }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["dead_code"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-dead-code-cargo-manifest-entry-points",
+            "command": "inspect",
+            "sections": "dead_code",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let items = dead_code_items(&response);
+    assert!(
+        items.contains(&("tools/main.rs".to_string(), "nested_only".to_string())),
+        "nested main.rs must not be treated as a Cargo entry point: {response:#}"
+    );
+    assert!(
+        !items.contains(&(
+            "src/bin/app.rs".to_string(),
+            "declared_bin_entry".to_string()
+        )),
+        "declared Cargo bin should remain an entry point: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_unused_exports_uses_package_exports_and_bin_as_public_api() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "package.json",
+        r#"{
+  "name": "fixture",
+  "exports": {
+    ".": "./src/index.ts",
+    "./feature": { "import": "./src/feature.ts" }
+  },
+  "bin": { "fixture": "./src/cli.ts" }
+}
+"#,
+    );
+    write_file(
+        &root,
+        "src/index.ts",
+        "export function publicApi() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "src/feature.ts",
+        "export function publicFeature() { return 2; }\n",
+    );
+    write_file(
+        &root,
+        "src/cli.ts",
+        "export function cliEntry() { return 3; }\n",
+    );
+    write_file(
+        &root,
+        "src/internal.ts",
+        "export function nonPublicUncalled() { return 4; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["unused_exports"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-exports-package-public-api",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(
+        unused_export_items(&response),
+        vec![(
+            "src/internal.ts".to_string(),
+            "nonPublicUncalled".to_string()
+        )],
+        "package exports/bin should be public API while non-public exports are reported: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_dead_code_and_unused_exports_share_workspace_public_api_resolution() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "package.json",
+        r#"{"private":true,"workspaces":["apps/*"]}"#,
+    );
+    write_file(
+        &root,
+        "apps/service/package.json",
+        r#"{"name":"service","exports":"./src/index.ts"}"#,
+    );
+    write_file(
+        &root,
+        "apps/service/src/index.ts",
+        "export function serviceApi() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "apps/service/src/internal.ts",
+        "export function serviceInternal() { return 2; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["dead_code", "unused_exports"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-shared-public-api-resolution",
+            "command": "inspect",
+            "sections": ["dead_code", "unused_exports"],
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(
+        dead_code_items(&response),
+        vec![(
+            "apps/service/src/internal.ts".to_string(),
+            "serviceInternal".to_string()
+        )],
+        "dead_code should use the workspace package public API: {response:#}"
+    );
+    assert_eq!(
+        unused_export_items(&response),
+        vec![(
+            "apps/service/src/internal.ts".to_string(),
+            "serviceInternal".to_string()
+        )],
+        "unused_exports should match dead_code without a packages/* assumption: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_command_manifestless_projects_keep_conventional_entry_point_fallback() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/index.ts",
+        "export function fallbackPublicApi() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "src/internal.ts",
+        "export function fallbackInternal() { return 2; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["dead_code", "unused_exports"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-manifestless-entry-point-fallback",
+            "command": "inspect",
+            "sections": ["dead_code", "unused_exports"],
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(
+        dead_code_items(&response),
+        vec![(
+            "src/internal.ts".to_string(),
+            "fallbackInternal".to_string()
+        )],
+        "manifest-less conventional index.ts should remain an entry/public API file: {response:#}"
+    );
+    assert_eq!(
+        unused_export_items(&response),
+        vec![(
+            "src/internal.ts".to_string(),
+            "fallbackInternal".to_string()
+        )],
+        "manifest-less fallback should be shared by unused_exports: {response:#}"
+    );
+}
+
 #[test]
 fn inspect_command_dead_code_keeps_same_name_exports_distinct_after_tier2_run() {
     let (_temp_dir, root) = fixture_project();

@@ -4,7 +4,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::{
@@ -13,7 +13,6 @@ use crate::inspect::{
 };
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
 type ExportNode = (String, String);
 
@@ -421,168 +420,8 @@ fn clean_symbol(symbol: &str) -> Option<String> {
 }
 
 pub(crate) fn collect_public_api_files(project_root: &Path) -> BTreeSet<String> {
-    let mut files = BTreeSet::new();
-    collect_package_public_api(project_root, project_root, &mut files);
-
-    let package_json = project_root.join("package.json");
-    let Ok(bytes) = std::fs::read(&package_json) else {
-        return files;
-    };
-    let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
-        return files;
-    };
-
-    for workspace in workspace_dirs(project_root, &package) {
-        collect_package_public_api(project_root, &workspace, &mut files);
-    }
-
-    files
-}
-
-fn collect_package_public_api(
-    project_root: &Path,
-    package_dir: &Path,
-    files: &mut BTreeSet<String>,
-) {
-    let package_json = package_dir.join("package.json");
-    let Ok(bytes) = std::fs::read(package_json) else {
-        return;
-    };
-    let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
-        return;
-    };
-
-    if let Some(main) = package.get("main").and_then(Value::as_str) {
-        insert_public_api_path(project_root, package_dir, main, files);
-    }
-    if let Some(module) = package.get("module").and_then(Value::as_str) {
-        insert_public_api_path(project_root, package_dir, module, files);
-    }
-    if let Some(exports) = package.get("exports") {
-        collect_export_values(project_root, package_dir, exports, files);
-    }
-}
-
-fn collect_export_values(
-    project_root: &Path,
-    package_dir: &Path,
-    value: &Value,
-    files: &mut BTreeSet<String>,
-) {
-    match value {
-        Value::String(path) => insert_public_api_path(project_root, package_dir, path, files),
-        Value::Array(values) => {
-            for value in values {
-                collect_export_values(project_root, package_dir, value, files);
-            }
-        }
-        Value::Object(map) => {
-            for value in map.values() {
-                collect_export_values(project_root, package_dir, value, files);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn insert_public_api_path(
-    project_root: &Path,
-    package_dir: &Path,
-    value: &str,
-    files: &mut BTreeSet<String>,
-) {
-    if value.starts_with('#') || value.contains('*') {
-        return;
-    }
-
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    if let Some(path) = resolve_package_entry(package_dir, trimmed) {
-        files.insert(relative_path(project_root, &path));
-    }
-}
-
-fn resolve_package_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
-    if entry.starts_with("node:") || entry.contains("://") {
-        return None;
-    }
-
-    let entry_path = if is_relative_module(entry) {
-        package_dir.join(entry)
-    } else {
-        package_dir.join(entry.trim_start_matches('/'))
-    };
-
-    candidate_paths(&entry_path)
-        .into_iter()
-        .map(|candidate| normalize_path(&candidate))
-        .find(|candidate| candidate.is_file())
-}
-
-fn candidate_paths(base: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    candidates.push(base.to_path_buf());
-
-    if base.extension().is_none() {
-        for extension in JS_MODULE_EXTENSIONS {
-            candidates.push(base.with_extension(extension));
-        }
-    }
-
-    for extension in JS_MODULE_EXTENSIONS {
-        candidates.push(base.join(format!("index.{extension}")));
-    }
-
-    candidates
-}
-
-fn is_relative_module(module_path: &str) -> bool {
-    module_path.starts_with("./")
-        || module_path.starts_with("../")
-        || module_path == "."
-        || module_path == ".."
-}
-
-fn workspace_dirs(project_root: &Path, package: &Value) -> Vec<PathBuf> {
-    let Some(workspaces) = package.get("workspaces") else {
-        return Vec::new();
-    };
-
-    let patterns = match workspaces {
-        Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
-        Value::Object(map) => map
-            .get("packages")
-            .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-
-    let mut dirs = Vec::new();
-    for pattern in patterns {
-        let pattern = pattern.trim_end_matches('/');
-        if let Some(prefix) = pattern.strip_suffix("/*") {
-            let parent = project_root.join(prefix);
-            let Ok(entries) = std::fs::read_dir(parent) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.join("package.json").is_file() {
-                    dirs.push(path);
-                }
-            }
-        } else {
-            let path = project_root.join(pattern);
-            if path.join("package.json").is_file() {
-                dirs.push(path);
-            }
-        }
-    }
-    dirs
+    crate::inspect::entry_points::resolve_entry_points(project_root)
+        .public_api_files_relative(project_root)
 }
 
 fn language_for_file(file: &str) -> &'static str {

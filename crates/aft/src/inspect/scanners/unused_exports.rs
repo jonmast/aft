@@ -45,12 +45,14 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
     let ctx = job.worker_ctx();
     let project_root = normalize_path(&ctx.project_root);
-    let (public_api_entries, package_warnings) = public_api_entries(&project_root);
+    let public_api_entries = crate::inspect::entry_points::resolve_entry_points(&project_root);
+    let package_warnings = public_api_entries.warnings().to_vec();
 
     let per_file = job
         .scope_files
         .par_iter()
         .filter_map(|path| scan_file(path, &project_root))
+        .map(|scan| suppress_public_api_exports(scan, &project_root, &public_api_entries))
         .collect::<Vec<_>>();
 
     let mut imported_by: BTreeMap<(PathBuf, String), BTreeSet<String>> = BTreeMap::new();
@@ -79,7 +81,7 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
     let mut count = 0usize;
     let mut items = Vec::new();
     for scan in &per_file {
-        if public_api_entries.contains(&scan.file_path) {
+        if public_api_entries.is_public_api_file(&scan.file_path) {
             continue;
         }
 
@@ -133,6 +135,23 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
         aggregate,
     };
     InspectResult::success(job, success, started.elapsed())
+}
+
+fn suppress_public_api_exports(
+    mut scan: FileScan,
+    project_root: &Path,
+    public_api_entries: &crate::inspect::entry_points::EntryPointSet,
+) -> FileScan {
+    if public_api_entries.is_public_api_file(&scan.file_path) && !scan.exports.is_empty() {
+        scan.exports.clear();
+        scan.contribution.contribution = contribution_value(
+            project_root,
+            &scan.relative_file,
+            &scan.exports,
+            &scan.imports,
+        );
+    }
+    scan
 }
 
 fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
@@ -647,59 +666,6 @@ fn package_name(module_path: &str) -> Option<String> {
     } else {
         Some(first)
     }
-}
-
-fn public_api_entries(project_root: &Path) -> (BTreeSet<PathBuf>, Vec<String>) {
-    let mut entries = BTreeSet::new();
-    let mut warnings = Vec::new();
-    let mut package_jsons = Vec::new();
-
-    let root_package_json = project_root.join("package.json");
-    if root_package_json.is_file() {
-        package_jsons.push(root_package_json);
-    }
-
-    let packages_dir = project_root.join("packages");
-    if let Ok(children) = fs::read_dir(packages_dir) {
-        for child in children.flatten() {
-            let package_json = child.path().join("package.json");
-            if package_json.is_file() {
-                package_jsons.push(package_json);
-            }
-        }
-    }
-
-    for package_json in package_jsons {
-        match read_public_entries_from_package_json(&package_json) {
-            Ok(package_entries) => {
-                let package_dir = package_json.parent().unwrap_or(project_root);
-                entries.extend(
-                    package_entries
-                        .iter()
-                        .filter_map(|entry| resolve_package_entry(package_dir, entry)),
-                );
-            }
-            Err(message) => warnings.push(message),
-        }
-    }
-
-    (entries, warnings)
-}
-
-fn read_public_entries_from_package_json(package_json: &Path) -> Result<Vec<String>, String> {
-    let source = fs::read_to_string(package_json)
-        .map_err(|error| format!("failed to read {}: {error}", package_json.display()))?;
-    let value = serde_json::from_str::<Value>(&source)
-        .map_err(|error| format!("failed to parse {}: {error}", package_json.display()))?;
-
-    let mut entries = Vec::new();
-    if let Some(main) = value.get("main").and_then(Value::as_str) {
-        entries.push(main.to_string());
-    }
-    if let Some(exports) = value.get("exports") {
-        collect_package_export_strings(exports, &mut entries);
-    }
-    Ok(entries)
 }
 
 fn collect_package_export_strings(value: &Value, entries: &mut Vec<String>) {

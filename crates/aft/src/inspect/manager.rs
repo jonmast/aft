@@ -846,6 +846,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
         .iter()
         .map(canonicalize_for_snapshot)
         .collect::<Vec<_>>();
+    let resolved_entry_points = super::entry_points::resolve_entry_points(project_root);
 
     let mut exported_symbols = Vec::new();
     let mut outbound_calls = Vec::new();
@@ -853,7 +854,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
 
     for file in &graph_files {
         let snapshot_file = canonicalize_for_snapshot(file);
-        if is_entry_point_file(project_root, &snapshot_file) {
+        if is_entry_point_file(&resolved_entry_points, &snapshot_file) {
             entry_points.insert(snapshot_file.clone());
         }
 
@@ -911,31 +912,8 @@ fn canonicalize_for_snapshot(path: &PathBuf) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
-fn is_entry_point_file(project_root: &Path, file: &Path) -> bool {
-    let relative = file.strip_prefix(project_root).unwrap_or(file);
-    let relative_display = relative.to_string_lossy().replace('\\', "/");
-    if relative_display.starts_with("bin/") || relative_display.contains("/bin/") {
-        return true;
-    }
-
-    let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    matches!(
-        file_name,
-        "main.rs"
-            | "main.ts"
-            | "main.tsx"
-            | "main.js"
-            | "main.jsx"
-            | "main.py"
-            | "main.go"
-            | "index.ts"
-            | "index.tsx"
-            | "index.js"
-            | "index.jsx"
-    ) || (file_name == "lib.rs" && project_root.join("Cargo.toml").exists())
+fn is_entry_point_file(entry_points: &super::entry_points::EntryPointSet, file: &Path) -> bool {
+    entry_points.is_entry_point(file)
 }
 
 fn symbol_kind_name(kind: &SymbolKind) -> &'static str {

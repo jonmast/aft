@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod dispatch;
+mod entry_points;
 pub mod freshness;
 pub mod job;
 mod manager;
