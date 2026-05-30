@@ -172,6 +172,30 @@ pub struct FileCallData {
     pub lang: LangId,
 }
 
+impl FileCallData {
+    /// Look up metadata for an exported symbol name.
+    ///
+    /// `exported_symbols` stores bare names (e.g. `total_disk_bytes`), but
+    /// `symbol_metadata` is keyed by scoped identity (e.g.
+    /// `BackupStore::total_disk_bytes` for impl methods, via
+    /// [`symbol_identity`]). A bare-name `.get()` therefore misses scoped
+    /// symbols and forces callers into degraded `unknown`/line-1 fallbacks.
+    /// This resolves an exact key first, then falls back to the first entry
+    /// whose unqualified name matches — recovering correct kind and line for
+    /// methods. (Bare-name exports are already ambiguous across scopes, so
+    /// first-match is the best available signal; this only affects displayed
+    /// metadata, never liveness, which keys on the symbol name.)
+    pub fn symbol_metadata_for(&self, name: &str) -> Option<&SymbolMeta> {
+        if let Some(meta) = self.symbol_metadata.get(name) {
+            return Some(meta);
+        }
+        self.symbol_metadata
+            .iter()
+            .find(|(key, _)| symbol_unqualified_name(key) == name)
+            .map(|(_, meta)| meta)
+    }
+}
+
 /// Result of resolving a cross-file call edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeResolution {
@@ -4570,6 +4594,50 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn symbol_metadata_for_recovers_scoped_method_by_bare_name() {
+        // exported_symbols carries the bare name; symbol_metadata is keyed by
+        // scoped identity (impl method). A plain .get(bare) misses and would
+        // force the degraded unknown/line-1 fallback. symbol_metadata_for must
+        // recover the scoped entry via unqualified-name match.
+        let mut symbol_metadata = HashMap::new();
+        symbol_metadata.insert(
+            "BackupStore::total_disk_bytes".to_string(),
+            SymbolMeta {
+                kind: SymbolKind::Method,
+                exported: true,
+                signature: None,
+                line: 703,
+                range: Range {
+                    start_line: 702,
+                    start_col: 0,
+                    end_line: 705,
+                    end_col: 0,
+                },
+            },
+        );
+        let file_data = FileCallData {
+            calls_by_symbol: HashMap::new(),
+            exported_symbols: vec!["total_disk_bytes".to_string()],
+            symbol_metadata,
+            default_export_symbol: None,
+            import_block: ImportBlock::empty(),
+            lang: LangId::Rust,
+        };
+
+        let meta = file_data
+            .symbol_metadata_for("total_disk_bytes")
+            .expect("scoped method recovered by bare name");
+        assert_eq!(meta.kind, SymbolKind::Method);
+        assert_eq!(
+            meta.line, 703,
+            "real declaration line, not the line-1 fallback"
+        );
+
+        // A genuinely-absent symbol still returns None (no false recovery).
+        assert!(file_data.symbol_metadata_for("does_not_exist").is_none());
+    }
 
     /// Create a temp directory with TypeScript files for testing.
     fn setup_ts_project() -> TempDir {

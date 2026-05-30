@@ -929,7 +929,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
         };
 
         for symbol in &file_data.exported_symbols {
-            let metadata = file_data.symbol_metadata.get(symbol);
+            let metadata = file_data.symbol_metadata_for(symbol);
             exported_symbols.push(CallgraphExport {
                 file: snapshot_file.clone(),
                 symbol: symbol.clone(),
