@@ -19,7 +19,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
   return {
     aft_import: {
       description:
-        "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, and Solidity.\n\n" +
+        "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, and PHP.\n\n" +
         "Ops:\n" +
         "- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n" +
         "- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n" +

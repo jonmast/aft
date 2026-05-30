@@ -1,6 +1,6 @@
 /**
  * aft_import — language-aware import add/remove/organize.
- * Supports TS, JS, TSX, Python, Rust, Go, Solidity.
+ * Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -152,7 +152,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_import",
     label: "import",
     description:
-      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity. Ops: `add`, `remove`, `organize`. Use aft_safety checkpoint/undo before broad cleanup.",
+      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP. Ops: `add`, `remove`, `organize`. Use aft_safety checkpoint/undo before broad cleanup.",
     parameters: ImportParams,
     async execute(
       _toolCallId: string,
