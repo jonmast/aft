@@ -156,28 +156,28 @@ _Coming soon._
 
 ## Supported languages
 
-| Language | Outline | Edit | AST | Imports | Refactor |
-|----------|---------|------|-----|---------|---------|
-| TypeScript / TSX | ✓ | ✓ | ✓ | ✓ | ✓ |
-| JavaScript / JSX | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Python | ✓ | ✓ | ✓ | ✓ | partial |
-| Rust | ✓ | ✓ | ✓ | ✓ | |
-| Go | ✓ | ✓ | ✓ | ✓ | |
-| C / C++ / C# | ✓ | ✓ | ✓ | | |
-| Java / Kotlin | ✓ | ✓ | ✓ | | |
-| Scala | ✓ | ✓ | | | |
-| Swift | ✓ | ✓ | ✓ | | |
-| Ruby | ✓ | ✓ | ✓ | | |
-| PHP | ✓ | ✓ | ✓ | | |
-| Lua / Perl | ✓ | ✓ | ✓ | | |
-| Zig | ✓ | ✓ | ✓ | | |
-| Bash | ✓ | ✓ | | | |
-| HTML / Markdown | ✓ | ✓ | | | |
-| JSON | ✓ | ✓ | ✓ | | |
-| Solidity | ✓ | ✓ | ✓ | | |
-| Vue | ✓ | ✓ | ✓ | | |
+| Language | Outline | Edit | AST | Semantic | Imports | Refactor |
+|----------|---------|------|-----|----------|---------|---------|
+| TypeScript / TSX | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| JavaScript / JSX | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Python | ✓ | ✓ | ✓ | ✓ | ✓ | partial |
+| Rust | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| Go | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| C / C++ / C# | ✓ | ✓ | ✓ | ✓ | | |
+| Java / Kotlin | ✓ | ✓ | ✓ | | | |
+| Scala | ✓ | ✓ | | | | |
+| Swift | ✓ | ✓ | ✓ | | | |
+| Ruby | ✓ | ✓ | ✓ | | | |
+| PHP | ✓ | ✓ | ✓ | | | |
+| Lua / Perl | ✓ | ✓ | ✓ | | | |
+| Zig | ✓ | ✓ | ✓ | ✓ | | |
+| Bash | ✓ | ✓ | | ✓ | | |
+| HTML / Markdown | ✓ | ✓ | | | | |
+| JSON | ✓ | ✓ | ✓ | | | |
+| Solidity | ✓ | ✓ | ✓ | ✓ | | |
+| Vue | ✓ | ✓ | ✓ | ✓ | | |
 
-Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`write`. **AST** is structural `ast_grep_search`/`ast_grep_replace`. **Refactor** is symbol move plus function extract and inline; *partial* means extract and inline only, without cross-file move.
+Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`write`, and trigram-indexed `grep`/`glob` covers every text file regardless of language. **AST** is structural `ast_grep_search`/`ast_grep_replace`. **Semantic** is `aft_search` embedding coverage. **Refactor** is symbol move plus function extract and inline; *partial* means extract and inline only, without cross-file move.
 
 ---
 
