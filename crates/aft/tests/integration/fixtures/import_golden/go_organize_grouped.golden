@@ -1,0 +1,9 @@
+package main
+
+import (
+	"fmt"
+
+	"github.com/x/y"
+)
+
+func main() {}

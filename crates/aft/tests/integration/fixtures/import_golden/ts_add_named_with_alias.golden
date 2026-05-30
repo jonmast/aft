@@ -1,0 +1,3 @@
+import { original as renamed } from './util';
+
+export const x = 1;

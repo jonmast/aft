@@ -1,0 +1,3 @@
+import { a, c } from 'mod';
+
+export const x = 1;
