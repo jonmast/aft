@@ -225,6 +225,8 @@ fn organize(
     for (group, imps) in &groups {
         let (organized, removed) = if matches!(lang, LangId::Rust) {
             organize_rust_group(imps)
+        } else if matches!(lang, LangId::Scala) {
+            organize_raw_preserving_group(imps)
         } else {
             organize_generic_group(imps, lang)
         };
@@ -245,6 +247,11 @@ struct OrganizedImport {
     default_import: Option<String>,
     namespace_import: Option<String>,
     kind: ImportKind,
+    /// When set, the import is rendered verbatim from this string instead of
+    /// being regenerated from the structured fields. Used by dialect-sensitive
+    /// languages (e.g. Scala) where re-rendering would normalize across
+    /// incompatible syntax variants and corrupt the source.
+    raw_override: Option<String>,
 }
 
 /// Organize a group of non-Rust imports: sort by module path, deduplicate.
@@ -306,6 +313,49 @@ fn organize_generic_group(
             default_import: imp.default_import.clone(),
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
+            raw_override: None,
+        });
+    }
+
+    (organized, removed)
+}
+
+fn organize_raw_preserving_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usize) {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut organized: Vec<OrganizedImport> = Vec::new();
+    let mut removed = 0;
+
+    let mut side_effects: Vec<&&ImportStatement> = imps
+        .iter()
+        .filter(|imp| imp.kind == ImportKind::SideEffect)
+        .collect();
+    let mut sorted: Vec<&&ImportStatement> = imps
+        .iter()
+        .filter(|imp| imp.kind != ImportKind::SideEffect)
+        .collect();
+    sorted.sort_by(|a, b| a.raw_text.trim().cmp(b.raw_text.trim()));
+    side_effects.extend(sorted);
+
+    for imp in side_effects {
+        let raw = imp.raw_text.trim().to_string();
+        if raw.is_empty() {
+            continue;
+        }
+        if seen.contains(&raw) {
+            removed += 1;
+            continue;
+        }
+        seen.insert(raw.clone());
+
+        organized.push(OrganizedImport {
+            module_path: imp.module_path.clone(),
+            names: imp.names.clone(),
+            default_import: imp.default_import.clone(),
+            namespace_import: imp.namespace_import.clone(),
+            kind: imp.kind,
+            raw_override: Some(raw),
         });
     }
 
@@ -444,6 +494,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                     },
                     namespace_import: None,
                     kind: up.kind,
+                    raw_override: None,
                 });
             }
         }
@@ -478,6 +529,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             },
             namespace_import: None,
             kind,
+            raw_override: None,
         });
     }
 
@@ -560,6 +612,9 @@ fn generate_go_grouped_block(grouped: &[(ImportGroup, Vec<OrganizedImport>)]) ->
 
 /// Generate a single import line from an OrganizedImport.
 fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
+    if let Some(ref raw) = imp.raw_override {
+        return raw.clone();
+    }
     match lang {
         LangId::Rust => {
             let prefix = if imp.default_import.as_deref() == Some("pub") {

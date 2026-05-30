@@ -751,6 +751,15 @@ fn scenarios() -> Vec<Scenario> {
             input: "import cats.syntax.all._\nimport scala.util.Try\nimport cats.effect.{Resource, IO}\nimport cats.syntax.all.*\nimport cats.effect.kernel.given\n\nobject Main { val x = 1 }\n",
             ops: &[Op::Organize],
         },
+        // Regression: organize must NOT rewrite Scala 2 syntax into Scala 3.
+        // `import a.b._` must stay `_` (not become `.*`) and `{C => D}` must keep
+        // the arrow (not become `{C as D}`) — both would be syntax errors in Scala 2.
+        Scenario {
+            name: "scala_organize_scala2_preserves_syntax",
+            ext: "scala",
+            input: "import scala.collection.mutable._\nimport java.util.{List => JList, Map => JMap}\n\nobject Main { val x = 1 }\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 
