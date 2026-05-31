@@ -74,7 +74,7 @@ impl From<serde_json::Error> for InspectCacheError {
 ///
 /// Bump this when `FileContribution.contribution` JSON changes in a way that
 /// requires existing per-file contributions to be rebuilt before roll-up.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 3;
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1290,6 +1290,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 3);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 4);
     }
 }

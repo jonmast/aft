@@ -24,6 +24,12 @@ const MAX_DRILL_DOWN_ITEMS: usize = 100;
 
 type ExportNode = (String, String);
 
+#[derive(Debug, Default)]
+struct ImportedExportLiveness {
+    root_exports: Vec<ImportedExportContribution>,
+    namespace_exports: Vec<ImportedExportContribution>,
+}
+
 pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
 
@@ -171,7 +177,7 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let imported_exports = imported_export_liveness_roots(
+    let imported_export_liveness = imported_export_liveness_roots(
         &job.project_root,
         file,
         exported_symbols_by_file,
@@ -221,8 +227,19 @@ fn gather_file_contribution(
     if !dispatched_method_names.is_empty() {
         payload["dispatched_method_names"] = json!(dispatched_method_names);
     }
-    if !imported_exports.is_empty() {
-        payload["imported_exports"] = json!(imported_exports
+    if !imported_export_liveness.root_exports.is_empty() {
+        payload["imported_exports"] = json!(imported_export_liveness
+            .root_exports
+            .iter()
+            .map(|root| json!({
+                "file": root.file,
+                "symbol": root.symbol,
+            }))
+            .collect::<Vec<_>>());
+    }
+    if !imported_export_liveness.namespace_exports.is_empty() {
+        payload["namespace_imported_exports"] = json!(imported_export_liveness
+            .namespace_exports
             .iter()
             .map(|root| json!({
                 "file": root.file,
@@ -385,6 +402,8 @@ fn reachable_exports(
     contributions: &[DeadCodeContribution],
     edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
 ) -> BTreeSet<ExportNode> {
+    let namespace_imports_by_file = namespace_imported_exports_by_file(contributions);
+    let mut expanded_namespace_imports = BTreeSet::new();
     let mut reachable = BTreeSet::new();
     let mut queue = VecDeque::new();
 
@@ -406,6 +425,18 @@ fn reachable_exports(
         if !reachable.insert(node.clone()) {
             continue;
         }
+        if expanded_namespace_imports.insert(node.0.clone()) {
+            // Namespace imports are conservative file-level edges: once the
+            // importer file is reached, every export of the imported module is
+            // considered live because member access is not tracked here.
+            if let Some(targets) = namespace_imports_by_file.get(&node.0) {
+                for target in targets {
+                    if !reachable.contains(target) {
+                        queue.push_back(target.clone());
+                    }
+                }
+            }
+        }
         if let Some(targets) = edges_by_source.get(&node) {
             for target in targets {
                 if !reachable.contains(target) {
@@ -416,6 +447,29 @@ fn reachable_exports(
     }
 
     reachable
+}
+
+fn namespace_imported_exports_by_file(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<String, BTreeSet<ExportNode>> {
+    let mut by_file: BTreeMap<String, BTreeSet<ExportNode>> = BTreeMap::new();
+
+    for contribution in contributions {
+        if contribution.namespace_imported_exports.is_empty() {
+            continue;
+        }
+        by_file
+            .entry(contribution.file.clone())
+            .or_default()
+            .extend(
+                contribution
+                    .namespace_imported_exports
+                    .iter()
+                    .map(|root| (root.file.clone(), root.symbol.clone())),
+            );
+    }
+
+    by_file
 }
 
 fn project_internal_call(
@@ -457,32 +511,33 @@ fn imported_export_liveness_roots(
     file: &Path,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     default_export_symbols_by_file: &BTreeMap<String, String>,
-) -> Vec<ImportedExportContribution> {
+) -> ImportedExportLiveness {
     let Some(lang) = detect_language(file)
         .filter(|lang| matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript))
     else {
-        return Vec::new();
+        return ImportedExportLiveness::default();
     };
     let Ok(source) = fs::read_to_string(file) else {
-        return Vec::new();
+        return ImportedExportLiveness::default();
     };
     let grammar = grammar_for(lang);
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&grammar).is_err() {
-        return Vec::new();
+        return ImportedExportLiveness::default();
     }
     let Some(tree) = parser.parse(&source, None) else {
-        return Vec::new();
+        return ImportedExportLiveness::default();
     };
 
     let import_block = parse_imports(&source, &tree, lang);
     let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let mut roots: BTreeSet<ExportNode> = BTreeSet::new();
+    let mut root_exports: BTreeSet<ExportNode> = BTreeSet::new();
+    let mut namespace_exports: BTreeSet<ExportNode> = BTreeSet::new();
 
     for import in &import_block.imports {
         if import.namespace_import.is_some() {
             if let Some(module_entry) = resolve_module_path(from_dir, &import.module_path) {
-                roots.extend(resolve_namespace_import_liveness_roots(
+                namespace_exports.extend(resolve_namespace_import_liveness_roots(
                     project_root,
                     &module_entry,
                     exported_symbols_by_file,
@@ -508,7 +563,7 @@ fn imported_export_liveness_roots(
                 exported_symbols_by_file,
                 default_export_symbols_by_file,
             ) {
-                roots.insert(root);
+                root_exports.insert(root);
             }
         }
 
@@ -520,15 +575,21 @@ fn imported_export_liveness_roots(
                 exported_symbols_by_file,
                 default_export_symbols_by_file,
             ) {
-                roots.insert(root);
+                root_exports.insert(root);
             }
         }
     }
 
-    roots
-        .into_iter()
-        .map(|(file, symbol)| ImportedExportContribution { file, symbol })
-        .collect()
+    ImportedExportLiveness {
+        root_exports: root_exports
+            .into_iter()
+            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+            .collect(),
+        namespace_exports: namespace_exports
+            .into_iter()
+            .map(|(file, symbol)| ImportedExportContribution { file, symbol })
+            .collect(),
+    }
 }
 
 fn resolve_workspace_package_import(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
@@ -975,6 +1036,8 @@ struct DeadCodeContribution {
     liveness_roots: Vec<String>,
     #[serde(default)]
     imported_exports: Vec<ImportedExportContribution>,
+    #[serde(default)]
+    namespace_imported_exports: Vec<ImportedExportContribution>,
     #[serde(default)]
     dispatched_method_names: Vec<String>,
     #[serde(default)]

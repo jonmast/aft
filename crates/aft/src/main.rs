@@ -685,6 +685,36 @@ fn watcher_path_is_ignore_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
+    let configured_root = ctx.config().project_root.clone();
+    ctx.canonical_cache_root_opt()
+        .or_else(|| configured_root.map(canonicalize_watcher_path))
+}
+
+fn watcher_path_is_git_info_exclude(
+    project_root: &std::path::Path,
+    path: &std::path::Path,
+) -> bool {
+    path == project_root.join(".git").join("info").join("exclude")
+}
+
+fn watcher_path_can_change_corpus_ignore(
+    project_root: Option<&std::path::Path>,
+    path: &std::path::Path,
+) -> bool {
+    let Some(project_root) = project_root else {
+        return false;
+    };
+    if !path.starts_with(project_root) {
+        return false;
+    }
+    if watcher_path_is_git_info_exclude(project_root, path) {
+        return true;
+    }
+
+    watcher_path_is_ignore_file(path) && !watcher_path_is_infra_skip(path)
+}
+
 fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(&path) {
         return canonical;
@@ -709,24 +739,28 @@ fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> FilteredWatche
 where
     I: IntoIterator<Item = std::path::PathBuf>,
 {
-    let raw_paths: Vec<std::path::PathBuf> = raw_paths.into_iter().collect();
+    let raw_paths: Vec<std::path::PathBuf> = raw_paths
+        .into_iter()
+        .map(canonicalize_watcher_path)
+        .collect();
+    let project_root = watcher_project_root(ctx);
 
-    // If any .gitignore/.aftignore file changed, rebuild the matcher before
+    // If any corpus-affecting ignore file changed, rebuild the matcher before
     // filtering this same batch so sibling events are checked against fresh
     // rules. The caller also needs this fact even if the ignore file itself is
     // filtered out: changing ignore rules changes the corpus shape, not just a
-    // single path.
+    // single path. Infra ignore files (for example, node_modules/.gitignore) do
+    // not affect AFT's project corpus and should not trigger a corpus refresh.
     let ignore_file_changed = raw_paths
         .iter()
-        .any(|path| watcher_path_is_ignore_file(path));
+        .any(|path| watcher_path_can_change_corpus_ignore(project_root.as_deref(), path));
     if ignore_file_changed {
-        log::debug!("watcher: .gitignore/.aftignore changed, rebuilding matcher before filter");
+        log::debug!("watcher: project ignore file changed, rebuilding matcher before filter");
         ctx.rebuild_gitignore();
     }
 
     let changed = raw_paths
         .into_iter()
-        .map(canonicalize_watcher_path)
         .filter(|path| {
             if watcher_path_is_infra_skip(path) {
                 return false;
@@ -1422,5 +1456,44 @@ mod watcher_filter_tests {
         assert!(changed.changed.contains(&gitignore));
         assert!(!changed.changed.contains(&ignored));
         assert!(changed.changed.contains(&kept));
+    }
+
+    #[test]
+    fn infra_ignore_file_does_not_request_corpus_refresh_but_project_aftignore_does() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let infra_gitignore = root.join("node_modules").join("pkg").join(".gitignore");
+        std::fs::create_dir_all(infra_gitignore.parent().unwrap()).unwrap();
+        std::fs::write(&infra_gitignore, "dist/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        let changed = filter_watcher_raw_paths(&ctx, vec![infra_gitignore]);
+
+        assert!(!changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
+
+        let aftignore = root.join(".aftignore");
+        std::fs::write(&aftignore, "ignored/\n").unwrap();
+        let changed = filter_watcher_raw_paths(&ctx, vec![aftignore.clone()]);
+
+        let aftignore = std::fs::canonicalize(aftignore).unwrap();
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.contains(&aftignore));
+    }
+
+    #[test]
+    fn project_git_info_exclude_requests_corpus_refresh_without_indexing_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git_info = root.join(".git").join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        let exclude = git_info.join("exclude");
+        std::fs::write(&exclude, "ignored/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        let changed = filter_watcher_raw_paths(&ctx, vec![exclude]);
+
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
     }
 }

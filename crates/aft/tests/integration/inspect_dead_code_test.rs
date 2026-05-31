@@ -550,7 +550,48 @@ fn inspect_dead_code_keeps_workspace_barrel_default_export_import_live() {
 }
 
 #[test]
-fn inspect_dead_code_keeps_namespace_imported_exports_live() {
+fn inspect_dead_code_does_not_keep_namespace_imported_exports_live_from_dead_file() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/mod.ts",
+            "export function thing() { return 1; }\nexport function helper() { return 2; }\n",
+        ),
+        (
+            "src/dead_consumer.ts",
+            "import * as mod from \"./mod\";\nmod.thing();\n",
+        ),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/mod.ts", "thing", "function", 1),
+            export(&root, "src/mod.ts", "helper", "function", 2),
+        ],
+        vec![outbound(
+            &root,
+            "src/dead_consumer.ts",
+            "<top-level>",
+            &target(&root, "src/mod.ts", "thing"),
+            2,
+        )],
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+    let dead_symbols = success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["symbol"].as_str().expect("symbol").to_string())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(success.aggregate["count"], 2, "{:#}", success.aggregate);
+    assert!(dead_symbols.contains("thing"));
+    assert!(dead_symbols.contains("helper"));
+}
+
+#[test]
+fn inspect_dead_code_keeps_namespace_imported_exports_live_from_reachable_file() {
     let (_temp_dir, root, paths) = fixture_project(&[
         (
             "src/mod.ts",
@@ -567,8 +608,14 @@ fn inspect_dead_code_keeps_namespace_imported_exports_live() {
             export(&root, "src/mod.ts", "thing", "function", 1),
             export(&root, "src/mod.ts", "helper", "function", 2),
         ],
-        Vec::new(),
-        Vec::new(),
+        vec![outbound(
+            &root,
+            "src/consumer.ts",
+            "<top-level>",
+            &target(&root, "src/mod.ts", "thing"),
+            2,
+        )],
+        vec![root.join("src/consumer.ts")],
     );
 
     let success = scan(job(&root, paths, Some(graph)));
