@@ -19,6 +19,8 @@ const KEY_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
 const SENSITIVE_KEY_WORD = /(?:token|password|secret|api[_-]?key|passwd|pwd|credential)/i;
 const SEGMENTED_KEY_WORD = /(?:^|[_.-])key(?:$|[_.-])/i;
 const CAMEL_CASE_KEY_WORD = /[a-z0-9]Key(?:$|[A-Z_.-])/;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b/g;
 
 const quotedSensitiveKeyValuePattern = new RegExp(
   String.raw`((['"])(${KEY_NAME})\2[^\S\r\n]*:[^\S\r\n]*)(['"])([^'"\r\n]+)\4`,
@@ -54,6 +56,8 @@ function redactSecrets(content: string): string {
     /\bsk-(?:live-)?[A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g,
     SECRET_PLACEHOLDER,
   );
+  sanitized = sanitized.replace(JWT_PATTERN, SECRET_PLACEHOLDER);
+  sanitized = sanitized.replace(AWS_ACCESS_KEY_ID_PATTERN, SECRET_PLACEHOLDER);
   sanitized = sanitized.replace(
     quotedSensitiveKeyValuePattern,
     (match: string, prefix: string, _keyQuote: string, keyName: string, valueQuote: string) =>

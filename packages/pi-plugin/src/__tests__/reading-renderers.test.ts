@@ -83,6 +83,52 @@ describe("reading renderers", () => {
     expect(empty).toContain("No outline available");
   });
 
+  test("multi-target zoom renders entries payloads with per-target labels", () => {
+    const batch = {
+      complete: true,
+      entries: [
+        {
+          targetLabel: "src/a.ts",
+          name: "foo",
+          success: true,
+          content: "src/a.ts:1-1 [function foo]\n\n1: export function foo() {}",
+        },
+        {
+          targetLabel: "src/b.ts",
+          name: "bar",
+          success: true,
+          content: "src/b.ts:2-2 [function bar]\n\n2: export function bar() {}",
+        },
+      ],
+      text: "",
+    };
+
+    const rendered = renderToString(
+      renderZoomResult(
+        makeResult(batch.text, batch),
+        {
+          targets: [
+            { filePath: "src/a.ts", symbol: "foo" },
+            { filePath: "src/b.ts", symbol: "bar" },
+          ],
+        },
+        mockTheme,
+        makeContext({
+          targets: [
+            { filePath: "src/a.ts", symbol: "foo" },
+            { filePath: "src/b.ts", symbol: "bar" },
+          ],
+        }),
+      ),
+    );
+
+    expect(rendered).not.toContain("No zoom result available");
+    expect(rendered).toContain("foo src/a.ts");
+    expect(rendered).toContain("bar src/b.ts");
+    expect(rendered).toContain("export function foo");
+    expect(rendered).toContain("export function bar");
+  });
+
   test("batched zoom keeps successes visible when another symbol fails", () => {
     const batch = formatZoomBatchResult(
       "sample.ts",

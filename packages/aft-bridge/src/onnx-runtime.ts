@@ -280,9 +280,8 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
  * Sweep abandoned `*.tmp.<pid>.<ts>` staging directories left behind by
  * killed download attempts, and remove an empty/half-populated target dir
  * so the next download retries cleanly. Safe to call before lock acquisition
- * because we only delete dirs whose owning PID is dead (or when the parent
- * dir's mtime exceeds STALE_LOCK_MS — covers Windows where we can't check
- * process liveness reliably).
+ * because we only delete dirs whose owning PID is dead (or, on Windows,
+ * very old while the owner is still reported alive).
  */
 function cleanupAbandonedStagingDirs(onnxBaseDir: string): void {
   // Sweep .tmp.* staging dirs whose pid is dead or are sufficiently old.
@@ -298,13 +297,19 @@ function cleanupAbandonedStagingDirs(onnxBaseDir: string): void {
       let abandoned = false;
       if (Number.isFinite(pid) && pid > 0) {
         if (process.platform === "win32") {
-          // No reliable cross-process liveness check on Windows; fall back
-          // to mtime-based age comparison.
-          try {
-            const ageMs = Date.now() - statSync(stagingDir).mtimeMs;
-            abandoned = ageMs > STALE_LOCK_MS;
-          } catch {
+          const ownerAlive = isProcessAlive(pid);
+          if (!ownerAlive) {
             abandoned = true;
+          } else {
+            // Keep the existing stale-age escape hatch for very old Windows
+            // attempts, but no longer impose a blind 5-minute wait when the
+            // owning process has already exited.
+            try {
+              const ageMs = Date.now() - statSync(stagingDir).mtimeMs;
+              abandoned = ageMs > STALE_LOCK_MS;
+            } catch {
+              abandoned = true;
+            }
           }
         } else {
           abandoned = !isProcessAlive(pid);
@@ -361,9 +366,35 @@ const INVALID_ORT_VERSION = "<invalid>";
 
 function parseOnnxVersionFromPath(value: string): string | null {
   const name = basename(value);
-  const semverish = name.match(/\.(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\.dylib)?$/);
+  const semverish = name.match(
+    /(?:^|[._-])(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\.(?:dylib|dll))?$/,
+  );
   if (semverish) return semverish[1].split(/[-+]/, 1)[0];
   return /\d+\.\d+\.\d+/.test(name) ? INVALID_ORT_VERSION : null;
+}
+
+function parseOnnxVersionFromDirectoryPath(value: string): string | null {
+  const parts = value
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .reverse();
+  for (const part of parts) {
+    const version = parseOnnxVersionFromPath(part);
+    if (version) return version;
+  }
+  return null;
+}
+
+function isPathInsideRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return (
+    rel === "" ||
+    (!rel.startsWith("../") &&
+      !rel.startsWith("..\\") &&
+      rel !== ".." &&
+      !isAbsolute(rel) &&
+      !win32.isAbsolute(rel))
+  );
 }
 
 /**
@@ -386,8 +417,10 @@ function detectOnnxVersion(libDir: string, libName: string): string | null {
     // `libonnxruntime.so.1.24.4` and macOS's `libonnxruntime.1.24.4.dylib`
     // are picked up.
     const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");
+    const expectedPrefix = process.platform === "win32" ? barePrefix.toLowerCase() : barePrefix;
     for (const entry of entries) {
-      if (!entry.startsWith(barePrefix)) continue;
+      const comparable = process.platform === "win32" ? entry.toLowerCase() : entry;
+      if (!comparable.startsWith(expectedPrefix)) continue;
       const version = parseOnnxVersionFromPath(entry);
       if (version) return version;
     }
@@ -396,7 +429,7 @@ function detectOnnxVersion(libDir: string, libName: string): string | null {
     if (existsSync(base)) {
       try {
         const real = realpathSync(base);
-        const version = parseOnnxVersionFromPath(real);
+        const version = parseOnnxVersionFromPath(real) ?? parseOnnxVersionFromDirectoryPath(real);
         if (version) return version;
       } catch {
         // ignore
@@ -409,6 +442,7 @@ function detectOnnxVersion(libDir: string, libName: string): string | null {
         // not a symlink
       }
     }
+    return parseOnnxVersionFromDirectoryPath(libDir);
   } catch {
     // unreadable dir
   }
@@ -530,6 +564,8 @@ function findSystemOnnxRuntime(libName?: string): string | null {
     return true;
   });
 
+  const unknownVersionPaths: string[] = [];
+
   for (const dir of uniquePaths) {
     const libPath = join(dir, libName);
     if (process.platform === "win32") {
@@ -538,36 +574,32 @@ function findSystemOnnxRuntime(libName?: string): string | null {
       continue;
     }
 
-    // Skip the version check for PATH entries — version-suffixed filenames
-    // are less common on Windows and we want PATH discovery to succeed.
-    let skipVersionCheck = false;
-    if (process.platform === "win32") {
-      // Only do version check for common install paths, not arbitrary PATH entries.
-      // Windows paths are case-insensitive, so normalize to lower case for comparison.
-      const dirLower = dir.toLowerCase();
-      const isCommonPath = dirLower.includes("program files") || dirLower.includes("onnxruntime");
-      if (!isCommonPath) skipVersionCheck = true;
+    // Reject system installs that the Rust pre-validator will refuse. Without
+    // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu
+    // 22.04) shadows our auto-downloaded v1.24 forever and semantic search
+    // stays "failed" until the user hand-deletes the system library.
+    //
+    // Windows PATH/NuGet installs often expose only `onnxruntime.dll`, so we
+    // also mine version-bearing parent directories and symlink targets. When a
+    // version is unknown, keep it as a last-choice fallback rather than letting
+    // it shadow a later candidate with a known compatible version.
+    const version = detectOnnxVersion(dir, libName);
+    if (!version) {
+      unknownVersionPaths.push(dir);
+      continue;
     }
-
-    if (!skipVersionCheck) {
-      // Reject system installs that the Rust pre-validator will refuse. Without
-      // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu
-      // 22.04) shadows our auto-downloaded v1.24 forever and semantic search
-      // stays "failed" until the user hand-deletes the system library.
-      const version = detectOnnxVersion(dir, libName);
-      if (version && !isOnnxVersionCompatible(version)) {
-        warn(
-          `Skipping system ONNX Runtime at ${dir} (v${version}); AFT requires ` +
-            `v${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}+. Falling through to AFT-managed download.`,
-        );
-        continue;
-      }
+    if (!isOnnxVersionCompatible(version)) {
+      warn(
+        `Skipping system ONNX Runtime at ${dir} (v${version}); AFT requires ` +
+          `v${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}+. Falling through to AFT-managed download.`,
+      );
+      continue;
     }
 
     return dir;
   }
 
-  return null;
+  return unknownVersionPaths[0] ?? null;
 }
 
 /**
@@ -849,6 +881,7 @@ function copyOnnxLibraries(
 
   // Recreate symlinks in target directory. If the required library is a
   // symlink, failures must be fatal for the same reason as required copies.
+  const targetRoot = realpathSync(targetDir);
   for (const link of symlinks) {
     const dst = join(targetDir, link.name);
     try {
@@ -856,6 +889,19 @@ function copyOnnxLibraries(
     } catch {
       // ignore
     }
+
+    const dstForContainment = join(targetRoot, link.name);
+    const resolvedTarget = resolve(dirname(dstForContainment), link.target);
+    if (!isPathInsideRoot(targetRoot, resolvedTarget)) {
+      const message = `ONNX Runtime symlink ${link.name} points outside install dir: ${link.target}`;
+      if (requiredLibs.has(link.name)) {
+        rmSync(targetDir, { recursive: true, force: true });
+        throw new Error(message);
+      }
+      log(`ORT extract: skipping optional symlink ${link.name}: ${message}`);
+      continue;
+    }
+
     try {
       symlinkSync(link.target, dst);
     } catch (symlinkErr) {
@@ -1000,9 +1046,8 @@ function acquireLock(lockPath: string): boolean {
 
   const age = Date.now() - lockMtimeMs;
   const ageWithinFresh = Math.abs(age) < STALE_LOCK_MS;
-  const skipLiveness = process.platform === "win32";
-  const ownerAlive = !skipLiveness && owningPid !== null && isProcessAlive(owningPid);
-  if (skipLiveness ? ageWithinFresh : ownerAlive && ageWithinFresh) {
+  const ownerAlive = owningPid !== null && isProcessAlive(owningPid);
+  if (ownerAlive && ageWithinFresh) {
     return false;
   }
 
@@ -1051,7 +1096,30 @@ function releaseLock(lockPath: string): void {
   }
 }
 
+function tasklistPidFromCsvLine(line: string): string | null {
+  const quoted = line.match(/"([^"]*)"/g);
+  if (quoted && quoted.length >= 2) return quoted[1].slice(1, -1);
+  const cells = line.split(",").map((cell) => cell.trim().replace(/^"|"$/g, ""));
+  return cells[1] ?? null;
+}
+
+function isWindowsProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const output = execFileSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+      encoding: "utf8",
+      timeout: 2_000,
+      windowsHide: true,
+    });
+    const expected = String(pid);
+    return output.split(/\r?\n/).some((line) => tasklistPidFromCsvLine(line) === expected);
+  } catch {
+    return false;
+  }
+}
+
 function isProcessAlive(pid: number): boolean {
+  if (process.platform === "win32") return isWindowsProcessAlive(pid);
   try {
     process.kill(pid, 0);
     return true;
@@ -1093,6 +1161,8 @@ export const __test__ = {
   parseOnnxVersionFromPath,
   isOnnxVersionCompatible,
   findSystemOnnxRuntime,
+  acquireLock,
+  releaseLock,
   REQUIRED_ORT_MAJOR,
   REQUIRED_ORT_MIN_MINOR,
 };

@@ -76,6 +76,22 @@ describe("sanitizeContent", () => {
     expect(out).not.toContain("github_pat_11AA22BB33CC_44dd55ee66");
   });
 
+  test("redacts standalone JWTs and AWS access key IDs", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig";
+    const awsAccessKeyId = "AKIAIOSFODNN7EXAMPLE";
+    const input = [
+      `payload={"jwt":"${jwt}"}`,
+      `aws access key id ${awsAccessKeyId} appeared in logs`,
+    ].join("\n");
+
+    const out = sanitizeContent(input);
+
+    expect(out).not.toContain(jwt);
+    expect(out).not.toContain(awsAccessKeyId);
+    expect(out).toContain('{"jwt":"<REDACTED_SECRET>"}');
+    expect(out).toContain("aws access key id <REDACTED_SECRET>");
+  });
+
   test("redacts env-style sensitive keys", () => {
     const input = [
       "OPENCODE_SERVER_PASSWORD=swordfish",

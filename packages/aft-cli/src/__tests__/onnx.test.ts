@@ -23,6 +23,9 @@ beforeEach(() => {
     ["PATH", process.env.PATH],
     ["Path", process.env.Path],
     ["path", process.env.path],
+    ["USERPROFILE", process.env.USERPROFILE],
+    ["ProgramFiles", process.env.ProgramFiles],
+    ["ProgramFiles(x86)", process.env["ProgramFiles(x86)"]],
   ]);
 });
 
@@ -50,12 +53,87 @@ describe("CLI ONNX system detection", () => {
     mkdirSync(runtimeDir, { recursive: true });
     writeFileSync(join(runtimeDir, "OnNxRuNtImE.DlL"), "binary");
     process.env.PATH = `${join(workDir, "missing")};${runtimeDir}`;
+    process.env.ProgramFiles = join(workDir, "program-files");
+    process.env["ProgramFiles(x86)"] = join(workDir, "program-files-x86");
+    process.env.USERPROFILE = join(workDir, "profile-without-nuget");
     delete process.env.Path;
     delete process.env.path;
 
     const found = withPlatform("win32", () => findSystemOnnxRuntime());
 
     expect(found).toBe(runtimeDir);
+  });
+
+  test("doctor skips incompatible Windows PATH DLLs and selects a compatible candidate", () => {
+    const oldRuntimeDir = join(workDir, "onnxruntime-1.9.0", "bin");
+    const newRuntimeDir = join(workDir, "onnxruntime-1.24.4", "bin");
+    mkdirSync(oldRuntimeDir, { recursive: true });
+    mkdirSync(newRuntimeDir, { recursive: true });
+    writeFileSync(join(oldRuntimeDir, "onnxruntime.dll"), "old binary");
+    writeFileSync(join(newRuntimeDir, "onnxruntime.dll"), "new binary");
+    process.env.PATH = `${oldRuntimeDir};${newRuntimeDir}`;
+    process.env.ProgramFiles = join(workDir, "program-files");
+    process.env["ProgramFiles(x86)"] = join(workDir, "program-files-x86");
+    process.env.USERPROFILE = join(workDir, "profile-without-nuget");
+    delete process.env.Path;
+    delete process.env.path;
+
+    const found = withPlatform("win32", () => findSystemOnnxRuntime());
+
+    expect(found).toBe(newRuntimeDir);
+  });
+
+  test("doctor treats a detected incompatible Windows PATH DLL as absent", () => {
+    const oldRuntimeDir = join(workDir, "onnxruntime-1.9.0", "bin");
+    mkdirSync(oldRuntimeDir, { recursive: true });
+    writeFileSync(join(oldRuntimeDir, "onnxruntime.dll"), "old binary");
+    process.env.PATH = oldRuntimeDir;
+    process.env.ProgramFiles = join(workDir, "program-files");
+    process.env["ProgramFiles(x86)"] = join(workDir, "program-files-x86");
+    process.env.USERPROFILE = join(workDir, "profile-without-nuget");
+    delete process.env.Path;
+    delete process.env.path;
+
+    const found = withPlatform("win32", () => findSystemOnnxRuntime());
+
+    expect(found).toBeNull();
+  });
+
+  test("doctor scans Windows NuGet caches and skips incompatible versions", () => {
+    const oldNativeDir = join(
+      workDir,
+      ".nuget",
+      "packages",
+      "microsoft.ml.onnxruntime",
+      "1.9.0",
+      "runtimes",
+      "win-x64",
+      "native",
+    );
+    const newNativeDir = join(
+      workDir,
+      ".nuget",
+      "packages",
+      "microsoft.ml.onnxruntime",
+      "1.24.4",
+      "runtimes",
+      "win-x64",
+      "native",
+    );
+    mkdirSync(oldNativeDir, { recursive: true });
+    mkdirSync(newNativeDir, { recursive: true });
+    writeFileSync(join(oldNativeDir, "onnxruntime.dll"), "old binary");
+    writeFileSync(join(newNativeDir, "onnxruntime.dll"), "new binary");
+    process.env.PATH = join(workDir, "missing");
+    process.env.ProgramFiles = join(workDir, "program-files");
+    process.env["ProgramFiles(x86)"] = join(workDir, "program-files-x86");
+    process.env.USERPROFILE = workDir;
+    delete process.env.Path;
+    delete process.env.path;
+
+    const found = withPlatform("win32", () => findSystemOnnxRuntime());
+
+    expect(found).toBe(newNativeDir);
   });
 });
 

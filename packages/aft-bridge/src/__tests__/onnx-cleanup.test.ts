@@ -14,18 +14,42 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __onnxTest__ } from "../index.js";
 
 const { cleanupAbandonedOnnxAttempts, ORT_VERSION, ONNX_INSTALLED_META_FILE } = __onnxTest__;
-const { cleanupAbandonedStagingDirs, cleanupIncompleteTargetIfUnowned, copyOnnxLibraries } =
-  __onnxTest__;
+const {
+  cleanupAbandonedStagingDirs,
+  cleanupIncompleteTargetIfUnowned,
+  copyOnnxLibraries,
+  acquireLock,
+  releaseLock,
+} = __onnxTest__;
 
 let workDir: string;
 let onnxBaseDir: string;
 let ortDir: string;
+
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { configurable: true, value: platform });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, "platform", descriptor);
+  }
+}
 
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "aft-onnx-cleanup-"));
@@ -166,6 +190,62 @@ describe("cleanupAbandonedOnnxAttempts", () => {
     ).toThrow("Required ONNX Runtime library missing");
 
     expect(existsSync(targetDir)).toBe(false);
+  });
+
+  test("rejects required symlinks that would escape the target directory after re-home", () => {
+    const extractedDir = join(workDir, "extracted-escape");
+    const targetDir = join(workDir, "target-escape");
+    mkdirSync(extractedDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(join(extractedDir, "libonnxruntime.so.1.24.4"), "binary");
+
+    expect(() =>
+      copyOnnxLibraries(
+        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
+        extractedDir,
+        targetDir,
+        ["libonnxruntime.so.1.24.4"],
+        [{ name: "libonnxruntime.so", target: "../.aft-onnx-installing" }],
+      ),
+    ).toThrow("points outside install dir");
+
+    expect(existsSync(targetDir)).toBe(false);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "allows same-directory versioned ONNX symlinks during re-home",
+    () => {
+      const extractedDir = join(workDir, "extracted-legit-symlink");
+      const targetDir = join(workDir, "target-legit-symlink");
+      mkdirSync(extractedDir, { recursive: true });
+      mkdirSync(targetDir, { recursive: true });
+      writeFileSync(join(extractedDir, "libonnxruntime.so.1.24.4"), "binary");
+
+      copyOnnxLibraries(
+        { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
+        extractedDir,
+        targetDir,
+        ["libonnxruntime.so.1.24.4"],
+        [{ name: "libonnxruntime.so", target: "libonnxruntime.so.1.24.4" }],
+      );
+
+      const installedLink = join(targetDir, "libonnxruntime.so");
+      expect(lstatSync(installedLink).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(installedLink)).toBe("libonnxruntime.so.1.24.4");
+      expect(existsSync(installedLink)).toBe(true);
+    },
+  );
+
+  test("Windows install lock reclaims a fresh lock whose owner PID is already dead", () => {
+    const lockPath = join(onnxBaseDir, ".aft-onnx-installing");
+    writeFileSync(lockPath, "999999999\n2026-01-01T00:00:00.000Z\n");
+
+    const acquired = withPlatform("win32", () => acquireLock(lockPath));
+
+    expect(acquired).toBe(true);
+    expect(readFileSync(lockPath, "utf8").split(/\r?\n/, 1)[0]).toBe(String(process.pid));
+    releaseLock(lockPath);
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   test("preserves complete install dir (meta file present)", () => {

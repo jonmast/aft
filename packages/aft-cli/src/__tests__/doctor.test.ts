@@ -358,6 +358,16 @@ describe("doctor --issue safety", () => {
         redacted: "Proxy-Authorization: Basic <REDACTED_SECRET>",
         secret: "cHJveHk6c2VjcmV0",
       },
+      {
+        line: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig",
+        redacted: "<REDACTED_SECRET>",
+        secret: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig",
+      },
+      {
+        line: "AKIAIOSFODNN7EXAMPLE",
+        redacted: "<REDACTED_SECRET>",
+        secret: "AKIAIOSFODNN7EXAMPLE",
+      },
     ];
 
     for (const { line, redacted, secret } of cases) {

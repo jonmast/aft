@@ -118,24 +118,31 @@ export function buildZoomSections(
   theme: Theme,
 ): string[] {
   const batch = asRecord(payload);
-  if (Array.isArray(batch?.symbols)) {
-    const header = batch.complete === false ? [theme.fg("warning", "Incomplete zoom results")] : [];
-    const items = batch.symbols as unknown[];
+  const batchItems = Array.isArray(batch?.symbols)
+    ? (batch.symbols as unknown[])
+    : Array.isArray(batch?.entries)
+      ? (batch.entries as unknown[])
+      : null;
+  if (batchItems) {
+    const header =
+      batch?.complete === false ? [theme.fg("warning", "Incomplete zoom results")] : [];
     return [
       ...header,
-      ...items.map((item) => {
+      ...batchItems.map((item) => {
         const record = asRecord(item);
         if (!record) return theme.fg("muted", "No zoom result available.");
         const name = asString(record.name) ?? "(unknown symbol)";
+        const itemTargetLabel = asString(record.targetLabel) ?? zoomTargetLabel(args);
         if (record.success === false) {
+          const location = record.targetLabel ? ` in ${shortenPath(itemTargetLabel)}` : "";
           return theme.fg(
             "error",
-            `Symbol "${name}" not found: ${asString(record.error) ?? "zoom failed"}`,
+            `Symbol "${name}" not found${location}: ${asString(record.error) ?? "zoom failed"}`,
           );
         }
         const content = asString(record.content);
         return [
-          `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(zoomTargetLabel(args)))}`,
+          `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(itemTargetLabel))}`,
           content,
         ]
           .filter(Boolean)
