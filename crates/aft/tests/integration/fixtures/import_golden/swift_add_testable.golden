@@ -1,0 +1,5 @@
+import Foundation
+
+@testable import MyApp
+
+struct App {}

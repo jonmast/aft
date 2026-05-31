@@ -760,6 +760,59 @@ fn scenarios() -> Vec<Scenario> {
             input: "import scala.collection.mutable._\nimport java.util.{List => JList, Map => JMap}\n\nobject Main { val x = 1 }\n",
             ops: &[Op::Organize],
         },
+        // ---- Swift (structured modifiers + kind imports) ----
+        Scenario {
+            name: "swift_add_plain",
+            ext: "swift",
+            input: "struct App {}\n",
+            ops: &[Op::Add {
+                module: "Foundation",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "swift_add_testable",
+            ext: "swift",
+            input: "import Foundation\nstruct App {}\n",
+            ops: &[Op::AddForm {
+                module: "MyApp",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["@testable"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "swift_add_struct_import",
+            ext: "swift",
+            input: "import Foundation\nstruct App {}\n",
+            ops: &[Op::AddForm {
+                module: "Foo.Bar",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: Some("struct"),
+            }],
+        },
+        Scenario {
+            name: "swift_remove_import",
+            ext: "swift",
+            input: "import Foundation\n@testable import MyApp\nimport struct Foo.Bar\n\nstruct App {}\n",
+            ops: &[Op::Remove {
+                module: "MyApp",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "swift_organize_mixed",
+            ext: "swift",
+            input: "import Foo.Zed\n@testable import MyApp\nimport struct Foo.Bar\nimport Foundation\nimport UIKit.UIView\n\nstruct App {}\n",
+            ops: &[Op::Organize],
+        },
     ]
 }
 

@@ -1,0 +1,4 @@
+import Foundation
+import struct Foo.Bar
+
+struct App {}
