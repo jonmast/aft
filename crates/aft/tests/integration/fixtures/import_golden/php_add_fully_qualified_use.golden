@@ -1,0 +1,5 @@
+<?php
+
+use \Vendor\Pkg\Thing;
+
+class C {}

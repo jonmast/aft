@@ -88,16 +88,17 @@ fn parse_java_import_declaration(source: &str, node: &Node) -> Option<ImportStat
 }
 
 pub(crate) fn generate_java_import_line(req: &ImportRequest) -> String {
-    let static_prefix = if req.modifiers.iter().any(|m| m == "static") {
-        "static "
-    } else {
-        ""
-    };
+    let is_static = req.modifiers.iter().any(|m| m == "static");
+    let static_prefix = if is_static { "static " } else { "" };
     let wildcard_suffix = if req.modifiers.iter().any(|m| m == "wildcard") {
         ".*"
     } else {
         ""
     };
+
+    if is_static && wildcard_suffix.is_empty() && req.names.len() == 1 {
+        return format!("import static {}.{};", req.module_path, req.names[0]);
+    }
 
     format!(
         "import {static_prefix}{}{wildcard_suffix};",

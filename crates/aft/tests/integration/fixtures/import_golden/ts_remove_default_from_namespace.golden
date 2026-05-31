@@ -1,0 +1,3 @@
+import * as NS from 'react';
+
+export const x = NS;

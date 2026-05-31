@@ -1,8 +1,10 @@
 import { a } from 'axios';
+
+import { z } from './z';
+import './side-effect';
+
 import { y } from 'zod';
 
-import './side-effect';
 import { b } from './b';
-import { z } from './z';
 
 export const x = 1;

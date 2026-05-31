@@ -243,6 +243,27 @@ fn scenarios() -> Vec<Scenario> {
             input: "import { z } from \"./z\";\nimport { a } from \"axios\";\nimport \"./side-effect\";\nimport { b } from \"./b\";\nimport { y } from \"zod\";\n\nexport const x = 1;\n",
             ops: &[Op::Organize],
         },
+        Scenario {
+            name: "ts_organize_preserves_side_effect_position",
+            ext: "ts",
+            input: "import { init } from \"./a\";\nimport \"./b\";\n\nexport const x = init;\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "ts_organize_default_namespace",
+            ext: "ts",
+            input: "import React, * as NS from \"react\";\n\nexport const x = React;\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "ts_remove_default_from_namespace",
+            ext: "ts",
+            input: "import React, * as NS from \"react\";\n\nexport const x = NS;\n",
+            ops: &[Op::Remove {
+                module: "react",
+                name: Some("React"),
+            }],
+        },
         // ---- JavaScript (shares the ES engine — proves the JS dispatch path) ----
         Scenario {
             name: "js_add_named",
@@ -312,6 +333,17 @@ fn scenarios() -> Vec<Scenario> {
             }],
         },
         Scenario {
+            name: "rs_add_named_use",
+            ext: "rs",
+            input: "fn main() {}\n",
+            ops: &[Op::Add {
+                module: "std::collections",
+                names: &["HashMap", "HashSet"],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
             name: "rs_organize_merges_use_tree",
             ext: "rs",
             input: "use std::collections::HashMap;\nuse std::collections::BTreeMap;\n\nfn main() {}\n",
@@ -349,6 +381,23 @@ fn scenarios() -> Vec<Scenario> {
             ext: "go",
             input: "package main\n\nimport (\n\t\"github.com/x/y\"\n\t\"fmt\"\n)\n\nfunc main() {}\n",
             ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "go_organize_mixed_grouped_and_standalone",
+            ext: "go",
+            input: "package main\n\nimport \"fmt\"\nimport (\n\t\"github.com/z/z\"\n)\n\nfunc main() {}\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "go_add_standalone_in_mixed_imports",
+            ext: "go",
+            input: "package main\n\nimport \"fmt\"\nimport (\n\t\"github.com/z/z\"\n)\n\nfunc main() {}\n",
+            ops: &[Op::Add {
+                module: "os",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
         },
         Scenario {
             name: "go_remove_path",
@@ -490,6 +539,19 @@ contract C {}
             }],
         },
         Scenario {
+            name: "java_add_static_member_dedupes_existing",
+            ext: "java",
+            input: "package com.example;\n\nimport static java.util.Collections.emptyList;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "java.util.Collections",
+                names: &["emptyList"],
+                namespace: None,
+                alias: None,
+                modifiers: &["static"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
             name: "java_add_wildcard",
             ext: "java",
             input: "package com.example;\n\nimport java.io.File;\n\nclass C {}\n",
@@ -537,6 +599,12 @@ import java.io.File;
 
 class C {}
 "#,
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "java_organize_dedupes_whitespace_variant",
+            ext: "java",
+            input: "package com.example;\n\nimport java.util.List;\nimport   java.util.List;\n\nclass C {}\n",
             ops: &[Op::Organize],
         },
         // ---- Kotlin (structured alias + wildcard imports) ----
@@ -685,6 +753,17 @@ class C {}
             input: "<?php\n\nnamespace Demo;\n\nuse App\\Existing;\n\nclass C {}\n",
             ops: &[Op::Add {
                 module: "App\\Foo",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "php_add_fully_qualified_use",
+            ext: "php",
+            input: "<?php\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "\\Vendor\\Pkg\\Thing",
                 names: &[],
                 default_import: None,
                 type_only: false,
@@ -853,6 +932,30 @@ object Main { val x = 1 }
                 default_import: None,
                 type_only: false,
             }],
+        },
+        Scenario {
+            name: "scala_add_uses_existing_scala2_dialect",
+            ext: "scala",
+            input: r#"import a._
+
+object Main { val x = 1 }
+"#,
+            ops: &[
+                Op::AddForm {
+                    module: "cats.syntax.all",
+                    names: &[],
+                    namespace: None,
+                    alias: None,
+                    modifiers: &["wildcard"],
+                    import_kind: None,
+                },
+                Op::Add {
+                    module: "scala.concurrent",
+                    names: &["ExecutionContext as EC"],
+                    default_import: None,
+                    type_only: false,
+                },
+            ],
         },
         Scenario {
             name: "scala_remove_selector_preserves_scala2_arrow",
@@ -1252,6 +1355,19 @@ int main(void) { return 0; }
             }],
         },
         Scenario {
+            name: "c_remove_system_include_keeps_local_same_path",
+            ext: "c",
+            input: r#"#include <config.h>
+#include "config.h"
+
+int main(void) { return 0; }
+"#,
+            ops: &[Op::Remove {
+                module: "<config.h>",
+                name: None,
+            }],
+        },
+        Scenario {
             name: "c_organize_mixed_includes",
             ext: "h",
             input: "#include \"z_local.h\"\n#include <stdio.h>\n#include \"a_local.h\"\n#include <stdlib.h>\n\nvoid f(void);\n",
@@ -1346,9 +1462,24 @@ int main() { return 0; }
             }],
         },
         Scenario {
+            name: "vue_remove_default_from_namespace",
+            ext: "vue",
+            input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport React, * as NS from 'react'\nconst x = NS\n</script>\n",
+            ops: &[Op::Remove {
+                module: "react",
+                name: Some("React"),
+            }],
+        },
+        Scenario {
             name: "vue_organize_script",
             ext: "vue",
             input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport Foo from './Foo.vue'\nimport { ref } from 'vue'\nconst x = ref(0)\n</script>\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "vue_organize_default_namespace",
+            ext: "vue",
+            input: "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport React, * as NS from 'react'\nconst x = React\n</script>\n",
             ops: &[Op::Organize],
         },
     ]

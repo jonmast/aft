@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::context::AppContext;
 use crate::edit;
-use crate::imports::{self, ImportGroup, ImportKind, ImportStatement};
+use crate::imports::{self, ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 
@@ -106,7 +106,13 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if imports_span_multiple_code_regions(&source, lang, &block.imports) {
+    let spans_multiple_regions = if lang == LangId::Go {
+        go_import_declarations_span_multiple_code_regions(&source, &_tree)
+    } else {
+        imports_span_multiple_code_regions(&source, lang, &block.imports)
+    };
+
+    if spans_multiple_regions {
         return Response::error_with_data(
             &req.id,
             "multi_region_imports",
@@ -141,6 +147,11 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         None
     };
+    let go_import_declarations_range = if matches!(lang, LangId::Go) && grouped_go_range.is_some() {
+        imports::go_import_declarations_range(&source, &_tree)
+    } else {
+        None
+    };
     let new_import_text = if matches!(lang, LangId::Go) && grouped_go_range.is_some() {
         generate_go_grouped_block(&grouped)
     } else {
@@ -148,7 +159,11 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Replace import region ---
-    let import_range = match grouped_go_range.as_ref().or(block.byte_range.as_ref()) {
+    let import_range = match go_import_declarations_range
+        .as_ref()
+        .or(grouped_go_range.as_ref())
+        .or(block.byte_range.as_ref())
+    {
         Some(range) => range,
         None => {
             return Response::error(
@@ -239,7 +254,34 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, result)
 }
 
-fn imports_span_multiple_code_regions(
+fn go_import_declarations_span_multiple_code_regions(
+    source: &str,
+    tree: &tree_sitter::Tree,
+) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            if node.kind() == "import_declaration" {
+                ranges.push(node.byte_range());
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    ranges.windows(2).any(|pair| {
+        let previous = &pair[0];
+        let next = &pair[1];
+        previous.end > next.start
+            || !import_gap_is_trivia(source, LangId::Go, previous.end..next.start)
+    })
+}
+
+pub(crate) fn imports_span_multiple_code_regions(
     source: &str,
     lang: LangId,
     imports: &[ImportStatement],
@@ -274,44 +316,29 @@ fn import_gap_is_trivia(source: &str, lang: LangId, range: Range<usize>) -> bool
         }
 
         if lang == LangId::Lua && rest.starts_with("--[[") {
-            let Some(end) = rest.find("]]") else {
-                return false;
-            };
-            offset += end + 2;
-            continue;
+            return false;
         }
 
         if lang == LangId::Lua && rest.starts_with("--") {
-            offset += line_comment_len(rest);
-            continue;
+            return false;
         }
 
         if supports_slash_line_comments(lang) && rest.starts_with("//") {
-            offset += line_comment_len(rest);
-            continue;
+            return false;
         }
 
         if supports_block_comments(lang) && rest.starts_with("/*") {
-            let Some(end) = rest.find("*/") else {
-                return false;
-            };
-            offset += end + 2;
-            continue;
+            return false;
         }
 
         if supports_hash_line_comments(lang) && rest.starts_with('#') {
-            offset += line_comment_len(rest);
-            continue;
+            return false;
         }
 
         return false;
     }
 
     true
-}
-
-fn line_comment_len(s: &str) -> usize {
-    s.find('\n').unwrap_or(s.len())
 }
 
 fn supports_slash_line_comments(lang: LangId) -> bool {
@@ -352,10 +379,26 @@ fn organize(
     imports: &[ImportStatement],
     lang: LangId,
 ) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
+    let mut refs: Vec<&ImportStatement> = imports.iter().collect();
+    refs.sort_by_key(|imp| imp.byte_range.start);
+
+    if preserves_side_effect_order(lang)
+        && refs.iter().any(|imp| imp.kind == ImportKind::SideEffect)
+    {
+        return organize_preserving_side_effect_order(&refs, lang);
+    }
+
+    organize_import_refs(&refs, lang)
+}
+
+fn organize_import_refs(
+    imports: &[&ImportStatement],
+    lang: LangId,
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
     // Group imports
     let mut groups: BTreeMap<ImportGroup, Vec<&ImportStatement>> = BTreeMap::new();
     for imp in imports {
-        groups.entry(imp.group).or_default().push(imp);
+        groups.entry(imp.group).or_default().push(*imp);
     }
 
     let mut result: Vec<(ImportGroup, Vec<OrganizedImport>)> = Vec::new();
@@ -376,6 +419,58 @@ fn organize(
     }
 
     (result, total_removed)
+}
+
+fn preserves_side_effect_order(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue | LangId::Lua
+    )
+}
+
+fn organize_preserving_side_effect_order(
+    imports: &[&ImportStatement],
+    lang: LangId,
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
+    let mut result = Vec::new();
+    let mut total_removed = 0;
+    let mut segment: Vec<&ImportStatement> = Vec::new();
+
+    for imp in imports {
+        if imp.kind == ImportKind::SideEffect {
+            let (mut grouped, removed) = organize_import_refs(&segment, lang);
+            result.append(&mut grouped);
+            total_removed += removed;
+            segment.clear();
+
+            result.push((imp.group, vec![organized_from_statement(imp, lang)]));
+        } else {
+            segment.push(*imp);
+        }
+    }
+
+    let (mut grouped, removed) = organize_import_refs(&segment, lang);
+    result.append(&mut grouped);
+    total_removed += removed;
+
+    (result, total_removed)
+}
+
+fn organized_from_statement(imp: &ImportStatement, lang: LangId) -> OrganizedImport {
+    let mut names = imp.names.clone();
+    sort_named_specifiers(&mut names);
+    let raw_override = should_preserve_raw_on_organize(lang)
+        .then(|| imp.raw_text.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+
+    OrganizedImport {
+        module_path: imp.module_path.clone(),
+        names,
+        default_import: imp.default_import.clone(),
+        namespace_import: imp.namespace_import.clone(),
+        kind: imp.kind,
+        raw_override,
+    }
 }
 
 fn should_preserve_raw_on_organize(lang: LangId) -> bool {
@@ -482,42 +577,59 @@ fn organize_raw_preserving_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImp
     use std::collections::HashSet;
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut organized: Vec<OrganizedImport> = Vec::new();
+    let mut side_effects: Vec<&ImportStatement> = Vec::new();
+    let mut sorted: Vec<&ImportStatement> = Vec::new();
     let mut removed = 0;
 
-    let mut side_effects: Vec<&&ImportStatement> = imps
-        .iter()
-        .filter(|imp| imp.kind == ImportKind::SideEffect)
-        .collect();
-    let mut sorted: Vec<&&ImportStatement> = imps
-        .iter()
-        .filter(|imp| imp.kind != ImportKind::SideEffect)
-        .collect();
-    sorted.sort_by(|a, b| a.raw_text.trim().cmp(b.raw_text.trim()));
-    side_effects.extend(sorted);
-
-    for imp in side_effects {
-        let raw = imp.raw_text.trim().to_string();
+    for imp in imps {
+        let raw = imp.raw_text.trim();
         if raw.is_empty() {
             continue;
         }
-        if seen.contains(&raw) {
+
+        let key = raw_preserving_dedup_key(imp);
+        if !seen.insert(key) {
             removed += 1;
             continue;
         }
-        seen.insert(raw.clone());
 
-        organized.push(OrganizedImport {
+        if imp.kind == ImportKind::SideEffect {
+            side_effects.push(*imp);
+        } else {
+            sorted.push(*imp);
+        }
+    }
+
+    sorted.sort_by(|a, b| a.raw_text.trim().cmp(b.raw_text.trim()));
+    side_effects.extend(sorted);
+
+    let organized = side_effects
+        .into_iter()
+        .map(|imp| OrganizedImport {
             module_path: imp.module_path.clone(),
             names: imp.names.clone(),
             default_import: imp.default_import.clone(),
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
-            raw_override: Some(raw),
-        });
-    }
+            raw_override: Some(imp.raw_text.trim().to_string()),
+        })
+        .collect();
 
     (organized, removed)
+}
+
+fn raw_preserving_dedup_key(imp: &ImportStatement) -> String {
+    let mut form = imp.form.clone();
+    match &mut form {
+        ImportForm::Structured { named, .. }
+        | ImportForm::Solidity { named, .. }
+        | ImportForm::Es { named, .. }
+        | ImportForm::Python { named, .. }
+        | ImportForm::RustUse { named, .. } => sort_named_specifiers(named),
+        ImportForm::Go { .. } => {}
+    }
+
+    format!("{}|{:?}|{:?}", imp.module_path, imp.kind, form)
 }
 
 fn sort_named_specifiers(names: &mut [String]) {
@@ -735,18 +847,31 @@ fn generate_organized_block(
     grouped: &[(ImportGroup, Vec<OrganizedImport>)],
     lang: LangId,
 ) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut output = String::new();
+    let mut previous_group: Option<ImportGroup> = None;
 
-    for (_, imps) in grouped {
+    for (group, imps) in grouped {
         let mut lines: Vec<String> = Vec::new();
         for imp in imps {
             let line = generate_organized_line(imp, lang);
             lines.push(line);
         }
-        parts.push(lines.join("\n"));
+        if lines.is_empty() {
+            continue;
+        }
+
+        if !output.is_empty() {
+            if previous_group == Some(*group) {
+                output.push('\n');
+            } else {
+                output.push_str("\n\n");
+            }
+        }
+        output.push_str(&lines.join("\n"));
+        previous_group = Some(*group);
     }
 
-    parts.join("\n\n")
+    output
 }
 
 fn generate_go_grouped_block(grouped: &[(ImportGroup, Vec<OrganizedImport>)]) -> String {
@@ -801,11 +926,12 @@ fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
         }
         _ => {
             // TS/JS/TSX/Python — use the standard generator
-            imports::generate_import_line(
+            imports::generate_import_line_with_namespace(
                 lang,
                 &imp.module_path,
                 &imp.names,
                 imp.default_import.as_deref(),
+                imp.namespace_import.as_deref(),
                 imp.kind == ImportKind::Type,
             )
         }

@@ -21,8 +21,10 @@ mod kotlin;
 mod lua;
 mod perl;
 mod php;
+pub(crate) use php::{php_grouped_use_matches_module, php_grouped_use_shares_prefix};
 mod ruby;
 mod scala;
+pub(crate) use scala::scala_block_uses_scala2_dialect;
 mod swift;
 
 // ---------------------------------------------------------------------------
@@ -772,15 +774,17 @@ fn request_dedup_key(lang: LangId, req: &ImportRequest<'_>) -> ImportDedupKey {
             Some(req.import_kind.or(req.default_import).unwrap_or("system")),
         ),
         LangId::Java => {
-            let (module_path, modifiers) = wildcard_suffix_request(
+            let (mut module_path, modifiers) = wildcard_suffix_request(
                 req.module_path,
                 req.modifiers,
                 req.default_import == Some("*"),
             );
+            let mut names = req.names.to_vec();
+            normalize_java_static_member_key(&mut module_path, &modifiers, &mut names);
             structured_dedup_key(
                 &module_path,
                 ImportKind::Value,
-                &[],
+                &names,
                 None,
                 None,
                 &modifiers,
@@ -923,6 +927,25 @@ fn wildcard_suffix_request(
     (stripped.to_string(), modifiers)
 }
 
+fn normalize_java_static_member_key(
+    module_path: &mut String,
+    modifiers: &[String],
+    names: &mut Vec<String>,
+) {
+    let is_static = modifiers.iter().any(|modifier| modifier == "static");
+    let is_wildcard = modifiers.iter().any(|modifier| modifier == "wildcard");
+    if !is_static || is_wildcard || !names.is_empty() {
+        return;
+    }
+
+    if let Some((prefix, member)) = module_path.rsplit_once('.') {
+        if !prefix.is_empty() && !member.is_empty() {
+            names.push(member.to_string());
+            *module_path = prefix.to_string();
+        }
+    }
+}
+
 fn scala_request_dedup_key(req: &ImportRequest<'_>) -> ImportDedupKey {
     let mut module_path = req.module_path.to_string();
     let mut names: Vec<String> = req
@@ -1001,6 +1024,14 @@ fn canonical_dedup_key(lang: LangId, mut key: ImportDedupKey) -> ImportDedupKey 
     if matches!(lang, LangId::Java | LangId::Kotlin) {
         if let Some(stripped) = key.module_path.strip_suffix(".*") {
             key.module_path = stripped.to_string();
+        }
+        if matches!(lang, LangId::Java) {
+            if let ImportForm::Structured {
+                named, modifiers, ..
+            } = &mut key.form
+            {
+                normalize_java_static_member_key(&mut key.module_path, modifiers, named);
+            }
         }
     } else if matches!(lang, LangId::Scala) {
         key.module_path = key
@@ -2095,10 +2126,9 @@ fn generate_rs_import_line(module_path: &str, names: &[String], _type_only: bool
     if names.is_empty() {
         format!("use {module_path};")
     } else {
-        // If names are provided, generate `use prefix::{names};`
-        // But the caller may pass module_path as the full path including the item,
-        // e.g., "serde::Deserialize". For simple cases, just use the module_path directly.
-        format!("use {module_path};")
+        let mut sorted_names = names.to_vec();
+        sort_named_specifiers(&mut sorted_names);
+        format!("use {module_path}::{{{}}};", sorted_names.join(", "))
     }
 }
 
@@ -2271,24 +2301,80 @@ pub fn go_has_grouped_import(_source: &str, tree: &Tree) -> Option<Range<usize>>
 
     loop {
         let node = cursor.node();
-        if node.kind() == "import_declaration" {
-            let mut c = node.walk();
-            if c.goto_first_child() {
-                loop {
-                    if c.node().kind() == "import_spec_list" {
-                        return Some(node.byte_range());
-                    }
-                    if !c.goto_next_sibling() {
-                        break;
-                    }
-                }
-            }
+        if node.kind() == "import_declaration" && go_import_declaration_is_grouped(&node) {
+            return Some(node.byte_range());
         }
         if !cursor.goto_next_sibling() {
             break;
         }
     }
     None
+}
+
+pub fn go_import_declarations_range(_source: &str, tree: &Tree) -> Option<Range<usize>> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut range: Option<Range<usize>> = None;
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "import_declaration" {
+            let node_range = node.byte_range();
+            range = Some(match range {
+                Some(existing) => {
+                    existing.start.min(node_range.start)..existing.end.max(node_range.end)
+                }
+                None => node_range,
+            });
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    range
+}
+
+pub fn go_offset_is_in_grouped_import(_source: &str, tree: &Tree, offset: usize) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "import_declaration"
+            && node.start_byte() < offset
+            && offset < node.end_byte()
+            && go_import_declaration_is_grouped(&node)
+        {
+            return true;
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    false
+}
+
+fn go_import_declaration_is_grouped(node: &Node) -> bool {
+    let mut c = node.walk();
+    if c.goto_first_child() {
+        loop {
+            if c.node().kind() == "import_spec_list" {
+                return true;
+            }
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

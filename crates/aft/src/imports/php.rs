@@ -143,11 +143,12 @@ fn parse_php_grouped_namespace_use_declaration(
         return None;
     }
 
+    let names = parse_php_grouped_use_members(&raw_text);
     let group = classify_group_php(&module_path);
 
     Some(ImportStatement {
         module_path,
-        names: Vec::new(),
+        names: names.clone(),
         default_import: None,
         namespace_import: None,
         kind: ImportKind::Value,
@@ -155,13 +156,32 @@ fn parse_php_grouped_namespace_use_declaration(
         byte_range,
         raw_text,
         form: ImportForm::Structured {
-            named: Vec::new(),
+            named: names,
             namespace: None,
             alias: None,
             modifiers: vec!["group".to_string()],
             import_kind,
         },
     })
+}
+
+fn parse_php_grouped_use_members(raw_text: &str) -> Vec<String> {
+    let Some(open) = raw_text.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = raw_text.rfind('}') else {
+        return Vec::new();
+    };
+    if close <= open {
+        return Vec::new();
+    }
+
+    raw_text[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|member| !member.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_php_grouped_use_header(source: &str, node: &Node) -> Option<(String, Option<String>)> {
@@ -261,6 +281,46 @@ fn parse_php_namespace_use_clause(
     }
 
     Some((module_path, alias, import_kind))
+}
+
+pub(crate) fn php_grouped_use_shares_prefix(imp: &ImportStatement, module: &str) -> bool {
+    if !php_import_is_grouped(imp) {
+        return false;
+    }
+
+    let prefix = imp.module_path.trim_matches('\\');
+    let module = module.trim_matches('\\');
+    module == prefix
+        || module
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+pub(crate) fn php_grouped_use_matches_module(imp: &ImportStatement, module: &str) -> bool {
+    if !php_grouped_use_shares_prefix(imp, module) {
+        return false;
+    }
+
+    let prefix = imp.module_path.trim_matches('\\');
+    let module = module.trim_matches('\\');
+    if module == prefix {
+        return true;
+    }
+
+    let member = module
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('\\'))
+        .unwrap_or(module);
+    imp.names
+        .iter()
+        .any(|name| super::specifier_matches(name, member))
+}
+
+fn php_import_is_grouped(imp: &ImportStatement) -> bool {
+    matches!(
+        &imp.form,
+        ImportForm::Structured { modifiers, .. } if modifiers.iter().any(|modifier| modifier == "group")
+    )
 }
 
 fn find_direct_child<'tree>(node: &Node<'tree>, kind: &str) -> Option<Node<'tree>> {
@@ -421,10 +481,11 @@ use const App\VERSION;
         assert_eq!(block.imports.len(), 3);
         assert_eq!(block.imports[1].module_path, "App");
         assert_eq!(block.imports[1].raw_text, "use App\\{Beta, Gamma as G};");
+        assert_eq!(block.imports[1].names, vec!["Beta", "Gamma as G"]);
         assert_eq!(
             block.imports[1].form,
             ImportForm::Structured {
-                named: vec![],
+                named: vec!["Beta".to_string(), "Gamma as G".to_string()],
                 namespace: None,
                 alias: None,
                 modifiers: vec!["group".to_string()],

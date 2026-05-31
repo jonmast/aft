@@ -1236,13 +1236,153 @@ fn organize_imports_preserves_side_effect_order() {
         "side-effect imports keep original relative order (b before a):\n{content}"
     );
     assert!(
-        polyfill_a_pos < react_pos,
-        "side-effects come before value imports within the same group:\n{content}"
+        zod_pos < polyfill_a_pos,
+        "value imports before a side-effect barrier must not cross it:\n{content}"
     );
     assert!(
-        react_pos < zod_pos,
-        "value imports alphabetized (react before zod):\n{content}"
+        polyfill_a_pos < react_pos,
+        "side-effects keep their source position relative to following value imports:\n{content}"
     );
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_refuses_to_drop_inter_import_comments() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
+        "organize_comment_gap_{}.ts",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let original =
+        "import A from 'a';\n// keep me\nimport B from 'b';\n\nexport const x = A || B;\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(&mut aft, "org-comment-gap", &file.display().to_string());
+    assert_eq!(resp["success"], false, "organize should refuse: {resp:?}");
+    assert_eq!(resp["code"], "multi_region_imports");
+    let content = fs::read_to_string(&file).unwrap();
+    assert_eq!(content, original, "comment gap must be preserved");
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn add_remove_import_refuse_csharp_and_php_multi_region_imports() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let cs_file = dir.path().join(format!("multi_region_{n}.cs"));
+    fs::write(
+        &cs_file,
+        "namespace A {\nusing Common;\nclass A {}\n}\nnamespace B {\nusing Common;\nclass B {}\n}\n",
+    )
+    .unwrap();
+    let cs_file_str = cs_file.display().to_string();
+    let add_cs = send_add_import(
+        &mut aft,
+        "cs-multi-add",
+        &cs_file_str,
+        "System",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(add_cs["success"], false, "C# add should refuse: {add_cs:?}");
+    assert_eq!(add_cs["code"], "multi_region_imports");
+    let remove_cs = send_remove_import(&mut aft, "cs-multi-remove", &cs_file_str, "Common", None);
+    assert_eq!(
+        remove_cs["success"], false,
+        "C# remove should refuse: {remove_cs:?}"
+    );
+    assert_eq!(remove_cs["code"], "multi_region_imports");
+
+    let php_file = dir.path().join(format!("multi_region_{n}.php"));
+    fs::write(
+        &php_file,
+        "<?php\nnamespace A {\nuse Common\\Thing;\nclass A {}\n}\nnamespace B {\nuse Common\\Thing;\nclass B {}\n}\n",
+    )
+    .unwrap();
+    let php_file_str = php_file.display().to_string();
+    let add_php = send_add_import(
+        &mut aft,
+        "php-multi-add",
+        &php_file_str,
+        "Other\\Thing",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        add_php["success"], false,
+        "PHP add should refuse: {add_php:?}"
+    );
+    assert_eq!(add_php["code"], "multi_region_imports");
+    let remove_php = send_remove_import(
+        &mut aft,
+        "php-multi-remove",
+        &php_file_str,
+        "Common\\Thing",
+        None,
+    );
+    assert_eq!(
+        remove_php["success"], false,
+        "PHP remove should refuse: {remove_php:?}"
+    );
+    assert_eq!(remove_php["code"], "multi_region_imports");
+
+    fs::remove_file(&cs_file).ok();
+    fs::remove_file(&php_file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn php_grouped_use_refuses_memberwise_add_and_remove() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
+        "php_grouped_use_{}.php",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let original = "<?php\nuse App\\{Foo, Bar as Baz};\n\nclass C {}\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    let add_resp = send_add_import(
+        &mut aft,
+        "php-group-add",
+        &file_str,
+        "App\\Foo",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        add_resp["success"], false,
+        "add should refuse: {add_resp:?}"
+    );
+    assert_eq!(add_resp["code"], "unsupported_grouped_import");
+
+    let remove_resp = send_remove_import(&mut aft, "php-group-remove", &file_str, "App\\Foo", None);
+    assert_eq!(
+        remove_resp["success"], false,
+        "remove should refuse: {remove_resp:?}"
+    );
+    assert_eq!(remove_resp["code"], "unsupported_grouped_import");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
 
     fs::remove_file(&file).ok();
     aft.shutdown();

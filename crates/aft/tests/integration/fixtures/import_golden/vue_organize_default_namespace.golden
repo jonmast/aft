@@ -1,0 +1,8 @@
+<template>
+  <div />
+</template>
+
+<script setup lang="ts">
+import React, * as NS from 'react'
+const x = React
+</script>

@@ -6,6 +6,7 @@ use tree_sitter::{Node, Tree};
 
 const SCALA_WILDCARD_FLAT_MARKER: &str = "*";
 const SCALA_GIVEN_FLAT_MARKER: &str = "given";
+const SCALA2_DIALECT_MODIFIER: &str = "scala2";
 
 pub(crate) fn classify_group_scala(module_path: &str) -> ImportGroup {
     if module_path == "scala"
@@ -19,6 +20,13 @@ pub(crate) fn classify_group_scala(module_path: &str) -> ImportGroup {
     } else {
         ImportGroup::External
     }
+}
+
+pub(crate) fn scala_block_uses_scala2_dialect(block: &ImportBlock) -> bool {
+    block
+        .imports
+        .iter()
+        .any(|imp| imp.raw_text.contains("=>") || imp.raw_text.contains("._"))
 }
 
 pub(crate) fn parse_scala_imports(source: &str, tree: &Tree) -> ImportBlock {
@@ -215,6 +223,11 @@ fn parse_scala_renamed_identifier(source: &str, node: &Node) -> Option<String> {
 }
 
 pub(crate) fn generate_scala_import_line(req: &ImportRequest) -> String {
+    let scala2 = req
+        .modifiers
+        .iter()
+        .any(|modifier| modifier == SCALA2_DIALECT_MODIFIER);
+
     if is_scala_given_request(req) {
         return format!(
             "import {}.given",
@@ -223,10 +236,19 @@ pub(crate) fn generate_scala_import_line(req: &ImportRequest) -> String {
     }
 
     if is_scala_wildcard_request(req) {
-        return format!("import {}.*", strip_scala_special_suffix(req.module_path));
+        let wildcard = if scala2 { "_" } else { "*" };
+        return format!(
+            "import {}.{wildcard}",
+            strip_scala_special_suffix(req.module_path)
+        );
     }
 
     if let Some(alias) = req.alias.filter(|alias| !alias.is_empty()) {
+        if scala2 {
+            if let Some((prefix, leaf)) = req.module_path.rsplit_once('.') {
+                return format!("import {}.{{{} => {}}}", prefix, leaf, alias);
+            }
+        }
         return format!("import {} as {}", req.module_path, alias);
     }
 
@@ -237,13 +259,16 @@ pub(crate) fn generate_scala_import_line(req: &ImportRequest) -> String {
     let mut names: Vec<String> = req
         .names
         .iter()
-        .map(|name| normalize_scala_rename(name))
+        .map(|name| normalize_scala_rename_for_dialect(name, scala2))
         .filter(|name| !name.is_empty())
         .collect();
     sort_named_specifiers(&mut names);
 
     match names.as_slice() {
         [] => format!("import {}", req.module_path),
+        [name] if scala2 && scala_selector_is_rename(name) => {
+            format!("import {}.{{{}}}", req.module_path, name)
+        }
         [name] => format!("import {}.{}", req.module_path, name),
         _ => format!("import {}.{{{}}}", req.module_path, names.join(", ")),
     }
@@ -271,13 +296,27 @@ fn strip_scala_special_suffix(module_path: &str) -> &str {
         .unwrap_or(module_path)
 }
 
-fn normalize_scala_rename(name: &str) -> String {
+fn normalize_scala_rename_for_dialect(name: &str, scala2: bool) -> String {
     let trimmed = name.trim();
-    if let Some((from, to)) = trimmed.split_once("=>") {
+    if scala2 {
+        if let Some((from, to)) = trimmed.split_once("=>") {
+            format!("{} => {}", from.trim(), to.trim())
+        } else if let Some((from, to)) = trimmed.split_once(" as ") {
+            format!("{} => {}", from.trim(), to.trim())
+        } else if trimmed == "*" {
+            "_".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else if let Some((from, to)) = trimmed.split_once("=>") {
         format!("{} as {}", from.trim(), to.trim())
     } else {
         trimmed.to_string()
     }
+}
+
+fn scala_selector_is_rename(name: &str) -> bool {
+    name.contains("=>") || name.contains(" as ")
 }
 
 pub struct ScalaSyntax;
@@ -471,6 +510,25 @@ mod tests {
             "import a.b.*"
         );
 
+        let scala2_wildcard_modifiers =
+            vec!["wildcard".to_string(), SCALA2_DIALECT_MODIFIER.to_string()];
+        assert_eq!(
+            generate_import(
+                LangId::Scala,
+                &ImportRequest {
+                    module_path: "a.b",
+                    names: &[],
+                    default_import: None,
+                    namespace: None,
+                    alias: None,
+                    type_only: false,
+                    modifiers: &scala2_wildcard_modifiers,
+                    import_kind: None,
+                }
+            ),
+            "import a.b._"
+        );
+
         let grouped_names = vec!["C".to_string(), "D".to_string()];
         assert_eq!(
             generate_import(
@@ -487,6 +545,24 @@ mod tests {
                 &ImportRequest::legacy("a.b", &renamed_name, None, None, false)
             ),
             "import a.b.C as D"
+        );
+
+        let scala2_modifiers = vec![SCALA2_DIALECT_MODIFIER.to_string()];
+        assert_eq!(
+            generate_import(
+                LangId::Scala,
+                &ImportRequest {
+                    module_path: "a.b",
+                    names: &renamed_name,
+                    default_import: None,
+                    namespace: None,
+                    alias: None,
+                    type_only: false,
+                    modifiers: &scala2_modifiers,
+                    import_kind: None,
+                }
+            ),
+            "import a.b.{C => D}"
         );
 
         assert_eq!(

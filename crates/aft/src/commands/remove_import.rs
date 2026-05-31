@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use super::organize_imports;
 use crate::context::AppContext;
 use crate::edit;
 use crate::imports;
@@ -93,13 +94,12 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let module_owned;
-    let module = if matches!(lang, LangId::C | LangId::Cpp) {
-        module_owned = imports::normalize_include_module(module).0;
-        module_owned.as_str()
+    let (module_owned, include_import_kind) = if matches!(lang, LangId::C | LangId::Cpp) {
+        imports::normalize_include_module(module)
     } else {
-        module
+        (module.to_string(), None)
     };
+    let module = module_owned.as_str();
 
     // --- Parse file and imports ---
     let (source, tree, block) = match imports::parse_file_imports(&path, lang) {
@@ -115,12 +115,51 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    if matches!(lang, LangId::CSharp | LangId::Php)
+        && organize_imports::imports_span_multiple_code_regions(&source, lang, &block.imports)
+    {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "remove_import: imports in {file} span multiple code regions; refusing to remove because the target region is ambiguous"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
+    if lang == LangId::Php
+        && block.imports.iter().any(|imp| {
+            imports::php_grouped_use_shares_prefix(imp, module)
+                || imports::php_grouped_use_matches_module(imp, module)
+        })
+    {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_grouped_import",
+            format!(
+                "remove_import: PHP grouped use declarations matching '{module}' are not safe to edit member-wise; expand the grouped use first"
+            ),
+            serde_json::json!({ "file": file, "module": module }),
+        );
+    }
+
     // --- Find matching import ---
     let matching: Vec<(usize, &imports::ImportStatement)> = block
         .imports
         .iter()
         .enumerate()
-        .filter(|(_, imp)| imp.module_path == module)
+        .filter(|(_, imp)| {
+            if imp.module_path != module {
+                return false;
+            }
+            if matches!(lang, LangId::C | LangId::Cpp) {
+                if let Some(kind) = include_import_kind {
+                    return imp.default_import.as_deref() == Some(kind);
+                }
+            }
+            true
+        })
         .collect();
 
     if matching.is_empty() {
@@ -291,28 +330,30 @@ fn remove_name_from_imports(
                 edits.push((range, String::new()));
             } else {
                 // Other bindings remain — regenerate without target
-                let new_line = imports::generate_import_line(
+                let new_line = imports::generate_import_line_with_namespace(
                     lang,
                     &imp.module_path,
                     &new_names,
                     imp.default_import.as_deref(),
+                    imp.namespace_import.as_deref(),
                     imp.kind == imports::ImportKind::Type,
                 );
                 edits.push((imp.byte_range.clone(), new_line));
             }
         } else if imp.default_import.as_deref() == Some(target_name) {
             // Removing the default import
-            if imp.names.is_empty() {
+            if imp.names.is_empty() && imp.namespace_import.is_none() {
                 // Only default — remove entire statement
                 let range = line_range(source, &imp.byte_range);
                 edits.push((range, String::new()));
             } else {
-                // Has named imports too — regenerate without default
-                let new_line = imports::generate_import_line(
+                // Has named or namespace imports too — regenerate without default
+                let new_line = imports::generate_import_line_with_namespace(
                     lang,
                     &imp.module_path,
                     &imp.names,
                     None,
+                    imp.namespace_import.as_deref(),
                     imp.kind == imports::ImportKind::Type,
                 );
                 edits.push((imp.byte_range.clone(), new_line));

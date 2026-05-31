@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use super::organize_imports;
 use crate::context::AppContext;
 use crate::edit;
 use crate::imports;
@@ -84,7 +85,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let modifiers: Vec<String> = req
+    let mut modifiers: Vec<String> = req
         .params
         .get("modifiers")
         .and_then(|v| v.as_array())
@@ -177,6 +178,42 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         if let Err(err) = imports::vue_single_script_content_range(&tree) {
             return Response::error(&req.id, err.code(), err.message("add_import"));
         }
+    }
+
+    if matches!(lang, LangId::CSharp | LangId::Php)
+        && organize_imports::imports_span_multiple_code_regions(&source, lang, &block.imports)
+    {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "add_import: imports in {file} span multiple code regions; refusing to add because the target region is ambiguous"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
+    if lang == LangId::Php
+        && block.imports.iter().any(|imp| {
+            imports::php_grouped_use_shares_prefix(imp, module)
+                || imports::php_grouped_use_matches_module(imp, module)
+        })
+    {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_grouped_import",
+            format!(
+                "add_import: PHP grouped use declarations matching '{module}' are not safe to edit member-wise; expand the grouped use first"
+            ),
+            serde_json::json!({ "file": file, "module": module }),
+        );
+    }
+
+    if lang == LangId::Scala
+        && imports::scala_block_uses_scala2_dialect(&block)
+        && !modifiers.iter().any(|modifier| modifier == "scala2")
+    {
+        modifiers.push("scala2".to_string());
     }
 
     let import_request = imports::ImportRequest {
@@ -337,7 +374,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
         // For Go, check if we're inserting into a grouped import block
         let import_line = if matches!(lang, LangId::Go) {
-            let in_group = imports::go_has_grouped_import(&source, &tree).is_some();
+            let in_group = imports::go_offset_is_in_grouped_import(&source, &tree, insert_offset);
             imports::generate_go_import_line_pub(module, default_import.as_deref(), in_group)
         } else {
             imports::generate_import(lang, &import_request)
@@ -528,7 +565,7 @@ fn validate_module_path_for_add(lang: LangId, module: &str) -> Result<(), &'stat
         if module.starts_with('/') || module.contains('/') {
             return Err("filesystem paths are not allowed for this language");
         }
-        if module.starts_with('\\') || has_windows_drive_prefix(module) {
+        if (lang != LangId::Php && module.starts_with('\\')) || has_windows_drive_prefix(module) {
             return Err("absolute paths are not allowed for this language");
         }
         if lang != LangId::Php && module.contains('\\') {
