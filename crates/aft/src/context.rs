@@ -588,8 +588,9 @@ impl AppContext {
     ///
     /// The builder honors:
     /// - `<project_root>/.gitignore`
-    /// - `<project_root>/.git/info/exclude` (loaded explicitly because
-    ///   `GitignoreBuilder::new` does not auto-discover it)
+    /// - Git's global excludes file (the same source used by `ignore::WalkBuilder`)
+    /// - the repository's real `info/exclude` file, resolved through Git's
+    ///   common dir for linked worktrees
     /// - nested `.gitignore` files (each `.gitignore` discovered during
     ///   the recursive walk)
     ///
@@ -624,6 +625,21 @@ impl AppContext {
         // for watcher events on macOS) keeps them in the same prefix space.
         let root = std::fs::canonicalize(&root_raw).unwrap_or(root_raw);
         let mut builder = GitignoreBuilder::new(&root);
+        // Git's global excludes file — keep the live watcher matcher aligned
+        // with the project walkers (`WalkBuilder::git_global(true)`). The
+        // ignore crate exposes the same path discovery it uses internally, so
+        // this handles the default XDG location and configured excludesFile.
+        if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+            if global_ignore.is_file() {
+                if let Some(err) = builder.add(&global_ignore) {
+                    crate::slog_warn!(
+                        "global gitignore parse error in {}: {}",
+                        global_ignore.display(),
+                        err
+                    );
+                }
+            }
+        }
         // Add root .gitignore (the most common case)
         let root_ignore = Path::new(&root).join(".gitignore");
         if root_ignore.exists() {
@@ -651,7 +667,15 @@ impl AppContext {
         }
         // .git/info/exclude — manually added because GitignoreBuilder::new()
         // does not auto-discover it (verified against ignore-0.4.25 source).
-        let info_exclude = Path::new(&root).join(".git").join("info").join("exclude");
+        // In linked worktrees this lives under the repository common dir, not
+        // under `<worktree>/.git/info/exclude` (where `.git` is only a file).
+        let info_exclude = self
+            .git_common_dir
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Path::new(&root).join(".git"))
+            .join("info")
+            .join("exclude");
         if info_exclude.exists() {
             if let Some(err) = builder.add(&info_exclude) {
                 crate::slog_warn!(
@@ -960,6 +984,10 @@ impl AppContext {
 
     pub fn is_worktree_bridge(&self) -> bool {
         *self.is_worktree_bridge.borrow()
+    }
+
+    pub fn git_common_dir(&self) -> Option<PathBuf> {
+        self.git_common_dir.borrow().clone()
     }
 
     /// Replace the current degraded-mode reasons. Empty vec = full-featured

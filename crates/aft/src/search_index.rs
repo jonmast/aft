@@ -1815,17 +1815,12 @@ pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
     let root = canonicalize_or_normalize(project_root);
     let mut files = Vec::new();
     collect_ignore_rule_files(&root, &mut files);
-    let info_exclude = run_git(
-        &root,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "info/exclude",
-        ],
-    )
-    .map(PathBuf::from)
-    .unwrap_or_else(|| root.join(".git").join("info").join("exclude"));
+    if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
+        if global_ignore.is_file() {
+            files.push(global_ignore);
+        }
+    }
+    let info_exclude = git_info_exclude_path(&root);
     if info_exclude.is_file() {
         files.push(info_exclude);
     }
@@ -1849,6 +1844,17 @@ pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
     }
 
     format!("{:x}", hasher.finalize())
+}
+
+fn git_info_exclude_path(root: &Path) -> PathBuf {
+    run_git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| root.join(".git"))
+    .join("info")
+    .join("exclude")
 }
 
 fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -1971,11 +1977,19 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
 fn verify_file_mtimes(index: &mut SearchIndex) {
+    let filters = PathFilters::default();
+    let current_files = walk_project_files(&index.project_root, &filters);
+    let current_file_set: HashSet<PathBuf> = current_files.iter().cloned().collect();
     let mut stale_paths = Vec::new();
+    let mut removed_paths = Vec::new();
 
     for entry in &mut index.files {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
+        }
+        if !current_file_set.contains(&entry.path) {
+            removed_paths.push(entry.path.clone());
+            continue;
         }
         let cached = FileFreshness {
             mtime: entry.modified,
@@ -1997,14 +2011,23 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
         }
     }
 
-    // Re-index stale files
+    for path in &removed_paths {
+        index.remove_file(path);
+    }
+
+    // Re-index stale files that are still in the current walk set. If an ignore
+    // rule changed while AFT was down but the fingerprint missed it, this keeps
+    // warm-cache verification from resurrecting now-ignored cached entries.
     for path in &stale_paths {
-        index.update_file(path);
+        if current_file_set.contains(path) {
+            index.update_file(path);
+        } else {
+            index.remove_file(path);
+        }
     }
 
     // Detect new files not in the index
-    let filters = PathFilters::default();
-    for path in walk_project_files(&index.project_root, &filters) {
+    for path in current_files {
         if !index.path_to_id.contains_key(&path) {
             index.update_file(&path);
         }

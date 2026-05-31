@@ -699,25 +699,59 @@ fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
         .or_else(|| configured_root.map(canonicalize_watcher_path))
 }
 
+fn watcher_same_path(path: &std::path::Path, target: &std::path::Path) -> bool {
+    if path == target {
+        return true;
+    }
+
+    std::fs::canonicalize(target)
+        .map(|target| path == target)
+        .unwrap_or(false)
+}
+
+fn watcher_git_info_exclude_path(
+    ctx: &AppContext,
+    project_root: &std::path::Path,
+) -> std::path::PathBuf {
+    ctx.git_common_dir()
+        .unwrap_or_else(|| project_root.join(".git"))
+        .join("info")
+        .join("exclude")
+}
+
 fn watcher_path_is_git_info_exclude(
+    ctx: &AppContext,
     project_root: &std::path::Path,
     path: &std::path::Path,
 ) -> bool {
-    path == project_root.join(".git").join("info").join("exclude")
+    watcher_same_path(path, &watcher_git_info_exclude_path(ctx, project_root))
+}
+
+fn watcher_path_is_global_gitignore(path: &std::path::Path) -> bool {
+    ignore::gitignore::gitconfig_excludes_path()
+        .as_deref()
+        .is_some_and(|global_ignore| watcher_same_path(path, global_ignore))
 }
 
 fn watcher_path_can_change_corpus_ignore(
+    ctx: &AppContext,
     project_root: Option<&std::path::Path>,
     path: &std::path::Path,
 ) -> bool {
+    if watcher_path_is_global_gitignore(path) {
+        return true;
+    }
+    if let Some(project_root) = project_root {
+        if watcher_path_is_git_info_exclude(ctx, project_root, path) {
+            return true;
+        }
+    }
+
     let Some(project_root) = project_root else {
         return false;
     };
     if !path.starts_with(project_root) {
         return false;
-    }
-    if watcher_path_is_git_info_exclude(project_root, path) {
-        return true;
     }
 
     watcher_path_is_ignore_file(path) && !watcher_path_is_infra_skip(path)
@@ -761,7 +795,7 @@ where
     // not affect AFT's project corpus and should not trigger a corpus refresh.
     let ignore_file_changed = raw_paths
         .iter()
-        .any(|path| watcher_path_can_change_corpus_ignore(project_root.as_deref(), path));
+        .any(|path| watcher_path_can_change_corpus_ignore(ctx, project_root.as_deref(), path));
     if ignore_file_changed {
         log::debug!("watcher: project ignore file changed, rebuilding matcher before filter");
         ctx.rebuild_gitignore();
@@ -774,16 +808,8 @@ where
                 return false;
             }
 
-            if let Some(matcher) = ctx.gitignore() {
-                if path.starts_with(matcher.path()) {
-                    let is_dir = path.is_dir();
-                    if matcher
-                        .matched_path_or_any_parents(path, is_dir)
-                        .is_ignore()
-                    {
-                        return false;
-                    }
-                }
+            if watcher_path_is_ignored_by_current_matcher(ctx, path) {
+                return false;
             }
             true
         })
@@ -806,18 +832,61 @@ fn semantic_project_files_for_refresh(
     )
 }
 
+fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &std::path::Path) -> bool {
+    if watcher_path_is_infra_skip(path) {
+        return true;
+    }
+
+    if let Some(matcher) = ctx.gitignore() {
+        if path.starts_with(matcher.path()) {
+            let is_dir = path.is_dir();
+            return matcher
+                .matched_path_or_any_parents(path, is_dir)
+                .is_ignore();
+        }
+    }
+
+    false
+}
+
 fn replay_search_index_pending_updates(
+    ctx: &AppContext,
     index: &mut aft::search_index::SearchIndex,
     pending_paths: Vec<std::path::PathBuf>,
 ) {
     for path in pending_paths {
         if path.exists() {
-            index.update_file(&path);
+            if watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+                index.remove_file(&path);
+            } else {
+                index.update_file(&path);
+            }
         } else {
             index.remove_file(&path);
         }
     }
 }
+
+fn semantic_corpus_refresh_in_progress(ctx: &AppContext) -> bool {
+    matches!(
+        &*ctx.semantic_index_status().borrow(),
+        SemanticIndexStatus::Building { stage, .. } if stage == "refreshing_corpus"
+    )
+}
+
+#[cfg(debug_assertions)]
+fn delay_search_rebuild_publish_for_debug() {
+    let Some(delay_ms) = std::env::var("AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(delay_ms));
+}
+
+#[cfg(not(debug_assertions))]
+fn delay_search_rebuild_publish_for_debug() {}
 
 fn spawn_search_corpus_refresh(
     ctx: &AppContext,
@@ -859,6 +928,7 @@ fn spawn_search_corpus_refresh(
                 &root,
                 config.search_index_max_file_size,
             );
+            delay_search_rebuild_publish_for_debug();
             if !is_worktree_bridge {
                 index.write_to_disk(&cache_dir, index.stored_git_head());
             }
@@ -995,7 +1065,11 @@ fn drain_watcher_events(ctx: &AppContext) {
         .filter(|path| watcher_path_is_source(path))
         .cloned()
         .collect::<Vec<_>>();
-    if ctx.semantic_index_rx().borrow().is_some() && !semantic_source_paths.is_empty() {
+    let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
+    let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
+    if (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
+        && !semantic_source_paths.is_empty()
+    {
         ctx.add_pending_semantic_index_paths(semantic_source_paths.clone());
     }
 
@@ -1078,25 +1152,48 @@ fn drain_watcher_events(ctx: &AppContext) {
 }
 
 fn drain_search_index_events(ctx: &AppContext) {
-    let latest = {
+    let (latest, disconnected) = {
         let rx_ref = ctx.search_index_rx().borrow();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
 
         let mut latest = None;
-        while let Ok(pair) = rx.try_recv() {
-            latest = Some(pair);
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(index) => latest = Some(index),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
-        latest
+        (latest, disconnected)
     };
 
+    let mut status_changed = false;
+    let mut installed_index = false;
     if let Some(mut index) = latest {
         let pending_paths = ctx.take_pending_search_index_paths();
         if !pending_paths.is_empty() {
-            replay_search_index_pending_updates(&mut index, pending_paths);
+            replay_search_index_pending_updates(ctx, &mut index, pending_paths);
         }
         *ctx.search_index().borrow_mut() = Some(index);
+        installed_index = true;
+        status_changed = true;
+    }
+
+    if disconnected || installed_index {
+        *ctx.search_index_rx().borrow_mut() = None;
+        if disconnected && !installed_index {
+            let _ = ctx.take_pending_search_index_paths();
+        }
+        status_changed = true;
+    }
+
+    if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
@@ -1258,6 +1355,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
     }
 
     let mut status_changed = false;
+    let mut replay_refresh_paths = Vec::new();
     for event in events {
         match event {
             SemanticRefreshEvent::Started { paths } => {
@@ -1286,7 +1384,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 }
             }
             SemanticRefreshEvent::CorpusCompleted {
-                index,
+                mut index,
                 changed,
                 added,
                 deleted,
@@ -1300,6 +1398,16 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                         deleted,
                         total_processed
                     );
+                }
+                let pending_paths = ctx.take_pending_semantic_index_paths();
+                for path in pending_paths {
+                    if !watcher_path_is_source(&path) {
+                        continue;
+                    }
+                    index.invalidate_file(&path);
+                    if !watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+                        replay_refresh_paths.push(path);
+                    }
                 }
                 *ctx.semantic_index().borrow_mut() = Some(index);
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
@@ -1317,10 +1425,41 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
             }
             SemanticRefreshEvent::CorpusFailed { error } => {
                 aft::slog_warn!("semantic corpus refresh failed: {}", error);
+                let _ = ctx.take_pending_semantic_index_paths();
                 *ctx.semantic_index().borrow_mut() = None;
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
                 status_changed = true;
             }
+        }
+    }
+
+    if !replay_refresh_paths.is_empty() {
+        {
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                for path in &replay_refresh_paths {
+                    status.add_refreshing_file(path.clone());
+                }
+                status_changed = true;
+            }
+        }
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest::Files {
+                    paths: replay_refresh_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            aft::slog_warn!(
+                "semantic refresh worker unavailable; dropping {} replayed corpus file(s)",
+                replay_refresh_paths.len()
+            );
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            for path in &replay_refresh_paths {
+                status.cancel_refreshing_file(path);
+            }
+            status_changed = true;
         }
     }
 
