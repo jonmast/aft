@@ -14,6 +14,18 @@ import {
 
 const z = tool.schema;
 
+function responsePaths(response: Record<string, unknown>): string[] {
+  return Array.isArray(response.paths)
+    ? response.paths.filter((path): path is string => typeof path === "string" && path.length > 0)
+    : [];
+}
+
+function bridgeErrorMessage(response: Record<string, unknown>, fallback: string): string {
+  return typeof response.message === "string" && response.message.length > 0
+    ? response.message
+    : fallback;
+}
+
 /**
  * Tool definitions for safety & recovery commands: undo, edit_history,
  * checkpoint, restore_checkpoint, list_checkpoints.
@@ -62,14 +74,22 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           throw new Error(`'name' is required for '${op}' op`);
         }
 
-        if (op === "undo" && typeof args.filePath === "string") {
-          const filePath = resolveAbsolutePath(context, args.filePath);
+        if (op === "undo") {
+          const previewParams: Record<string, unknown> = {};
+          if (typeof args.filePath === "string") previewParams.file = args.filePath;
+          const preview = await callBridge(ctx, context, "undo_preview", previewParams);
+          if (preview.success === false) {
+            throw new Error(bridgeErrorMessage(preview, "undo preview failed"));
+          }
 
-          // External-directory check first (mirrors opencode-native edit.ts:68).
-          {
+          for (const filePath of new Set(responsePaths(preview))) {
             const denial = await assertExternalDirectoryPermission(context, filePath);
             if (denial) return permissionDeniedResponse(denial);
           }
+        }
+
+        if (op === "undo" && typeof args.filePath === "string") {
+          const filePath = resolveAbsolutePath(context, args.filePath);
 
           const permissionError = await askEditPermission(
             context,
@@ -79,23 +99,39 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
 
-        if (op === "checkpoint" && Array.isArray(args.files)) {
-          const uniqueParents = new Set<string>();
-          for (const file of args.files as string[]) {
-            if (typeof file !== "string") continue;
-            const abs = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
-            const parent = path.dirname(abs);
-            if (uniqueParents.has(parent)) continue;
-            uniqueParents.add(parent);
-            const denial = await assertExternalDirectoryPermission(context, file, { kind: "file" });
-            if (denial) return permissionDeniedResponse(denial);
+        if (op === "checkpoint") {
+          const checkpointFiles = Array.isArray(args.files)
+            ? (args.files as string[])
+            : typeof args.filePath === "string"
+              ? [args.filePath]
+              : undefined;
+          if (Array.isArray(checkpointFiles)) {
+            const uniqueParents = new Set<string>();
+            for (const file of checkpointFiles) {
+              if (typeof file !== "string") continue;
+              const abs = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+              const parent = path.dirname(abs);
+              if (uniqueParents.has(parent)) continue;
+              uniqueParents.add(parent);
+              const denial = await assertExternalDirectoryPermission(context, file, {
+                kind: "file",
+              });
+              if (denial) return permissionDeniedResponse(denial);
+            }
           }
         }
 
         if (op === "restore") {
-          // Limitation: restore can include external files from a prior checkpoint,
-          // but the plugin has no per-file visibility into checkpoint contents
-          // without a Rust-side preview API. Keep the workspace edit ask below.
+          const preview = await callBridge(ctx, context, "checkpoint_paths", { name: args.name });
+          if (preview.success === false) {
+            throw new Error(bridgeErrorMessage(preview, "checkpoint path preview failed"));
+          }
+
+          for (const filePath of new Set(responsePaths(preview))) {
+            const denial = await assertExternalDirectoryPermission(context, filePath);
+            if (denial) return permissionDeniedResponse(denial);
+          }
+
           const permissionError = await askEditPermission(context, [workspacePattern(context)], {
             checkpoint: args.name,
           });

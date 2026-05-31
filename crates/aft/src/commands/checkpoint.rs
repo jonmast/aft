@@ -95,3 +95,33 @@ fn validate_checkpoint_files(
     }
     Ok(validated)
 }
+
+/// Handle the `checkpoint_paths` command: return paths a checkpoint restore would write.
+///
+/// Params: `name` (string, required) — checkpoint name.
+/// Returns: `{ name, paths, file_count }` without mutating checkpoint or filesystem state.
+pub fn handle_checkpoint_paths(req: &RawRequest, ctx: &AppContext) -> Response {
+    let name = match req.params.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "checkpoint_paths: missing required param 'name'",
+            );
+        }
+    };
+
+    let checkpoint_store = ctx.checkpoint().borrow();
+    match checkpoint_store.absolute_file_paths(req.session(), name) {
+        Ok(paths) => Response::success(
+            &req.id,
+            serde_json::json!({
+                "name": name,
+                "paths": paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "file_count": paths.len(),
+            }),
+        ),
+        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+    }
+}

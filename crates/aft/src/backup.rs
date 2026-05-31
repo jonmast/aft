@@ -42,6 +42,28 @@ pub enum BackupEntryKind {
     Tombstone,
 }
 
+#[derive(Debug, Clone)]
+struct BackupEntryHead {
+    order: u128,
+    op_id: Option<String>,
+}
+
+impl BackupEntryHead {
+    fn from_entry(entry: &BackupEntry) -> Self {
+        Self {
+            order: entry.order,
+            op_id: entry.op_id.clone(),
+        }
+    }
+
+    fn from_row(row: &BackupRow) -> Self {
+        Self {
+            order: row.order,
+            op_id: row.op_id.clone(),
+        }
+    }
+}
+
 impl BackupEntry {
     fn to_backup_row(
         &self,
@@ -687,6 +709,107 @@ impl BackupStore {
         files.into_iter().collect()
     }
 
+    /// Preview the file path that `restore_latest` would write for `(session, path)`.
+    ///
+    /// This is intentionally read-only: it inspects DB/disk/in-memory backup metadata
+    /// without popping the undo stack or writing restored file contents.
+    pub fn preview_latest_path(&self, session: &str, path: &Path) -> Result<PathBuf, AftError> {
+        let key = canonicalize_key(path);
+        if self.latest_head_for_key(session, &key).is_some() {
+            Ok(key)
+        } else {
+            Err(AftError::NoUndoHistory {
+                path: path.display().to_string(),
+            })
+        }
+    }
+
+    /// Preview the paths that `restore_last_operation` would touch for `session`.
+    ///
+    /// This mirrors the operation selection logic used by restore, but only reads
+    /// backup metadata. It includes tombstone targets because undoing a create
+    /// operation deletes those paths and therefore still requires write permission.
+    pub fn preview_last_operation_paths(&self, session: &str) -> Result<Vec<PathBuf>, AftError> {
+        let mut heads_by_path: HashMap<PathBuf, BackupEntryHead> = self
+            .entries
+            .get(session)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|(key, stack)| {
+                        stack
+                            .last()
+                            .map(|entry| (key.clone(), BackupEntryHead::from_entry(entry)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        match self.read_latest_operation_heads_from_db(session) {
+            Some(Ok(db_heads)) if !db_heads.is_empty() => {
+                for (key, head) in db_heads {
+                    heads_by_path.insert(key, head);
+                }
+            }
+            Some(Ok(_)) => {
+                crate::slog_info!(
+                    "backup latest operation preview DB miss for session {}; falling back to disk",
+                    session
+                );
+                self.merge_disk_stack_heads(session, &mut heads_by_path);
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "backup latest operation preview DB lookup failed for session {}; falling back to disk: {}",
+                    session,
+                    error
+                );
+                self.merge_disk_stack_heads(session, &mut heads_by_path);
+            }
+            None => {
+                crate::slog_info!(
+                    "backup latest operation preview DB unavailable for session {}; falling back to disk",
+                    session
+                );
+                self.merge_disk_stack_heads(session, &mut heads_by_path);
+            }
+        }
+
+        let mut latest: Option<(u128, String)> = None;
+        for head in heads_by_path.values() {
+            if let Some(op_id) = &head.op_id {
+                if latest
+                    .as_ref()
+                    .map_or(true, |(latest_order, _)| head.order > *latest_order)
+                {
+                    latest = Some((head.order, op_id.clone()));
+                }
+            }
+        }
+
+        let Some((_, op_id)) = latest else {
+            return Err(AftError::NoUndoHistory {
+                path: "operation".to_string(),
+            });
+        };
+
+        let mut paths: Vec<PathBuf> = heads_by_path
+            .into_iter()
+            .filter_map(|(key, head)| {
+                (head.op_id.as_deref() == Some(op_id.as_str())).then_some(key)
+            })
+            .collect();
+        paths.sort();
+
+        if paths.is_empty() {
+            Err(AftError::NoUndoHistory {
+                path: "operation".to_string(),
+            })
+        } else {
+            Ok(paths)
+        }
+    }
+
     /// Return all session namespaces that currently have any backup state
     /// (memory or disk). Exposed for `/aft-status` aggregate reporting.
     pub fn sessions_with_backups(&self) -> Vec<String> {
@@ -728,6 +851,140 @@ impl BackupStore {
         let pool = self.db_pool.read().ok().and_then(|slot| slot.clone())?;
         let harness = self.db_harness.read().ok().and_then(|slot| slot.clone())?;
         Some((pool, harness))
+    }
+
+    fn latest_head_for_key(&self, session: &str, key: &Path) -> Option<BackupEntryHead> {
+        match self.read_stack_heads_from_db(session, key) {
+            Some(Ok(stack)) if !stack.is_empty() => return stack.last().cloned(),
+            Some(Ok(_)) => {
+                crate::slog_info!(
+                    "backup preview DB miss for session {} path {}; falling back to disk",
+                    session,
+                    key.display()
+                );
+            }
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "backup preview DB lookup failed for session {} path {}; falling back to disk: {}",
+                    session,
+                    key.display(),
+                    error
+                );
+            }
+            None => {
+                crate::slog_info!(
+                    "backup preview DB unavailable for session {} path {}; falling back to disk",
+                    session,
+                    key.display()
+                );
+            }
+        }
+
+        self.entries
+            .get(session)
+            .and_then(|files| files.get(key))
+            .and_then(|stack| stack.last())
+            .map(BackupEntryHead::from_entry)
+            .or_else(|| {
+                self.read_stack_heads_from_disk(session, key)
+                    .and_then(|stack| stack.last().cloned())
+            })
+    }
+
+    fn merge_disk_stack_heads(
+        &self,
+        session: &str,
+        heads_by_path: &mut HashMap<PathBuf, BackupEntryHead>,
+    ) {
+        let disk_keys: Vec<PathBuf> = self
+            .disk_index
+            .get(session)
+            .map(|files| files.keys().cloned().collect())
+            .unwrap_or_default();
+        for key in disk_keys {
+            if let Some(head) = self
+                .read_stack_heads_from_disk(session, &key)
+                .and_then(|stack| stack.last().cloned())
+            {
+                heads_by_path.insert(key, head);
+            }
+        }
+    }
+
+    fn read_stack_heads_from_db(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Option<Result<Vec<BackupEntryHead>, String>> {
+        let (pool, harness) = self.db_pool_and_harness()?;
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Some(Err("db mutex poisoned".to_string())),
+        };
+        let path_hash = Self::path_hash(key);
+        Some(
+            crate::db::backups::list_backups(&conn, &harness, session, &path_hash)
+                .map_err(|error| error.to_string())
+                .map(|rows| {
+                    rows.iter()
+                        .map(BackupEntryHead::from_row)
+                        .collect::<Vec<_>>()
+                }),
+        )
+    }
+
+    fn read_latest_operation_heads_from_db(
+        &self,
+        session: &str,
+    ) -> Option<Result<HashMap<PathBuf, BackupEntryHead>, String>> {
+        let (pool, harness) = self.db_pool_and_harness()?;
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Some(Err("db mutex poisoned".to_string())),
+        };
+        let latest = match crate::db::backups::get_latest_operation_backup(&conn, &harness, session)
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(HashMap::new())),
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        let Some(op_id) = latest.op_id else {
+            return Some(Ok(HashMap::new()));
+        };
+        let rows = match crate::db::backups::list_backups_by_op(&conn, &harness, session, &op_id) {
+            Ok(rows) => rows,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        if rows.is_empty() {
+            return Some(Ok(HashMap::new()));
+        }
+        let path_hashes: std::collections::HashSet<String> =
+            rows.into_iter().map(|row| row.path_hash).collect();
+        drop(conn);
+
+        let mut heads = HashMap::new();
+        for path_hash in path_hashes {
+            let conn = match pool.lock() {
+                Ok(conn) => conn,
+                Err(_) => return Some(Err("db mutex poisoned".to_string())),
+            };
+            let rows = match crate::db::backups::list_backups(&conn, &harness, session, &path_hash)
+            {
+                Ok(rows) => rows,
+                Err(error) => return Some(Err(error.to_string())),
+            };
+            drop(conn);
+
+            let Some(file_path) = rows.first().map(|row| row.file_path.clone()) else {
+                continue;
+            };
+            let Some(head) = rows.last().map(BackupEntryHead::from_row) else {
+                continue;
+            };
+            heads.insert(PathBuf::from(file_path), head);
+        }
+
+        Some(Ok(heads))
     }
 
     fn read_stack_from_db(
@@ -1449,6 +1706,58 @@ impl BackupStore {
         for key in disk_keys {
             self.load_from_disk_if_needed(session, &key);
         }
+    }
+
+    fn read_stack_heads_from_disk(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Option<Vec<BackupEntryHead>> {
+        let disk_meta = match self
+            .disk_index
+            .get(session)
+            .and_then(|s| s.get(key))
+            .cloned()
+        {
+            Some(m) if m.count > 0 => m,
+            _ => return None,
+        };
+
+        let entry_meta = std::fs::read_to_string(disk_meta.dir.join("meta.json"))
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|meta| meta.get("entries").and_then(|v| v.as_array()).cloned())
+            .unwrap_or_default();
+
+        let mut heads = Vec::new();
+        for i in 0..disk_meta.count {
+            let meta = entry_meta.get(i);
+            let backup_id = meta
+                .and_then(|m| m.get("backup_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("disk-{}", i));
+            let timestamp = meta
+                .and_then(|m| m.get("timestamp"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let order = meta
+                .and_then(|m| m.get("order"))
+                .and_then(parse_order_value)
+                .unwrap_or_else(|| legacy_entry_order(timestamp, &backup_id));
+            heads.push(BackupEntryHead {
+                order,
+                op_id: meta
+                    .and_then(|m| m.get("op_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            });
+        }
+
+        if heads.is_empty() {
+            return None;
+        }
+        Some(heads)
     }
 
     fn read_stack_from_disk(&self, session: &str, key: &Path) -> Option<Vec<BackupEntry>> {

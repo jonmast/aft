@@ -451,8 +451,10 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "undo" => aft::commands::undo::handle_undo(&req, ctx),
+        "undo_preview" => aft::commands::undo::handle_undo_preview(&req, ctx),
         "edit_history" => aft::commands::edit_history::handle_edit_history(&req, ctx),
         "checkpoint" => aft::commands::checkpoint::handle_checkpoint(&req, ctx),
+        "checkpoint_paths" => aft::commands::checkpoint::handle_checkpoint_paths(&req, ctx),
         "restore_checkpoint" => {
             aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
         }

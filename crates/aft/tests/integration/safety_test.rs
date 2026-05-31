@@ -830,3 +830,144 @@ fn test_edit_history_caps_at_twenty_entries_per_file() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+#[test]
+fn undo_preview_reports_operation_paths_without_mutating() {
+    let dir = temp_dir("undo_preview_operation");
+    let file_a = dir.join("a.txt");
+    let file_b = dir.join("b.txt");
+
+    fs::write(&file_a, "original-a").unwrap();
+    fs::write(&file_b, "original-b").unwrap();
+    let expected_a = fs::canonicalize(&file_a).unwrap();
+    let expected_b = fs::canonicalize(&file_b).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-for-preview",
+        "command": "delete_file",
+        "files": [file_a.display().to_string(), file_b.display().to_string()],
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], true, "delete: {delete_resp:?}");
+    assert!(!file_a.exists());
+    assert!(!file_b.exists());
+
+    let preview = aft.send(r#"{"id":"undo-preview-operation","command":"undo_preview"}"#);
+    assert_eq!(preview["success"], true, "preview: {preview:?}");
+    assert_eq!(preview["count"], 2);
+    let paths: Vec<&str> = preview["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .map(|path| path.as_str().expect("path string"))
+        .collect();
+    assert!(paths.contains(&expected_a.to_str().unwrap()));
+    assert!(paths.contains(&expected_b.to_str().unwrap()));
+    assert!(!file_a.exists(), "preview must not restore file_a");
+    assert!(!file_b.exists(), "preview must not restore file_b");
+
+    let preview_again =
+        aft.send(r#"{"id":"undo-preview-operation-again","command":"undo_preview"}"#);
+    assert_eq!(
+        preview_again["success"], true,
+        "second preview: {preview_again:?}"
+    );
+    assert_eq!(preview_again["paths"], preview["paths"]);
+
+    let undo = aft.send(r#"{"id":"undo-after-preview","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "original-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn undo_preview_with_file_reports_path_without_mutating() {
+    let dir = temp_dir("undo_preview_file");
+    let file = dir.join("target.txt");
+    fs::write(&file, "version-1").unwrap();
+    let expected = fs::canonicalize(&file).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let snap = aft.send(&format!(
+        r#"{{"id":"snap-preview-file","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(snap["success"], true, "snapshot: {snap:?}");
+
+    fs::write(&file, "version-2").unwrap();
+
+    let preview = aft.send(&format!(
+        r#"{{"id":"undo-preview-file","command":"undo_preview","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(preview["success"], true, "preview: {preview:?}");
+    assert_eq!(preview["count"], 1);
+    assert_eq!(preview["paths"][0], expected.display().to_string());
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "version-2",
+        "preview must not mutate file contents"
+    );
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-after-file-preview","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "version-1");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkpoint_paths_reports_restore_targets_without_mutating() {
+    let dir = temp_dir("checkpoint_paths_preview");
+    let file_a = dir.join("a.txt");
+    let file_b = dir.join("b.txt");
+    fs::write(&file_a, "checkpoint-a").unwrap();
+    fs::write(&file_b, "checkpoint-b").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let create = aft.send(&format!(
+        r#"{{"id":"checkpoint-paths-create","command":"checkpoint","name":"paths","files":[{},{}]}}"#,
+        crate::helpers::json_string(&file_a.display()),
+        crate::helpers::json_string(&file_b.display())
+    ));
+    assert_eq!(create["success"], true, "checkpoint create: {create:?}");
+
+    fs::write(&file_a, "modified-a").unwrap();
+    fs::write(&file_b, "modified-b").unwrap();
+
+    let preview =
+        aft.send(r#"{"id":"checkpoint-paths","command":"checkpoint_paths","name":"paths"}"#);
+    assert_eq!(preview["success"], true, "checkpoint paths: {preview:?}");
+    assert_eq!(preview["name"], "paths");
+    assert_eq!(preview["file_count"], 2);
+    let paths: Vec<&str> = preview["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .map(|path| path.as_str().expect("path string"))
+        .collect();
+    assert!(paths.contains(&file_a.to_str().unwrap()));
+    assert!(paths.contains(&file_b.to_str().unwrap()));
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "modified-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "modified-b");
+
+    let restore = aft
+        .send(r#"{"id":"checkpoint-paths-restore","command":"restore_checkpoint","name":"paths"}"#);
+    assert_eq!(restore["success"], true, "restore: {restore:?}");
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "checkpoint-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "checkpoint-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -291,6 +291,17 @@ impl CheckpointStore {
         Ok(checkpoint.file_contents.keys().cloned().collect())
     }
 
+    /// Return absolute file paths stored for a checkpoint without restoring it.
+    pub fn absolute_file_paths(&self, session: &str, name: &str) -> Result<Vec<PathBuf>, AftError> {
+        let mut paths: Vec<PathBuf> = self
+            .file_paths(session, name)?
+            .into_iter()
+            .map(absolute_checkpoint_path)
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
     /// Delete a checkpoint from a session. Returns true when a checkpoint was removed.
     pub fn delete(&mut self, session: &str, name: &str) -> bool {
         let Some(session_checkpoints) = self.checkpoints.get_mut(session) else {
@@ -344,6 +355,30 @@ impl CheckpointStore {
                 name: name.to_string(),
             })
     }
+}
+
+fn absolute_checkpoint_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_checkpoint_path(&path);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    normalize_checkpoint_path(&cwd.join(path))
+}
+
+fn normalize_checkpoint_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Result<(), AftError> {

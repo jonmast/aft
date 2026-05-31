@@ -49,3 +49,35 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
 }
+
+/// Handle the `undo_preview` command: return paths the next undo would touch without restoring.
+///
+/// Params: `file`/`filePath` (string, optional) — when provided, previews that per-file stack;
+/// otherwise previews the most recent operation in the session.
+/// Returns: `{ paths, count }` on success, or `no_undo_history` error.
+pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
+    let backup = ctx.backup().borrow();
+
+    let preview = req
+        .params
+        .get("file")
+        .or_else(|| req.params.get("filePath"))
+        .and_then(|v| v.as_str())
+        .map(|file| {
+            backup
+                .preview_latest_path(req.session(), Path::new(file))
+                .map(|path| vec![path])
+        })
+        .unwrap_or_else(|| backup.preview_last_operation_paths(req.session()));
+
+    match preview {
+        Ok(paths) => Response::success(
+            &req.id,
+            serde_json::json!({
+                "paths": paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "count": paths.len(),
+            }),
+        ),
+        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+    }
+}

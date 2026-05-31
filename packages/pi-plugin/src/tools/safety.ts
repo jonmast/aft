@@ -23,6 +23,12 @@ import {
   shortenPath,
 } from "./render-helpers.js";
 
+function responsePaths(response: Record<string, unknown>): string[] {
+  return Array.isArray(response.paths)
+    ? response.paths.filter((path): path is string => typeof path === "string" && path.length > 0)
+    : [];
+}
+
 const SafetyParams = Type.Object({
   op: StringEnum(["undo", "history", "checkpoint", "restore", "list"] as const, {
     description: "Safety operation",
@@ -180,11 +186,18 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       const files = params.files
         ? await Promise.all(params.files.map((file) => resolvePathArg(extCtx.cwd, file)))
         : undefined;
+      const bridge = bridgeFor(ctx, extCtx.cwd);
+      const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
 
-      if (params.op === "undo" && filePath) {
-        await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
-          restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-        });
+      if (params.op === "undo") {
+        const previewReq: Record<string, unknown> = {};
+        if (filePath) previewReq.file = filePath;
+        const preview = await callBridge(bridge, "undo_preview", previewReq, extCtx);
+        for (const file of new Set(responsePaths(preview))) {
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot,
+          });
+        }
       }
       if (params.op === "checkpoint") {
         const checkpointFiles = files ?? (filePath ? [filePath] : undefined);
@@ -194,13 +207,20 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
             if (checked.has(file)) continue;
             checked.add(file);
             await assertExternalDirectoryPermission(extCtx, file, "modify", {
-              restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+              restrictToProjectRoot,
             });
           }
         }
       }
+      if (params.op === "restore" && params.name) {
+        const preview = await callBridge(bridge, "checkpoint_paths", { name: params.name }, extCtx);
+        for (const file of new Set(responsePaths(preview))) {
+          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            restrictToProjectRoot,
+          });
+        }
+      }
 
-      const bridge = bridgeFor(ctx, extCtx.cwd);
       const commandMap: Record<string, string> = {
         undo: "undo",
         history: "edit_history",

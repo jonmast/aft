@@ -200,7 +200,11 @@ describe("permission audit regressions", () => {
     const { project } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, backup_id: "b1" }));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "inside.ts")] }
+        : { success: true, backup_id: "b1" },
+    );
 
     const raw = (await tools.aft_safety.execute(
       { op: "undo", filePath: "inside.ts" },
@@ -209,32 +213,129 @@ describe("permission audit regressions", () => {
 
     expect(JSON.parse(raw).success).toBe(true);
     expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
-    expect(calls[0]?.command).toBe("undo");
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
   });
 
-  test("aft_safety undo without filePath calls bridge without file param", async () => {
+  test("aft_safety undo without filePath previews then calls bridge without file param", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, operation: true }));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [] }
+        : { success: true, operation: true },
+    );
 
     const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
 
     expect(JSON.parse(raw).success).toBe(true);
     expect(askCalls).toHaveLength(0);
-    expect(calls[0]?.command).toBe("undo");
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
     expect(calls[0]?.params).not.toHaveProperty("file");
+    expect(calls[1]?.params).not.toHaveProperty("file");
   });
 
-  test("aft_safety undo with filePath still passes file param", async () => {
+  test("aft_safety undo with filePath previews and still passes file param", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const sdkCtx = createSdkContext(project, recordingAsk([]));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, backup_id: "b1" }));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "inside.ts")] }
+        : { success: true, backup_id: "b1" },
+    );
 
     await tools.aft_safety.execute({ op: "undo", filePath: "inside.ts" }, sdkCtx);
 
-    expect(calls[0]?.command).toBe("undo");
+    expect(calls[0]?.command).toBe("undo_preview");
     expect(calls[0]?.params).toMatchObject({ file: "inside.ts" });
+    expect(calls[1]?.command).toBe("undo");
+    expect(calls[1]?.params).toMatchObject({ file: "inside.ts" });
+  });
+
+  test("aft_safety undo preflights external paths returned by preview", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const externalFile = path.join(external, "undo.ts");
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [externalFile, externalFile] }
+        : { success: true, operation: true },
+    );
+
+    const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+  });
+
+  test("aft_safety undo preview internal paths do not ask external_directory", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "undo_preview"
+        ? { success: true, paths: [path.join(project, "undo.ts")] }
+        : { success: true, operation: true },
+    );
+
+    await tools.aft_safety.execute({ op: "undo" }, sdkCtx);
+
+    expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+  });
+
+  test("aft_safety restore preflights external checkpoint paths", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const externalFile = path.join(external, "restore.ts");
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "checkpoint_paths"
+        ? { success: true, paths: [externalFile] }
+        : { success: true, name: "snap" },
+    );
+
+    const raw = (await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx)) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+  });
+
+  test("aft_safety restore internal checkpoint paths do not ask external_directory", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "checkpoint_paths"
+        ? { success: true, paths: [path.join(project, "restore.ts")] }
+        : { success: true, name: "snap" },
+    );
+
+    await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx);
+
+    expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+  });
+
+  test("aft_safety checkpoint checks a single external filePath", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const externalFile = path.join(external, "single.ts");
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, name: "snap" }));
+
+    const raw = (await tools.aft_safety.execute(
+      { op: "checkpoint", name: "snap", filePath: externalFile },
+      sdkCtx,
+    )) as string;
+
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+    expect(calls[0]?.command).toBe("checkpoint");
+    expect(calls[0]?.params).toMatchObject({ files: [externalFile] });
   });
 
   test("ast_grep_search denies external paths before bridge execution", async () => {
