@@ -93,3 +93,4 @@ mod trace_to_symbol_test;
 mod transaction_test;
 mod url_fetch_test;
 mod vue_test;
+mod watcher_search_semantic_regression_test;
