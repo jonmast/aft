@@ -378,16 +378,19 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         } else {
             source.clone()
         };
-        let target_byte_start = line_col_to_byte(
+        let signature_byte_start = line_col_to_byte(
             &resolved_source,
             target.range.start_line,
             target.range.start_col,
         );
-        let target_byte_end = line_col_to_byte(
+        let signature_byte_end = line_col_to_byte(
             &resolved_source,
             target.range.end_line,
             target.range.end_col,
         );
+        let (target_byte_start, target_byte_end) =
+            symbol_body_byte_range(tree.root_node(), signature_byte_start, signature_byte_end)
+                .unwrap_or((signature_byte_start, signature_byte_end));
 
         let all_file_calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
 
@@ -491,6 +494,69 @@ fn extract_calls_in_range(
     lang: LangId,
 ) -> Vec<(String, u32)> {
     crate::calls::extract_calls_in_range(source, root, byte_start, byte_end, lang)
+}
+
+fn symbol_body_byte_range(
+    root: tree_sitter::Node,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<(usize, usize)> {
+    let node = smallest_node_covering_range(root, byte_start, byte_end)?;
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if is_symbol_body_node(node.kind()) {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        current = node.parent();
+    }
+    Some((node.start_byte(), node.end_byte()))
+}
+
+fn smallest_node_covering_range<'tree>(
+    node: tree_sitter::Node<'tree>,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<tree_sitter::Node<'tree>> {
+    if node.start_byte() > byte_start || node.end_byte() < byte_end {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if let Some(found) = smallest_node_covering_range(child, byte_start, byte_end) {
+                return Some(found);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    Some(node)
+}
+
+fn is_symbol_body_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "lexical_declaration"
+            | "function_definition"
+            | "class_definition"
+            | "decorated_definition"
+            | "function_item"
+            | "impl_item"
+            | "method_declaration"
+    )
 }
 
 fn extract_calls_with_ranges(source: &str, root: tree_sitter::Node, lang: LangId) -> Vec<RawCall> {
@@ -714,6 +780,44 @@ mod tests {
     }
 
     // --- Full zoom response tests ---
+
+    #[test]
+    fn body_range_expands_signature_range_to_include_body_calls() {
+        let source = r#"function compute(
+  value: number,
+): number {
+  return helper(value);
+}
+
+function helper(value: number): number {
+  return value * 2;
+}
+"#;
+        let grammar = crate::parser::grammar_for(LangId::TypeScript);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let signature_end = source.find('{').expect("function has body");
+
+        let (body_start, body_end) =
+            symbol_body_byte_range(tree.root_node(), 0, signature_end).expect("body range");
+        let calls = extract_calls_in_range(
+            source,
+            tree.root_node(),
+            body_start,
+            body_end,
+            LangId::TypeScript,
+        );
+        let names = calls
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            names.contains(&"helper"),
+            "call inside the function body should be included: {names:?}"
+        );
+    }
 
     #[test]
     fn zoom_response_has_calls_out_and_called_by() {

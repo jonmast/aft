@@ -493,6 +493,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
         })
         .build();
 
+    let mut walk_truncated = false;
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -510,14 +511,14 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
         }
 
         resolvable_files.push(path.to_path_buf());
+        if resolvable_files.len() > DIRECTORY_FILE_CAP {
+            walk_truncated = true;
+            break;
+        }
     }
 
-    if resolvable_files.len() > DIRECTORY_FILE_CAP {
-        let unchecked = resolvable_files[DIRECTORY_FILE_CAP..]
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect();
-        return (unchecked, true);
+    if walk_truncated {
+        resolvable_files.truncate(DIRECTORY_FILE_CAP);
     }
 
     let mut unchecked = Vec::new();
@@ -543,7 +544,7 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
         }
     }
 
-    (unchecked, false)
+    (unchecked, walk_truncated)
 }
 
 fn build_response(
@@ -688,4 +689,35 @@ fn parse_severity_filter(value: Option<&str>) -> Result<SeverityFilter, String> 
 
 fn normalize_query_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::parser::TreeSitterProvider;
+    use std::fs;
+
+    #[test]
+    fn compute_unchecked_files_caps_resolvable_walk() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("workspace");
+        let src = root.join("src");
+        fs::create_dir_all(&src).expect("create src");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("cargo toml");
+        for index in 0..250 {
+            fs::write(src.join(format!("file_{index:03}.rs")), "fn main() {}\n").expect("write rs");
+        }
+
+        let config = Config {
+            project_root: Some(root),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+
+        let (unchecked, truncated) = compute_unchecked_files(&ctx, &src);
+
+        assert!(truncated);
+        assert_eq!(unchecked.len(), DIRECTORY_FILE_CAP);
+    }
 }

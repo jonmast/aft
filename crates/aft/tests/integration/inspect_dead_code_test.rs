@@ -453,7 +453,7 @@ fn inspect_dead_code_keeps_cross_package_barrel_reexport_import_live() {
             ),
         ],
         Vec::new(),
-        Vec::new(),
+        vec![root.join("packages/app/src/consumer.ts")],
     );
 
     let success = scan(job(&root, source_files, Some(graph)));
@@ -529,7 +529,7 @@ fn inspect_dead_code_keeps_workspace_barrel_default_export_import_live() {
             ),
         ],
         Vec::new(),
-        Vec::new(),
+        vec![root.join("packages/app/src/consumer.ts")],
     );
 
     let success = scan(job(&root, source_files, Some(graph)));
@@ -662,6 +662,209 @@ fn inspect_dead_code_skips_malformed_child_package_json_when_resolving_package_n
             "function",
             1,
         )],
+        Vec::new(),
+        vec![root.join("packages/app/src/consumer.ts")],
+    );
+
+    let success = scan(job(&root, source_files, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 0, "{:#}", success.aggregate);
+}
+
+#[test]
+fn inspect_dead_code_keeps_relative_named_import_live_from_reachable_file() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/main.ts",
+            "import { Live } from './leaf';\nexport function main() { return 1; }\n",
+        ),
+        (
+            "src/leaf.ts",
+            "export function Live() { return 1; }\nexport function Dead() { return 2; }\n",
+        ),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/main.ts", "main", "function", 2),
+            export(&root, "src/leaf.ts", "Live", "function", 1),
+            export(&root, "src/leaf.ts", "Dead", "function", 2),
+        ],
+        Vec::new(),
+        vec![root.join("src/main.ts")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+    let dead_symbols = success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["symbol"].as_str().expect("symbol").to_string())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(success.aggregate["count"], 1, "{:#}", success.aggregate);
+    assert!(!dead_symbols.contains("Live"));
+    assert!(dead_symbols.contains("Dead"));
+}
+
+#[test]
+fn inspect_dead_code_does_not_keep_relative_named_import_live_from_dead_file() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/dead_consumer.ts",
+            "import { Live } from './leaf';\nexport function unusedConsumer() { return 1; }\n",
+        ),
+        (
+            "src/leaf.ts",
+            "export function Live() { return 1; }\nexport function Dead() { return 2; }\n",
+        ),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(
+                &root,
+                "src/dead_consumer.ts",
+                "unusedConsumer",
+                "function",
+                2,
+            ),
+            export(&root, "src/leaf.ts", "Live", "function", 1),
+            export(&root, "src/leaf.ts", "Dead", "function", 2),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+    let dead_symbols = success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["symbol"].as_str().expect("symbol").to_string())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(success.aggregate["count"], 3, "{:#}", success.aggregate);
+    assert!(dead_symbols.contains("unusedConsumer"));
+    assert!(dead_symbols.contains("Live"));
+    assert!(dead_symbols.contains("Dead"));
+}
+
+#[test]
+fn inspect_dead_code_keeps_public_typescript_barrel_reexport_leaf_live() {
+    let (_temp_dir, root, _paths) = fixture_project(&[
+        ("package.json", r#"{"main":"src/index.ts"}"#),
+        ("src/index.ts", "export { Live } from './leaf';\n"),
+        (
+            "src/leaf.ts",
+            "export function Live() { return 1; }\nexport function Dead() { return 2; }\n",
+        ),
+    ]);
+    let source_files = vec![root.join("src/index.ts"), root.join("src/leaf.ts")];
+    let graph = snapshot(
+        source_files.clone(),
+        vec![
+            export(&root, "src/index.ts", "Live", "re_export", 1),
+            export(&root, "src/leaf.ts", "Live", "function", 1),
+            export(&root, "src/leaf.ts", "Dead", "function", 2),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, source_files, Some(graph)));
+    let dead_symbols = success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["symbol"].as_str().expect("symbol").to_string())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(success.aggregate["count"], 1, "{:#}", success.aggregate);
+    assert!(!dead_symbols.contains("Live"));
+    assert!(dead_symbols.contains("Dead"));
+}
+
+#[test]
+fn inspect_dead_code_keeps_public_rust_pub_use_leaf_live() {
+    let (_temp_dir, root, _paths) = fixture_project(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub use foo::Foo;\nmod foo;\n"),
+        ("src/foo.rs", "pub struct Foo;\npub struct Dead;\n"),
+    ]);
+    let source_files = vec![root.join("src/lib.rs"), root.join("src/foo.rs")];
+    let graph = snapshot(
+        source_files.clone(),
+        vec![
+            export(&root, "src/lib.rs", "Foo", "struct", 1),
+            export(&root, "src/foo.rs", "Foo", "struct", 1),
+            export(&root, "src/foo.rs", "Dead", "struct", 2),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, source_files, Some(graph)));
+    let dead_symbols = success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["symbol"].as_str().expect("symbol").to_string())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(success.aggregate["count"], 1, "{:#}", success.aggregate);
+    assert!(!dead_symbols.contains("Foo"));
+    assert!(dead_symbols.contains("Dead"));
+}
+
+#[test]
+fn inspect_dead_code_parses_rust_scoped_targets_after_file_separator() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        ("src/main.rs", "pub fn main() { Handler::handle(); }\n"),
+        ("src/handler.rs", "pub fn handle() {}\n"),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/main.rs", "main", "function", 1),
+            export(&root, "src/handler.rs", "Handler::handle", "method", 1),
+        ],
+        vec![outbound(
+            &root,
+            "src/main.rs",
+            "main",
+            &target(&root, "src/handler.rs", "Handler::handle"),
+            1,
+        )],
+        vec![root.join("src/main.rs")],
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 0, "{:#}", success.aggregate);
+}
+
+#[test]
+fn inspect_dead_code_ignored_manifest_does_not_suppress_fallback_entry_points() {
+    let (_temp_dir, root, _paths) = fixture_project(&[
+        (".gitignore", "fixtures/\n"),
+        ("fixtures/pkg/package.json", r#"{"main":"src/index.ts"}"#),
+        (
+            "fixtures/pkg/src/index.ts",
+            "export function ignoredPublicApi() { return 1; }\n",
+        ),
+        (
+            "src/index.ts",
+            "export function publicApi() { return 1; }\n",
+        ),
+    ]);
+    let source_files = vec![root.join("src/index.ts")];
+    let graph = snapshot(
+        source_files.clone(),
+        vec![export(&root, "src/index.ts", "publicApi", "function", 1)],
         Vec::new(),
         Vec::new(),
     );

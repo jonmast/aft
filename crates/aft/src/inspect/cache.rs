@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
+use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 
 use super::job::{
     contribution_with_type_ref_names, type_ref_names_from_contribution, FileContribution,
@@ -74,7 +74,7 @@ impl From<serde_json::Error> for InspectCacheError {
 ///
 /// Bump this when `FileContribution.contribution` JSON changes in a way that
 /// requires existing per-file contributions to be rebuilt before roll-up.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 4;
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -816,13 +816,13 @@ impl InspectCache {
     pub(crate) fn contribution_fingerprint(
         &self,
         category: InspectCategory,
-    ) -> Result<(usize, String), InspectCacheError> {
+    ) -> Result<(usize, String, bool), InspectCacheError> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
         let mut stmt = conn.prepare(
-            "SELECT file_path, file_mtime_ns, file_size \
+            "SELECT file_path, file_mtime_ns, file_size, file_hash \
              FROM tier2_contributions \
              WHERE category = ?1 AND project_key = ?2 \
              ORDER BY file_path ASC",
@@ -832,23 +832,30 @@ impl InspectCache {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
 
+        let zero_hash = hash_to_hex(cache_freshness::zero_hash());
         let mut count = 0usize;
+        let mut hash_complete = true;
         let mut hasher = blake3::Hasher::new();
         for row in rows {
-            let (file_path, mtime_ns, file_size) = row?;
+            let (file_path, mtime_ns, file_size, file_hash) = row?;
             count += 1;
+            if file_hash == zero_hash {
+                hash_complete = false;
+            }
             update_contribution_fingerprint_hash(
                 &mut hasher,
                 &file_path,
                 mtime_ns.max(0),
                 file_size.max(0) as u64,
+                &file_hash,
             );
         }
 
-        Ok((count, hasher.finalize().to_hex().to_string()))
+        Ok((count, hasher.finalize().to_hex().to_string(), hash_complete))
     }
 
     pub(crate) fn contribution_freshness(
@@ -1037,11 +1044,14 @@ fn update_contribution_fingerprint_hash(
     relative_path: &str,
     mtime_ns: i64,
     file_size: u64,
+    file_hash: &str,
 ) {
     hasher.update(relative_path.as_bytes());
     hasher.update(&[0]);
     hasher.update(&mtime_ns.to_le_bytes());
     hasher.update(&file_size.to_le_bytes());
+    hasher.update(&[0]);
+    hasher.update(file_hash.as_bytes());
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
@@ -1290,6 +1300,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 4);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 5);
     }
 }

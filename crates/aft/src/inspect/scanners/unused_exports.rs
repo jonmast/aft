@@ -383,6 +383,15 @@ fn collect_namespace_member_accesses(
                 }
             }
         }
+        "identifier" | "shorthand_property_identifier" => {
+            let alias = node_text(source, &node).trim();
+            if aliases.contains(alias) && namespace_alias_used_as_value(&node) {
+                accesses
+                    .entry(alias.to_string())
+                    .or_default()
+                    .insert("*".to_string());
+            }
+        }
         _ => {}
     }
 
@@ -395,6 +404,41 @@ fn collect_namespace_member_accesses(
             }
         }
     }
+}
+
+fn namespace_alias_used_as_value(node: &Node) -> bool {
+    if is_inside_import_statement(*node) {
+        return false;
+    }
+
+    if let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "member_expression" | "subscript_expression") {
+            if parent
+                .child_by_field_name("object")
+                .is_some_and(|object| same_node(&object, node))
+            {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn is_inside_import_statement(mut node: Node) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "import_statement" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn same_node(left: &Node, right: &Node) -> bool {
+    left.kind() == right.kind()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
 }
 
 fn static_member_name(source: &str, node: &Node) -> Option<String> {

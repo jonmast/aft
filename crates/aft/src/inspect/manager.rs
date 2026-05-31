@@ -10,14 +10,14 @@ use serde_json::{json, Value};
 
 use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
-use super::freshness::{verify_contribution_file, ContributionFreshness};
+use super::freshness::ContributionFreshness;
 use super::job::{
     normalize_path, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution,
     InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
     JobOutcome, JobScope, DISPATCHED_CALLEE_SEPARATOR,
 };
 use super::scanners::DEFAULT_EXPORT_MARKER_KIND;
-use crate::cache_freshness::FileFreshness;
+use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{is_bare_callee, resolve_symbol_query_in_data, CallGraph, EdgeResolution};
 use crate::symbols::SymbolKind;
 
@@ -39,6 +39,7 @@ struct CachedContributionFreshness {
 struct ContributionFingerprint {
     count: usize,
     set_hash: String,
+    hash_complete: bool,
 }
 
 pub struct InspectManager {
@@ -353,7 +354,7 @@ impl InspectManager {
             } else {
                 snapshot.project_root.join(&record.file_path)
             };
-            match verify_contribution_file(&absolute, &record.freshness) {
+            match verify_contribution_file_strict(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh {
                     metadata_changed,
                     freshness,
@@ -456,7 +457,7 @@ impl InspectManager {
         };
         let cached = load_contribution_fingerprint(cache, job.category)?;
         let current = current_file_fingerprint(&job.project_root, &job.scope_files)?;
-        if cached != current {
+        if !cached.hash_complete || !current.hash_complete || cached != current {
             return Ok(None);
         }
 
@@ -497,7 +498,7 @@ impl InspectManager {
             };
 
             let absolute = job.project_root.join(&record.file_path);
-            match verify_contribution_file(&absolute, &record.freshness) {
+            match verify_contribution_file_strict(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh {
                     metadata_changed,
                     freshness,
@@ -1050,10 +1051,14 @@ fn load_contribution_fingerprint(
     cache: &InspectCache,
     category: InspectCategory,
 ) -> Result<ContributionFingerprint, String> {
-    let (count, set_hash) = cache
+    let (count, set_hash, hash_complete) = cache
         .contribution_fingerprint(category)
         .map_err(|error| error.to_string())?;
-    Ok(ContributionFingerprint { count, set_hash })
+    Ok(ContributionFingerprint {
+        count,
+        set_hash,
+        hash_complete,
+    })
 }
 
 fn current_file_fingerprint(
@@ -1061,23 +1066,39 @@ fn current_file_fingerprint(
     files: &[PathBuf],
 ) -> Result<ContributionFingerprint, String> {
     let mut entries = Vec::with_capacity(files.len());
+    let mut hash_complete = true;
     for file in files {
-        let metadata = std::fs::metadata(file)
-            .map_err(|error| format!("failed to stat {}: {error}", file.display()))?;
+        let freshness = cache_freshness::collect(file)
+            .map_err(|error| format!("failed to fingerprint {}: {error}", file.display()))?;
         let relative_path = relative_cache_key(project_root, file);
-        let mtime_ns = system_time_to_ns_i64(metadata.modified().unwrap_or(UNIX_EPOCH));
-        entries.push((relative_path, mtime_ns, metadata.len()));
+        let mtime_ns = system_time_to_ns_i64(freshness.mtime);
+        if freshness.content_hash == cache_freshness::zero_hash() {
+            hash_complete = false;
+        }
+        entries.push((
+            relative_path,
+            mtime_ns,
+            freshness.size,
+            freshness.content_hash.to_hex().to_string(),
+        ));
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut hasher = blake3::Hasher::new();
-    for (relative_path, mtime_ns, file_size) in &entries {
-        update_contribution_fingerprint_hash(&mut hasher, relative_path, *mtime_ns, *file_size);
+    for (relative_path, mtime_ns, file_size, file_hash) in &entries {
+        update_contribution_fingerprint_hash(
+            &mut hasher,
+            relative_path,
+            *mtime_ns,
+            *file_size,
+            file_hash,
+        );
     }
 
     Ok(ContributionFingerprint {
         count: entries.len(),
         set_hash: hasher.finalize().to_hex().to_string(),
+        hash_complete,
     })
 }
 
@@ -1086,11 +1107,36 @@ fn update_contribution_fingerprint_hash(
     relative_path: &str,
     mtime_ns: i64,
     file_size: u64,
+    file_hash: &str,
 ) {
     hasher.update(relative_path.as_bytes());
     hasher.update(&[0]);
     hasher.update(&mtime_ns.to_le_bytes());
     hasher.update(&file_size.to_le_bytes());
+    hasher.update(&[0]);
+    hasher.update(file_hash.as_bytes());
+}
+
+fn verify_contribution_file_strict(path: &Path, cached: &FileFreshness) -> ContributionFreshness {
+    match cache_freshness::verify_file_strict(path, cached) {
+        FreshnessVerdict::HotFresh => ContributionFreshness::Fresh {
+            metadata_changed: false,
+            freshness: *cached,
+        },
+        FreshnessVerdict::ContentFresh {
+            new_mtime,
+            new_size,
+        } => ContributionFreshness::Fresh {
+            metadata_changed: true,
+            freshness: FileFreshness {
+                mtime: new_mtime,
+                size: new_size,
+                content_hash: cached.content_hash,
+            },
+        },
+        FreshnessVerdict::Stale => ContributionFreshness::Stale,
+        FreshnessVerdict::Deleted => ContributionFreshness::Deleted,
+    }
 }
 
 fn load_contribution_freshness(

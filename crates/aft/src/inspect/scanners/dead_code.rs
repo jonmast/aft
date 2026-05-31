@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
-use crate::imports::{parse_imports, specifier_imported_name};
+use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
@@ -155,6 +155,13 @@ fn gather_file_contribution(
             )
         })
         .collect::<Vec<_>>();
+    internal_calls.extend(reexport_liveness_edges(
+        &job.project_root,
+        file,
+        &file_name,
+        exported_symbols_by_file,
+        default_export_symbols_by_file,
+    ));
     internal_calls.sort_by(|left, right| {
         left.caller_symbol
             .cmp(&right.caller_symbol)
@@ -402,8 +409,9 @@ fn reachable_exports(
     contributions: &[DeadCodeContribution],
     edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
 ) -> BTreeSet<ExportNode> {
+    let imported_exports_by_file = imported_exports_by_file(contributions);
     let namespace_imports_by_file = namespace_imported_exports_by_file(contributions);
-    let mut expanded_namespace_imports = BTreeSet::new();
+    let mut expanded_file_imports = BTreeSet::new();
     let mut reachable = BTreeSet::new();
     let mut queue = VecDeque::new();
 
@@ -416,17 +424,27 @@ fn reachable_exports(
                 queue.push_back((contribution.file.clone(), export.symbol.clone()));
             }
         }
-        for imported_export in &contribution.imported_exports {
-            queue.push_back((imported_export.file.clone(), imported_export.symbol.clone()));
-        }
     }
 
     while let Some(node) = queue.pop_front() {
         if !reachable.insert(node.clone()) {
             continue;
         }
-        if expanded_namespace_imports.insert(node.0.clone()) {
-            // Namespace imports are conservative file-level edges: once the
+        if expanded_file_imports.insert(node.0.clone()) {
+            // Static imports are file-level liveness edges: an imported export
+            // should keep the target live only when the importer file itself is
+            // reachable. This prevents dead consumers from making their imports
+            // look live while still covering references the call graph cannot
+            // see (type-only imports, JSX/value usage, barrel consumers, etc.).
+            if let Some(targets) = imported_exports_by_file.get(&node.0) {
+                for target in targets {
+                    if !reachable.contains(target) {
+                        queue.push_back(target.clone());
+                    }
+                }
+            }
+
+            // Namespace imports remain conservative file-level edges: once the
             // importer file is reached, every export of the imported module is
             // considered live because member access is not tracked here.
             if let Some(targets) = namespace_imports_by_file.get(&node.0) {
@@ -447,6 +465,29 @@ fn reachable_exports(
     }
 
     reachable
+}
+
+fn imported_exports_by_file(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<String, BTreeSet<ExportNode>> {
+    let mut by_file: BTreeMap<String, BTreeSet<ExportNode>> = BTreeMap::new();
+
+    for contribution in contributions {
+        if contribution.imported_exports.is_empty() {
+            continue;
+        }
+        by_file
+            .entry(contribution.file.clone())
+            .or_default()
+            .extend(
+                contribution
+                    .imported_exports
+                    .iter()
+                    .map(|root| (root.file.clone(), root.symbol.clone())),
+            );
+    }
+
+    by_file
 }
 
 fn namespace_imported_exports_by_file(
@@ -506,6 +547,539 @@ fn project_internal_call(
     })
 }
 
+fn reexport_liveness_edges(
+    project_root: &Path,
+    file: &Path,
+    file_name: &str,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<InternalCall> {
+    let Some(lang) = detect_language(file) else {
+        return Vec::new();
+    };
+    let Ok(source) = fs::read_to_string(file) else {
+        return Vec::new();
+    };
+
+    match lang {
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => ts_reexport_liveness_edges(
+            project_root,
+            file,
+            file_name,
+            &source,
+            lang,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ),
+        LangId::Rust => rust_reexport_liveness_edges(
+            project_root,
+            file,
+            file_name,
+            &source,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ),
+        _ => Vec::new(),
+    }
+}
+
+fn ts_reexport_liveness_edges(
+    project_root: &Path,
+    file: &Path,
+    file_name: &str,
+    source: &str,
+    lang: LangId,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<InternalCall> {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut edges = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    if !cursor.goto_first_child() {
+        return edges;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "export_statement" {
+            if let Some(module_path) = export_source_module(source, node) {
+                if let Some(module_entry) = resolve_import_module_path(from_dir, &module_path) {
+                    edges.extend(ts_reexport_edges_for_statement(
+                        project_root,
+                        file_name,
+                        source,
+                        node,
+                        &module_entry,
+                        exported_symbols_by_file,
+                        default_export_symbols_by_file,
+                    ));
+                }
+            }
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    edges
+}
+
+fn ts_reexport_edges_for_statement(
+    project_root: &Path,
+    file_name: &str,
+    source: &str,
+    node: tree_sitter::Node,
+    module_entry: &Path,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<InternalCall> {
+    let mut edges = Vec::new();
+    let line = (node.start_position().row + 1) as u32;
+    let raw_export = node_text(source, node).trim();
+
+    for specifier in ts_reexport_specifiers(raw_export) {
+        if !file_exports_symbol(file_name, &specifier.exported, exported_symbols_by_file) {
+            continue;
+        }
+        if let Some((target_file, target_symbol)) = resolve_imported_export_liveness_root(
+            project_root,
+            module_entry,
+            &specifier.imported,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ) {
+            edges.push(InternalCall {
+                caller_symbol: specifier.exported,
+                file: target_file,
+                symbol: target_symbol,
+                line,
+            });
+        }
+    }
+
+    if raw_export.contains('*') {
+        if let Some(namespace_export) = ts_namespace_reexport_name(raw_export) {
+            if file_exports_symbol(file_name, &namespace_export, exported_symbols_by_file) {
+                edges.extend(reexport_edges_for_all_target_symbols(
+                    project_root,
+                    file_name,
+                    &namespace_export,
+                    module_entry,
+                    line,
+                    exported_symbols_by_file,
+                    default_export_symbols_by_file,
+                    false,
+                ));
+            }
+        } else {
+            edges.extend(reexport_edges_for_all_target_symbols(
+                project_root,
+                file_name,
+                "",
+                module_entry,
+                line,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+                true,
+            ));
+        }
+    }
+
+    edges
+}
+
+fn ts_reexport_specifiers(raw_export: &str) -> Vec<ReexportSpecifier> {
+    let Some(start) = raw_export.find('{').map(|index| index + 1) else {
+        return Vec::new();
+    };
+    let Some(end) = raw_export[start..].find('}').map(|index| start + index) else {
+        return Vec::new();
+    };
+
+    raw_export[start..end]
+        .split(',')
+        .filter_map(|specifier| {
+            let specifier = specifier.trim();
+            if specifier.is_empty() {
+                return None;
+            }
+            let imported = specifier_imported_name(specifier).trim();
+            let exported = specifier_local_name(specifier).trim();
+            if imported.is_empty() || exported.is_empty() {
+                return None;
+            }
+            Some(ReexportSpecifier {
+                imported: imported.to_string(),
+                exported: exported.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn ts_namespace_reexport_name(raw_export: &str) -> Option<String> {
+    let after_star = raw_export.split_once('*')?.1.trim_start();
+    let after_as = after_star.strip_prefix("as")?.trim_start();
+    let name = after_as
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| ch == '{' || ch == '}' || ch == ';' || ch == ',');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn rust_reexport_liveness_edges(
+    project_root: &Path,
+    file: &Path,
+    file_name: &str,
+    source: &str,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<InternalCall> {
+    let module_files = rust_module_files(file, source);
+    let mut edges = Vec::new();
+
+    for (statement, line) in rust_pub_use_statements(source) {
+        for specifier in rust_reexport_specifiers(&statement) {
+            let Some(module_entry) = rust_module_entry(&module_files, &specifier.module_path)
+            else {
+                continue;
+            };
+
+            if specifier.imported == "*" {
+                edges.extend(reexport_edges_for_all_target_symbols(
+                    project_root,
+                    file_name,
+                    "",
+                    &module_entry,
+                    line,
+                    exported_symbols_by_file,
+                    default_export_symbols_by_file,
+                    true,
+                ));
+                continue;
+            }
+
+            if !file_exports_symbol(file_name, &specifier.exported, exported_symbols_by_file) {
+                continue;
+            }
+            if let Some((target_file, target_symbol)) = resolve_imported_export_liveness_root(
+                project_root,
+                &module_entry,
+                &specifier.imported,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            ) {
+                edges.push(InternalCall {
+                    caller_symbol: specifier.exported,
+                    file: target_file,
+                    symbol: target_symbol,
+                    line,
+                });
+            }
+        }
+    }
+
+    edges
+}
+
+fn reexport_edges_for_all_target_symbols(
+    project_root: &Path,
+    file_name: &str,
+    namespace_export: &str,
+    module_entry: &Path,
+    line: u32,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+    match_current_export_names: bool,
+) -> Vec<InternalCall> {
+    let Some((_, target_symbols)) =
+        exported_symbols_for_resolved_file(project_root, module_entry, exported_symbols_by_file)
+    else {
+        return Vec::new();
+    };
+
+    let mut edges = Vec::new();
+    for target_symbol in target_symbols {
+        let caller_symbol = if match_current_export_names {
+            if !file_exports_symbol(file_name, target_symbol, exported_symbols_by_file) {
+                continue;
+            }
+            target_symbol.clone()
+        } else {
+            namespace_export.to_string()
+        };
+
+        if let Some((target_file, resolved_symbol)) = resolve_imported_export_liveness_root(
+            project_root,
+            module_entry,
+            target_symbol,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ) {
+            edges.push(InternalCall {
+                caller_symbol,
+                file: target_file,
+                symbol: resolved_symbol,
+                line,
+            });
+        }
+    }
+
+    edges
+}
+
+fn rust_module_files(file: &Path, source: &str) -> BTreeMap<String, PathBuf> {
+    let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut modules = BTreeMap::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let after_visibility = trimmed
+            .strip_prefix("pub ")
+            .or_else(|| trimmed.strip_prefix("pub(crate) "))
+            .or_else(|| trimmed.strip_prefix("pub(super) "))
+            .unwrap_or(trimmed)
+            .trim_start();
+        let Some(after_mod) = after_visibility.strip_prefix("mod ") else {
+            continue;
+        };
+        let module = after_mod
+            .trim_end_matches(';')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if module.is_empty() || module.contains('{') {
+            continue;
+        }
+        if let Some(path) = resolve_rust_module_file(base_dir, module) {
+            modules.insert(module.to_string(), path);
+        }
+    }
+    modules
+}
+
+fn resolve_rust_module_file(base_dir: &Path, module: &str) -> Option<PathBuf> {
+    let flat = base_dir.join(format!("{module}.rs"));
+    if flat.is_file() {
+        return Some(flat);
+    }
+    let nested = base_dir.join(module).join("mod.rs");
+    nested.is_file().then_some(nested)
+}
+
+fn rust_pub_use_statements(source: &str) -> Vec<(String, u32)> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut start_line = 0u32;
+
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if current.is_empty() {
+            if !(trimmed.starts_with("pub use ") || trimmed.starts_with("pub(crate) use ")) {
+                continue;
+            }
+            start_line = (index + 1) as u32;
+        }
+
+        current.push(' ');
+        current.push_str(trimmed);
+        if trimmed.ends_with(';') {
+            statements.push((current.trim().to_string(), start_line));
+            current.clear();
+        }
+    }
+
+    statements
+}
+
+fn rust_reexport_specifiers(statement: &str) -> Vec<RustReexportSpecifier> {
+    let statement = statement
+        .trim()
+        .trim_end_matches(';')
+        .strip_prefix("pub(crate) use ")
+        .or_else(|| {
+            statement
+                .trim()
+                .trim_end_matches(';')
+                .strip_prefix("pub use ")
+        })
+        .unwrap_or("")
+        .trim();
+    if statement.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some((module_path, grouped)) = statement.split_once("::{") {
+        let grouped = grouped.trim_end_matches('}');
+        return grouped
+            .split(',')
+            .filter_map(|specifier| rust_reexport_specifier(module_path.trim(), specifier.trim()))
+            .collect();
+    }
+
+    let Some((module_path, imported)) = statement.rsplit_once("::") else {
+        return Vec::new();
+    };
+    rust_reexport_specifier(module_path.trim(), imported.trim())
+        .into_iter()
+        .collect()
+}
+
+fn rust_reexport_specifier(module_path: &str, specifier: &str) -> Option<RustReexportSpecifier> {
+    if specifier.is_empty() {
+        return None;
+    }
+    let (imported, exported) = specifier
+        .split_once(" as ")
+        .map(|(imported, exported)| (imported.trim(), exported.trim()))
+        .unwrap_or((specifier.trim(), specifier.trim()));
+    if imported.is_empty() || exported.is_empty() {
+        return None;
+    }
+    Some(RustReexportSpecifier {
+        module_path: rust_normalize_module_path(module_path),
+        imported: imported.to_string(),
+        exported: exported.to_string(),
+    })
+}
+
+fn rust_normalize_module_path(module_path: &str) -> Vec<String> {
+    module_path
+        .split("::")
+        .filter_map(|segment| {
+            let segment = segment.trim();
+            if segment.is_empty() || matches!(segment, "self" | "crate") {
+                None
+            } else {
+                Some(segment.to_string())
+            }
+        })
+        .collect()
+}
+
+fn rust_module_entry(
+    module_files: &BTreeMap<String, PathBuf>,
+    module_path: &[String],
+) -> Option<PathBuf> {
+    let first = module_path.first()?;
+    module_files.get(first).cloned()
+}
+
+fn file_exports_symbol(
+    file_name: &str,
+    symbol: &str,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    exported_symbols_by_file
+        .get(file_name)
+        .is_some_and(|symbols| symbols.contains(symbol))
+}
+
+fn export_source_module(source: &str, node: tree_sitter::Node) -> Option<String> {
+    node.child_by_field_name("source")
+        .or_else(|| find_child_by_kind(node, "string"))
+        .and_then(|source_node| string_literal_content(source, source_node))
+}
+
+fn find_child_by_kind<'tree>(
+    node: tree_sitter::Node<'tree>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind() == kind {
+            return Some(child);
+        }
+        if let Some(descendant) = find_child_by_kind(child, kind) {
+            return Some(descendant);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    None
+}
+
+fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<String> {
+    let raw = node_text(source, node).trim();
+    let quote = raw.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    raw.strip_prefix(quote)
+        .and_then(|value| value.strip_suffix(quote))
+        .map(ToOwned::to_owned)
+}
+
+fn node_text<'a>(source: &'a str, node: tree_sitter::Node) -> &'a str {
+    &source[node.byte_range()]
+}
+
+fn resolve_import_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    if is_relative_module_path(module_path) {
+        return resolve_js_ts_module_path(from_dir, module_path);
+    }
+    resolve_workspace_package_import(from_dir, module_path)
+}
+
+fn resolve_js_ts_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    resolve_module_path(from_dir, module_path)
+        .or_else(|| resolve_esm_source_module_path(from_dir, module_path))
+}
+
+fn resolve_esm_source_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    if !is_relative_module_path(module_path) {
+        return None;
+    }
+    let base = from_dir.join(module_path);
+    let ext = base.extension().and_then(|extension| extension.to_str())?;
+    let candidates: &[&str] = match ext {
+        "js" => &["ts", "tsx"],
+        "jsx" => &["tsx", "ts"],
+        "mjs" => &["mts", "ts"],
+        "cjs" => &["cts", "ts"],
+        _ => return None,
+    };
+
+    candidates
+        .iter()
+        .map(|extension| base.with_extension(extension))
+        .find(|candidate| candidate.is_file())
+}
+
+fn is_relative_module_path(module_path: &str) -> bool {
+    module_path.starts_with("./")
+        || module_path.starts_with("../")
+        || module_path == "."
+        || module_path == ".."
+}
+
+#[derive(Debug)]
+struct ReexportSpecifier {
+    imported: String,
+    exported: String,
+}
+
+#[derive(Debug)]
+struct RustReexportSpecifier {
+    module_path: Vec<String>,
+    imported: String,
+    exported: String,
+}
+
 fn imported_export_liveness_roots(
     project_root: &Path,
     file: &Path,
@@ -536,7 +1110,7 @@ fn imported_export_liveness_roots(
 
     for import in &import_block.imports {
         if import.namespace_import.is_some() {
-            if let Some(module_entry) = resolve_module_path(from_dir, &import.module_path) {
+            if let Some(module_entry) = resolve_import_module_path(from_dir, &import.module_path) {
                 namespace_exports.extend(resolve_namespace_import_liveness_roots(
                     project_root,
                     &module_entry,
@@ -546,8 +1120,7 @@ fn imported_export_liveness_roots(
             }
         }
 
-        let Some(module_entry) = resolve_workspace_package_import(from_dir, &import.module_path)
-        else {
+        let Some(module_entry) = resolve_import_module_path(from_dir, &import.module_path) else {
             continue;
         };
 
@@ -823,7 +1396,7 @@ fn parse_target(project_root: &Path, target: &str) -> ParsedTarget {
         };
     }
 
-    if let Some((file, symbol)) = trimmed.rsplit_once("::") {
+    if let Some((file, symbol)) = split_file_symbol_target(project_root, trimmed, "::") {
         return ParsedTarget {
             file: Some(relative_path(project_root, Path::new(file))),
             symbol: clean_symbol(symbol),
@@ -843,6 +1416,29 @@ fn parse_target(project_root: &Path, target: &str) -> ParsedTarget {
     }
 }
 
+fn split_file_symbol_target<'a>(
+    project_root: &Path,
+    target: &'a str,
+    separator: &str,
+) -> Option<(&'a str, &'a str)> {
+    let mut search_start = 0;
+    while let Some(offset) = target[search_start..].find(separator) {
+        let split_at = search_start + offset;
+        let file = &target[..split_at];
+        let symbol = &target[split_at + separator.len()..];
+        if !symbol.trim().is_empty() && looks_like_source_file_target(project_root, file) {
+            return Some((file, symbol));
+        }
+        search_start = split_at + separator.len();
+    }
+    None
+}
+
+fn looks_like_source_file_target(project_root: &Path, file: &str) -> bool {
+    let path = Path::new(file);
+    language_for_file(file) != "unknown" || path.is_file() || project_root.join(path).is_file()
+}
+
 fn clean_symbol(symbol: &str) -> Option<String> {
     let trimmed = symbol.trim();
     if trimmed.is_empty() {
@@ -859,11 +1455,12 @@ fn liveness_roots_for_file(
     is_liveness_root_file: bool,
     is_public_api_file: bool,
 ) -> Vec<String> {
-    if !is_liveness_root_file {
+    if !is_liveness_root_file && !is_public_api_file {
         return Vec::new();
     }
 
     let mut roots = BTreeSet::new();
+    roots.insert("<top-level>".to_string());
     if is_public_api_file {
         roots.extend(exports.iter().map(|export| export.symbol.clone()));
     } else {

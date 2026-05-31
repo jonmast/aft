@@ -78,8 +78,16 @@ fn run_reuse(
     manager: &InspectManager,
     snapshot: InspectSnapshot,
 ) -> (InspectScanSuccess, Duration) {
+    run_reuse_category(manager, snapshot, InspectCategory::Duplicates)
+}
+
+fn run_reuse_category(
+    manager: &InspectManager,
+    snapshot: InspectSnapshot,
+    category: InspectCategory,
+) -> (InspectScanSuccess, Duration) {
     let started = Instant::now();
-    let result = manager.tier2_run_with_reuse_result(snapshot, InspectCategory::Duplicates, None);
+    let result = manager.tier2_run_with_reuse_result(snapshot, category, None);
     let elapsed = started.elapsed();
     (result.outcome.expect("tier2 reuse run succeeds"), elapsed)
 }
@@ -124,4 +132,41 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
         vec!["src/file_07.ts"]
     );
     assert_ne!(third.aggregate, first.aggregate);
+}
+
+#[test]
+fn inspect_tier2_reuse_rescans_same_size_content_change_with_restored_mtime() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    fs::create_dir_all(&root).expect("create project");
+    let source = write_file(&root, "src/export.ts", "export function one() {}\n");
+    let fixed_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(&source, fixed_mtime).expect("set fixed mtime");
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+
+    let first_manager = InspectManager::new();
+    let (first, _t1) = run_reuse_category(
+        &first_manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert_eq!(first.scanned_files.len(), 1);
+    assert_eq!(first.aggregate["items"][0]["symbol"], "one");
+
+    fs::write(&source, "export function two() {}\n").expect("same-size mutate");
+    filetime::set_file_mtime(&source, fixed_mtime).expect("restore mtime");
+
+    let second_manager = InspectManager::new();
+    let (second, _t2) = run_reuse_category(
+        &second_manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+
+    assert_eq!(
+        relative_paths(&root, &second.scanned_files),
+        vec!["src/export.ts"]
+    );
+    assert_eq!(second.aggregate["items"][0]["symbol"], "two");
+    assert_ne!(second.aggregate, first.aggregate);
 }

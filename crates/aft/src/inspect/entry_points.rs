@@ -109,37 +109,11 @@ pub(crate) fn collect_entry_point_manifests(project_root: &Path) -> Vec<PathBuf>
 }
 
 fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
-    let mut stack = vec![project_root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.path());
-
-        for entry in entries {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-
-            if file_type.is_dir() {
-                if !should_skip_manifest_dir(&path) {
-                    stack.push(path);
-                }
-                continue;
-            }
-
-            if !file_type.is_file() {
-                continue;
-            }
-
-            match path.file_name().and_then(|name| name.to_str()) {
-                Some("Cargo.toml") => manifests.cargo_tomls.push(path),
-                Some("package.json") => manifests.package_jsons.push(path),
-                _ => {}
-            }
+    for path in entry_point_walk_files(project_root) {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("Cargo.toml") => manifests.cargo_tomls.push(path),
+            Some("package.json") => manifests.package_jsons.push(path),
+            _ => {}
         }
     }
 
@@ -149,10 +123,52 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
     manifests.package_jsons.dedup();
 }
 
+fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+                || !should_skip_manifest_dir(entry.path())
+        });
+
+    let mut files = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+        })
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
 fn should_skip_manifest_dir(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | "node_modules" | "target" | ".aft-test-storage" | ".aft-cache")
+        Some(
+            ".git"
+                | "node_modules"
+                | "target"
+                | "venv"
+                | ".venv"
+                | "__pycache__"
+                | ".tox"
+                | "dist"
+                | "build"
+                | ".aft-test-storage"
+                | ".aft-cache"
+        )
     )
 }
 
@@ -405,30 +421,9 @@ fn is_relative_module(module_path: &str) -> bool {
 }
 
 fn collect_fallback_entry_points(project_root: &Path, entry_points: &mut EntryPointSet) {
-    let mut stack = vec![project_root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-
-            if file_type.is_dir() {
-                if !should_skip_manifest_dir(&path) {
-                    stack.push(path);
-                }
-                continue;
-            }
-
-            if file_type.is_file() {
-                if let Some(kind) = conventional_entry_point_kind(project_root, &path) {
-                    insert_resolved_entry_point(entry_points, &path, kind);
-                }
-            }
+    for path in entry_point_walk_files(project_root) {
+        if let Some(kind) = conventional_entry_point_kind(project_root, &path) {
+            insert_resolved_entry_point(entry_points, &path, kind);
         }
     }
 }

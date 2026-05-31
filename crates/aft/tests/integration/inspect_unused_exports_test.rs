@@ -180,6 +180,29 @@ fn inspect_unused_exports_namespace_import_uses_only_accessed_members() {
 }
 
 #[test]
+fn inspect_unused_exports_namespace_import_used_as_value_marks_all_exports_uncertain() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let exported = write_file(
+        &root.join("src/a.ts"),
+        "export function first() { return 1; }\nexport function second() { return 2; }\n",
+    );
+    let importer = write_file(
+        &root.join("src/b.ts"),
+        "import * as api from './a';\nconsume(api);\n",
+    );
+
+    let success = scan(root, vec![exported, importer]);
+
+    assert_eq!(success.aggregate["count"], 0, "{:#}", success.aggregate);
+    assert_eq!(success.aggregate["uncertain_count"], 2);
+    assert_eq!(
+        symbols(&success.aggregate["uncertain_items"]),
+        vec!["first".to_string(), "second".to_string()]
+    );
+}
+
+#[test]
 fn inspect_unused_exports_non_js_ts_files_contribute_empty_and_are_skipped() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
