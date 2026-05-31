@@ -1303,6 +1303,7 @@ impl BackupStore {
             Err(_) => return,
         };
         let mut total_entries = 0usize;
+        let mut skipped_legacy = 0usize;
         for session_entry in session_dirs.flatten() {
             let session_dir = session_entry.path();
             if !session_dir.is_dir() {
@@ -1340,7 +1341,13 @@ impl BackupStore {
                         ) {
                             let key = PathBuf::from(path_str);
                             if !is_loadable_backup_path(&key, &path_dir) {
-                                crate::slog_warn!(
+                                // Legacy/relocated backup dirs whose folder name came
+                                // from an older path-hash scheme can never be loaded by
+                                // the current hasher. They are harmless dead husks
+                                // (active undo is DB-backed), so skip quietly and
+                                // summarize once at debug instead of warning per entry.
+                                skipped_legacy += 1;
+                                crate::slog_debug!(
                                     "skipping backup entry with invalid path metadata: {}",
                                     meta_path.display()
                                 );
@@ -1361,6 +1368,12 @@ impl BackupStore {
             if per_session.is_empty() {
                 self.disk_index.remove(&session_id);
             }
+        }
+        if skipped_legacy > 0 {
+            crate::slog_debug!(
+                "skipped {} legacy backup entries with mismatched path-hash directories",
+                skipped_legacy
+            );
         }
         if total_entries > 0 {
             crate::slog_info!(
