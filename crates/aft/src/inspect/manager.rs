@@ -1476,6 +1476,11 @@ fn roll_up_unused_exports_contributions(
         if public_api_entries.contains(&scan.file) {
             continue;
         }
+        // Mirror the fresh-scan path: fixtures/corpora/mock data are consumed
+        // by path, never imported, so their exports always look unused.
+        if super::job::is_test_support_file(&scan.file) {
+            continue;
+        }
 
         for export in &scan.exports {
             let imported = imported_by

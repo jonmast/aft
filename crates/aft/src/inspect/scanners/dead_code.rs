@@ -11,7 +11,7 @@ use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
-use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
+use crate::inspect::job::{is_test_support_file, DISPATCHED_CALLEE_SEPARATOR};
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess,
@@ -312,6 +312,12 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
     let uncertain_count = 0usize;
     let uncertain_items: Vec<serde_json::Value> = Vec::new();
     for contribution in &parsed {
+        // Test-support files (fixtures, corpora, mock data) are consumed by
+        // path, never imported, so their exports always look dead. Skip
+        // REPORTING them — their edges already kept real code live above.
+        if is_test_support_file(&contribution.file) {
+            continue;
+        }
         let is_public_api_file = public_api_files.contains(&contribution.file);
         for export in &contribution.exports {
             let node = (contribution.file.clone(), export.symbol.clone());

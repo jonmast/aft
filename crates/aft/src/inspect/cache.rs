@@ -81,7 +81,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// method bodies (free fns reached only via `obj.method()` were false-dead).
 /// v7: duplicates now collapses nested/overlapping fragments (a duplicated
 /// block no longer reports every nested subtree as its own group).
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 7;
+/// v8: entry-point recognition seeds npm `scripts` source files as liveness
+/// roots (baked into per-file liveness_roots), and dead_code/unused_exports
+/// exclude test-support files (fixtures/corpora/mocks) from reporting.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1340,6 +1343,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 7);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 8);
     }
 }

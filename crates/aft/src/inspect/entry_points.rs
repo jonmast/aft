@@ -342,6 +342,46 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
             EntryPointKind::LivenessRoot,
         );
     }
+
+    if let Some(scripts) = value.get("scripts").and_then(Value::as_object) {
+        for command in scripts.values().filter_map(Value::as_str) {
+            collect_script_entry_points(package_dir, command, entry_points);
+        }
+    }
+}
+
+/// Extract local source files referenced by an npm `scripts` command (e.g.
+/// `bun run benchmarks/src/runner.ts`, `node scripts/build.mjs`, `tsx x.ts`).
+/// These are runnable roots — their reachable code is live even though nothing
+/// imports them — so harness/script code is not reported dead. Conservative:
+/// only tokens that resolve to an existing local source file are added; flags,
+/// bare binaries, config files, and node_modules refs are ignored.
+fn collect_script_entry_points(
+    package_dir: &Path,
+    command: &str,
+    entry_points: &mut EntryPointSet,
+) {
+    let is_separator =
+        |c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '(' | ')' | '<' | '>' | ',');
+    for token in command.split(is_separator) {
+        let token = token
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+        if token.is_empty() || token.starts_with('-') || token.contains("node_modules") {
+            continue;
+        }
+        let is_source = Path::new(token)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| JS_MODULE_EXTENSIONS.contains(&extension));
+        if !is_source {
+            continue;
+        }
+        let candidate = normalize_path(&package_dir.join(token));
+        if candidate.is_file() {
+            insert_resolved_entry_point(entry_points, &candidate, EntryPointKind::LivenessRoot);
+        }
+    }
 }
 
 fn collect_json_entry_strings(value: &Value, entries: &mut BTreeSet<String>) {
@@ -484,4 +524,43 @@ fn relative_path(project_root: &Path, path: &Path) -> String {
         .unwrap_or(path.as_path())
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_scripts_seed_source_files_as_liveness_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("src/runner.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join("scripts/build.mjs"), "console.log(1)\n").unwrap();
+        // A private package (no main/module/exports/bin) with only scripts.
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "x",
+                "private": true,
+                "scripts": {
+                    "bench": "bun run src/runner.ts",
+                    "build": "node scripts/build.mjs --flag",
+                    "lint": "biome check .",
+                    "missing": "bun run src/does-not-exist.ts"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        // Real script targets become liveness roots.
+        assert!(entry_points.is_liveness_root_file(&root.join("src/runner.ts")));
+        assert!(entry_points.is_liveness_root_file(&root.join("scripts/build.mjs")));
+        // Non-file tokens (binaries, flags, ".") and missing files are ignored.
+        assert!(!entry_points.is_liveness_root_file(&root.join("src/does-not-exist.ts")));
+        // Script roots are liveness roots, not public-API surfaces.
+        assert!(!entry_points.is_public_api_file(&root.join("src/runner.ts")));
+    }
 }

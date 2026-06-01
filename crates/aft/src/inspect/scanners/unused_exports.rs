@@ -9,6 +9,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::cache_freshness;
 use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
+use crate::inspect::job::is_test_support_file;
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -84,6 +85,12 @@ pub fn run_unused_exports_scan(job: &InspectJob) -> InspectResult {
     let mut uncertain_items = Vec::new();
     for scan in &per_file {
         if public_api_entries.is_public_api_file(&scan.file_path) {
+            continue;
+        }
+        // Fixtures/corpora/mock data are loaded by path, not imported, so their
+        // exports always look unused. Skip reporting (their import edges above
+        // still mark the product code they consume as used).
+        if is_test_support_file(&scan.relative_file) {
             continue;
         }
 

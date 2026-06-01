@@ -523,6 +523,32 @@ impl JobOutcome {
     }
 }
 
+/// Whether a project-relative path is a test-support / standalone file that
+/// should be EXCLUDED from dead_code and unused_exports reporting. These files
+/// (test fixtures, corpora, mock data, snapshots) are consumed by file path or
+/// loaded dynamically — never imported as modules — so static reachability
+/// always reports their symbols as dead/unused. They are noise, not signal.
+///
+/// Edges FROM these files are still honored elsewhere (their imports keep
+/// product code live); only their own exported symbols are suppressed from the
+/// dead/unused lists. The match is on conventional directory names anywhere in
+/// the path, kept conservative to avoid hiding real product directories.
+pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
+    let normalized = relative_path.replace('\\', "/");
+    normalized.split('/').any(|segment| {
+        matches!(
+            segment,
+            "fixtures"
+                | "__fixtures__"
+                | "testdata"
+                | "test-data"
+                | "__mocks__"
+                | "__snapshots__"
+                | "corpora"
+        )
+    })
+}
+
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -537,4 +563,41 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod test_support_tests {
+    use super::is_test_support_file;
+
+    #[test]
+    fn matches_conventional_support_dirs() {
+        assert!(is_test_support_file("crates/aft/tests/fixtures/sample.ts"));
+        assert!(is_test_support_file(
+            "packages/x/__tests__/e2e/fixtures/a.ts"
+        ));
+        assert!(is_test_support_file(
+            "benchmarks/codegraph/corpora/repo/lib.go"
+        ));
+        assert!(is_test_support_file("src/__mocks__/fs.ts"));
+        assert!(is_test_support_file("src/__snapshots__/render.snap"));
+        assert!(is_test_support_file("internal/testdata/golden.json"));
+        // Windows-style separators normalize.
+        assert!(is_test_support_file("crates\\aft\\tests\\fixtures\\x.rs"));
+    }
+
+    #[test]
+    fn does_not_match_product_or_test_files() {
+        // A real product file under src must never be excluded.
+        assert!(!is_test_support_file("crates/aft/src/inspect/job.rs"));
+        // Test FILES are not support files (they hold real assertions/roots).
+        assert!(!is_test_support_file(
+            "packages/x/__tests__/reading.test.ts"
+        ));
+        assert!(!is_test_support_file(
+            "crates/aft/tests/integration/main.rs"
+        ));
+        // Substring of a segment must not match (only whole segments).
+        assert!(!is_test_support_file("src/fixturesHelper.ts"));
+        assert!(!is_test_support_file("src/my_corpora_loader.rs"));
+    }
 }
