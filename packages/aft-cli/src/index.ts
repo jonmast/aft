@@ -16,6 +16,7 @@ function printHelp(): void {
   console.log("  -------");
   console.log("");
   console.log("  Commands:");
+  console.log("    --version        Show CLI, binary, and per-harness plugin versions");
   console.log("    setup            Interactive setup wizard");
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
@@ -38,6 +39,10 @@ function printHelp(): void {
 }
 
 async function main(): Promise<number> {
+  if (command === "--version" || command === "-v" || command === "-V" || command === "version") {
+    const { runVersion } = await import("./commands/version.js");
+    return runVersion();
+  }
   if (command === "setup") {
     const { runSetup } = await import("./commands/setup.js");
     return runSetup(args);

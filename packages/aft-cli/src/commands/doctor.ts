@@ -26,6 +26,12 @@ import {
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
+import {
+  AFT_SCHEMA_URL,
+  ensureAftSchemaUrl,
+  type JsoncFormat,
+  readJsoncFile,
+} from "../lib/jsonc.js";
 import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
 import { findOnnxFixCandidates, runOnnxFix } from "../lib/onnx-fix.js";
@@ -99,7 +105,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   }
 
   const adapters = await resolveAdaptersForCommand(options.argv, {
-    allowMulti: true,
+    allowMulti: false,
     verb: "diagnose",
   });
 
@@ -141,6 +147,12 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     log.info(`  aft config: ${h.aftConfig.exists ? h.configPaths.aftConfig : "(not set)"}`);
     if (h.aftConfig.parseError) {
       log.error(`  aft config parse error: ${h.aftConfig.parseError}`);
+    } else if (h.aftConfig.exists) {
+      const { value } = readJsoncFile(h.configPaths.aftConfig);
+      const schemaSet = value?.$schema === AFT_SCHEMA_URL;
+      log.info(
+        `  aft config $schema: ${schemaSet ? "set" : "not set — run `aft doctor --fix` for editor autocomplete"}`,
+      );
     }
 
     log.info(`  storage: ${formatDoctorStorageStatus(h)}`);
@@ -358,8 +370,60 @@ export function clearOldBinaries(): BinaryCacheClearResult {
 }
 
 export interface DoctorFixPlanItem {
-  kind: "plugin" | "binary" | "onnx" | "storage";
+  kind: "plugin" | "binary" | "onnx" | "storage" | "schema";
   message: string;
+}
+
+interface SchemaFixTarget {
+  adapter: HarnessAdapter;
+  aftConfig: string;
+  aftConfigFormat: JsoncFormat;
+}
+
+/**
+ * Installed harnesses whose AFT config is missing the `$schema` URL (so editor
+ * autocomplete/validation won't kick in). `aft setup` already sets this; this
+ * is the `--fix` counterpart for configs created before setup or hand-edited.
+ * Plain `aft doctor` stays read-only and only reports it.
+ */
+function findSchemaFixTargets(adapters: HarnessAdapter[]): SchemaFixTarget[] {
+  const targets: SchemaFixTarget[] = [];
+  for (const adapter of adapters) {
+    if (!adapter.isInstalled()) continue;
+    let aftConfig: string;
+    let aftConfigFormat: JsoncFormat;
+    try {
+      ({ aftConfig, aftConfigFormat } = adapter.detectConfigPaths());
+    } catch {
+      continue;
+    }
+    const { value } = readJsoncFile(aftConfig);
+    if (value?.$schema === AFT_SCHEMA_URL) continue;
+    targets.push({ adapter, aftConfig, aftConfigFormat });
+  }
+  return targets;
+}
+
+function applySchemaFixes(targets: SchemaFixTarget[]): { changed: number; errors: number } {
+  let changed = 0;
+  let errors = 0;
+  for (const target of targets) {
+    try {
+      const result = ensureAftSchemaUrl(target.aftConfig, target.aftConfigFormat);
+      if (result.action === "added" || result.action === "updated") {
+        changed += 1;
+        log.success(`${target.adapter.displayName}: ${result.message}`);
+      }
+    } catch (error) {
+      errors += 1;
+      log.warn(
+        `${target.adapter.displayName}: could not set $schema on ${target.aftConfig}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  return { changed, errors };
 }
 
 export function buildDoctorFixPlan(
@@ -420,6 +484,13 @@ export function buildDoctorFixPlan(
     }
   }
 
+  for (const target of findSchemaFixTargets(adapters)) {
+    items.push({
+      kind: "schema",
+      message: `Will add the AFT config $schema URL to ${target.aftConfig} (editor autocomplete + validation)`,
+    });
+  }
+
   return items;
 }
 
@@ -466,7 +537,7 @@ function logUnmatchedBinaryCandidates(expectedVersion: string): void {
  */
 async function runFixFlow(argv: string[]): Promise<number> {
   const adapters = await resolveAdaptersForCommand(argv, {
-    allowMulti: true,
+    allowMulti: false,
     verb: "auto-fix issues for",
   });
 
@@ -491,6 +562,11 @@ async function runFixFlow(argv: string[]): Promise<number> {
 
   await fixPluginEntries(adapters);
   const storageSummary = ensureStorageDirsForRegisteredPlugins(adapters);
+
+  // Ensure aft.jsonc carries the $schema URL (editor autocomplete + validation).
+  // `aft setup` already does this; --fix covers configs created/edited outside
+  // setup. Plain `aft doctor` stays read-only and only reports the gap.
+  const schemaSummary = applySchemaFixes(findSchemaFixTargets(adapters));
 
   // GitHub #46 follow-up: download the binary if it's missing. Without this,
   // doctor would silently say "everything looks good" while the user
@@ -543,7 +619,9 @@ async function runFixFlow(argv: string[]): Promise<number> {
     !binaryDownloadSkipped &&
     !binaryDownloadError &&
     storageSummary.created === 0 &&
-    storageSummary.errors === 0
+    storageSummary.errors === 0 &&
+    schemaSummary.changed === 0 &&
+    schemaSummary.errors === 0
   ) {
     log.info("No auto-fixable issues detected.");
     note(
@@ -560,7 +638,8 @@ async function runFixFlow(argv: string[]): Promise<number> {
   const hadErrors =
     (onnxResult?.errors.length ?? 0) > 0 ||
     binaryDownloadError !== null ||
-    storageSummary.errors > 0;
+    storageSummary.errors > 0 ||
+    schemaSummary.errors > 0;
   const afterReport = await collectDiagnostics(adapters);
   const stillHasProblems = hasDoctorProblems(afterReport);
   outro(
@@ -823,7 +902,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   }
 
   const adapters = await resolveAdaptersForCommand(argv, {
-    allowMulti: true,
+    allowMulti: false,
     verb: "include in the issue",
   });
 

@@ -1,7 +1,11 @@
 /// <reference path="../bun-test.d.ts" />
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
+import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
 import {
   buildDoctorFixPlan,
@@ -101,13 +105,20 @@ function messages(plan: DoctorFixPlanItem[]): string[] {
   return plan.map((item) => item.message);
 }
 
+// The `$schema` planning item depends on real on-disk state of the harness's
+// aft.jsonc (a hardcoded /tmp path in these mocks), so exact-match plan
+// assertions filter it out and a dedicated isolated test below covers it.
+function nonSchemaMessages(plan: DoctorFixPlanItem[]): string[] {
+  return plan.filter((item) => item.kind !== "schema").map((item) => item.message);
+}
+
 describe("doctor --fix planning", () => {
   test("lists plugin and binary mutations before applying fixes", () => {
     const report = makeReport([makeHarness({ pluginRegistered: false })], null);
 
     const plan = buildDoctorFixPlan([makeAdapter()], report);
 
-    expect(messages(plan)).toEqual([
+    expect(nonSchemaMessages(plan)).toEqual([
       "Will add @cortexkit/aft-opencode@latest to /tmp/aft-test/opencode.jsonc",
       "Will download/cache the aft binary matching CLI v0.30.1",
     ]);
@@ -121,7 +132,9 @@ describe("doctor --fix planning", () => {
 
     const plan = buildDoctorFixPlan([makeAdapter("pi")], report);
 
-    expect(messages(plan)).toEqual(["Will run `pi install npm:@cortexkit/aft-pi` to register Pi"]);
+    expect(nonSchemaMessages(plan)).toEqual([
+      "Will run `pi install npm:@cortexkit/aft-pi` to register Pi",
+    ]);
   });
 
   test("skips the confirmation prompt for explicit automation flags", () => {
@@ -170,6 +183,46 @@ describe("doctor --fix planning", () => {
     const plan = buildDoctorFixPlan([makeAdapter()], report);
 
     expect(messages(plan)).toContain("Will create AFT storage directory at /tmp/aft-test/storage");
+  });
+
+  test("plans a $schema fix when the harness aft config lacks the schema URL", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aft-cli-doctor-schema-"));
+    const aftConfig = join(dir, "aft.jsonc");
+    writeFileSync(aftConfig, JSON.stringify({ semantic_search: true }, null, 2));
+    const adapter = makeAdapter();
+    adapter.detectConfigPaths = () => ({
+      configDir: dir,
+      harnessConfig: join(dir, "opencode.jsonc"),
+      harnessConfigFormat: "jsonc",
+      aftConfig,
+      aftConfigFormat: "jsonc",
+    });
+    const report = makeReport([makeHarness({ pluginRegistered: true })], "0.30.1");
+
+    const plan = buildDoctorFixPlan([adapter], report);
+
+    expect(messages(plan)).toContain(
+      `Will add the AFT config $schema URL to ${aftConfig} (editor autocomplete + validation)`,
+    );
+  });
+
+  test("does not plan a $schema fix when the schema URL is already present", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aft-cli-doctor-schema-"));
+    const aftConfig = join(dir, "aft.jsonc");
+    writeFileSync(aftConfig, JSON.stringify({ $schema: AFT_SCHEMA_URL }, null, 2));
+    const adapter = makeAdapter();
+    adapter.detectConfigPaths = () => ({
+      configDir: dir,
+      harnessConfig: join(dir, "opencode.jsonc"),
+      harnessConfigFormat: "jsonc",
+      aftConfig,
+      aftConfigFormat: "jsonc",
+    });
+    const report = makeReport([makeHarness({ pluginRegistered: true })], "0.30.1");
+
+    const plan = buildDoctorFixPlan([adapter], report);
+
+    expect(plan.some((item) => item.kind === "schema")).toBe(false);
   });
 });
 
