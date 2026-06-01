@@ -562,7 +562,12 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Ruby => Some(&ruby::RUBY_SYNTAX),
         LangId::Scala => Some(&scala::SCALA_SYNTAX),
         LangId::Swift => Some(&swift::SWIFT_SYNTAX),
-        LangId::Zig | LangId::Bash | LangId::Json | LangId::Html | LangId::Markdown => None,
+        LangId::Zig
+        | LangId::Bash
+        | LangId::Json
+        | LangId::Html
+        | LangId::Markdown
+        | LangId::Yaml => None,
     }
 }
 
