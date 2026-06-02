@@ -151,6 +151,10 @@ export class BridgePool {
       onBashPatternMatch: options.onBashPatternMatch,
       errorPrefix: options.errorPrefix,
       logger: options.logger,
+      // Forward the per-child env override so a pooled bridge honors the
+      // documented `BridgeOptions.childEnv` (PoolOptions extends BridgeOptions);
+      // omitting it silently dropped the override for pooled spawns.
+      childEnv: options.childEnv,
     };
     this.configOverrides = configOverrides;
     // Skip cleanup timer when idle timeout is Infinity (no-op) to avoid wasted cycles
@@ -367,6 +371,16 @@ export class BridgePool {
    */
   _testGetConfigOverrides(): Readonly<Record<string, unknown>> {
     return { ...this.configOverrides };
+  }
+
+  /**
+   * Test-only view of the per-bridge options forwarded to every spawned
+   * `BinaryBridge`. Lets tests assert that documented `BridgeOptions` fields
+   * (e.g. `childEnv`) are actually propagated through the pool rather than
+   * silently dropped.
+   */
+  _testGetBridgeOptions(): Readonly<BridgeOptions> {
+    return { ...this.bridgeOptions };
   }
 }
 

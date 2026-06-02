@@ -108,4 +108,18 @@ describe("BridgePool.setConfigureOverride", () => {
       restrict_to_project_root: true,
     });
   });
+
+  // Regression: PoolOptions extends BridgeOptions, so a `childEnv` passed to the
+  // pool must reach every spawned bridge. It was previously dropped because the
+  // pool's bridgeOptions copy omitted it.
+  test("childEnv is forwarded to spawned bridges", () => {
+    const pool = new BridgePool("/fake/aft", {
+      idleTimeoutMs: Infinity,
+      childEnv: { AFT_CACHE_DIR: "/tmp/scoped-cache" },
+    });
+
+    expect(pool._testGetBridgeOptions().childEnv).toEqual({
+      AFT_CACHE_DIR: "/tmp/scoped-cache",
+    });
+  });
 });
