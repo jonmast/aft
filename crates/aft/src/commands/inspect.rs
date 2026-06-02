@@ -81,6 +81,33 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 /// so the bar renders the `~` marker. Errors/warnings are NOT touched here —
 /// they're read live from the LSP store at attach time.
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
+    // Only refresh the bar's Tier-2 counts when at least one Tier-2 category
+    // actually produced data (Fresh, or Stale with a cached aggregate). A
+    // Pending/Failed/Stale-without-cache outcome means no scan has ever
+    // produced counts — populating from it would flip the bar to `populated`
+    // with fabricated `~D0 U0 C0` zeros and lie about project health (#1). In
+    // that state we leave the bar unpopulated so `status_bar_counts()` keeps
+    // suppressing it until a real scan lands.
+    let has_real_tier2 = [
+        InspectCategory::DeadCode,
+        InspectCategory::UnusedExports,
+        InspectCategory::Duplicates,
+    ]
+    .iter()
+    .any(|category| {
+        matches!(
+            outcomes.get(category),
+            Some(JobOutcome::Fresh { .. })
+                | Some(JobOutcome::Stale {
+                    cached: Some(_),
+                    ..
+                })
+        )
+    });
+    if !has_real_tier2 {
+        return;
+    }
+
     let count_of = |category: InspectCategory| -> usize {
         outcomes
             .get(&category)
@@ -627,4 +654,122 @@ fn empty_array(value: &Value) -> bool {
 
 fn invalid_request(id: &str, message: String) -> Response {
     Response::error(id, "invalid_request", message)
+}
+
+#[cfg(test)]
+mod status_bar_refresh_tests {
+    use super::*;
+    use crate::parser::TreeSitterProvider;
+
+    fn ctx() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+    }
+
+    fn outcomes(
+        entries: Vec<(InspectCategory, JobOutcome)>,
+    ) -> BTreeMap<InspectCategory, JobOutcome> {
+        entries.into_iter().collect()
+    }
+
+    // #1: a Pending-only Tier-2 (no scan has ever produced counts) must NOT
+    // populate the status bar — otherwise it renders fabricated `~D0 U0 C0`
+    // zeros that lie about project health.
+    #[test]
+    fn pending_tier2_does_not_populate_status_bar() {
+        let ctx = ctx();
+        assert!(ctx.status_bar_counts().is_none());
+
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![
+                (
+                    InspectCategory::DeadCode,
+                    JobOutcome::Pending { in_flight: true },
+                ),
+                (
+                    InspectCategory::UnusedExports,
+                    JobOutcome::Pending { in_flight: true },
+                ),
+                (
+                    InspectCategory::Duplicates,
+                    JobOutcome::Pending { in_flight: true },
+                ),
+            ]),
+        );
+
+        assert!(
+            ctx.status_bar_counts().is_none(),
+            "Pending Tier-2 must leave the bar unpopulated (no fabricated zeros)"
+        );
+    }
+
+    // Stale-without-cache is equally untrustworthy — also must not populate.
+    #[test]
+    fn stale_without_cache_does_not_populate_status_bar() {
+        let ctx = ctx();
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![(
+                InspectCategory::DeadCode,
+                JobOutcome::Stale {
+                    cached: None,
+                    in_flight: true,
+                },
+            )]),
+        );
+        assert!(ctx.status_bar_counts().is_none());
+    }
+
+    // A real Fresh outcome populates the bar with the actual counts.
+    #[test]
+    fn fresh_tier2_populates_status_bar() {
+        let ctx = ctx();
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![
+                (
+                    InspectCategory::DeadCode,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({ "count": 7 }),
+                    },
+                ),
+                (
+                    InspectCategory::UnusedExports,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({ "count": 3 }),
+                    },
+                ),
+                (
+                    InspectCategory::Duplicates,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({ "count": 1 }),
+                    },
+                ),
+            ]),
+        );
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 7);
+        assert_eq!(counts.unused_exports, 3);
+        assert_eq!(counts.duplicates, 1);
+        assert!(!counts.tier2_stale);
+    }
+
+    // Stale-WITH-cache populates (last-known counts) and marks the bar stale.
+    #[test]
+    fn stale_with_cache_populates_and_marks_stale() {
+        let ctx = ctx();
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![(
+                InspectCategory::DeadCode,
+                JobOutcome::Stale {
+                    cached: Some(serde_json::json!({ "count": 12 })),
+                    in_flight: true,
+                },
+            )]),
+        );
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 12);
+        assert!(counts.tier2_stale);
+    }
 }

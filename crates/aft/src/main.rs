@@ -389,11 +389,16 @@ fn drain_configure_warning_events(ctx: &AppContext) {
 
 fn drain_inspect_events(ctx: &AppContext) {
     let drained = ctx.inspect_manager().drain_completions();
+    // Watcher-driven Tier-2 scans complete via the reuse path, which bypasses
+    // `result_rx`/`drain_completions`. Poll the manager's reuse counter so a
+    // background scan still refreshes the bar (#3) — otherwise the counts and
+    // `~` marker would only update on a manual `aft_inspect`.
+    let reuse_completed = ctx.take_new_reuse_completions();
     // A completed background Tier-2 scan refreshes the agent status-bar counts
     // to the freshly-persisted aggregate, and clears the stale marker — so the
     // bar reflects the new numbers on the next tool result without waiting for
     // an explicit aft_inspect call.
-    if drained > 0 {
+    if drained > 0 || reuse_completed {
         if let Some(project_root) = ctx.config().project_root.clone() {
             let (dead_code, unused_exports, duplicates) = ctx
                 .inspect_manager()
@@ -1204,8 +1209,15 @@ fn drain_watcher_events(ctx: &AppContext) {
     // `git checkout`, branch switch) — not just the delete command. The agent
     // status bar reads E/W live from the warm set on each response, so clearing
     // the store is sufficient; the next tool call's bar reflects the new count.
+    //
+    // Not gated on the trigram `SOURCE_EXTENSIONS` set: any registered LSP
+    // server (Bash, YAML, Solidity, Vue, C/C++, custom servers, …) can publish
+    // diagnostics for files outside that set, and gating on it left their
+    // diagnostics stranded after deletion. `clear_for_file` is a cheap no-op
+    // when the store holds nothing for the path, so clearing unconditionally
+    // for every vanished path is safe.
     for path in &changed {
-        if !path.exists() && watcher_path_is_source(path) {
+        if !path.exists() {
             ctx.lsp_clear_diagnostics_for_file(path);
         }
     }

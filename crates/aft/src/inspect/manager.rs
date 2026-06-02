@@ -70,6 +70,11 @@ pub struct InspectManager {
     caches: Mutex<HashMap<PathBuf, Arc<InspectCache>>>,
     soft_deadline: Duration,
     next_job_id: AtomicU64,
+    /// Monotonic count of Tier-2 completions delivered via the reuse path
+    /// (watcher-driven scheduler runs). These bypass `result_rx`/
+    /// `drain_completions`, so the `&AppContext`-side drain polls this counter
+    /// to know when to refresh the agent status bar after a background scan.
+    reuse_completions: AtomicU64,
 }
 
 impl InspectManager {
@@ -88,6 +93,7 @@ impl InspectManager {
             caches: Mutex::new(HashMap::new()),
             soft_deadline,
             next_job_id: AtomicU64::new(1),
+            reuse_completions: AtomicU64::new(0),
         }
     }
 
@@ -998,6 +1004,18 @@ impl InspectManager {
         for waiter in waiters {
             let _ = waiter.tx.send(outcome.clone());
         }
+        // Signal the main-thread drain that a background (watcher-driven) Tier-2
+        // scan finished so it can refresh the status bar. This path bypasses
+        // `result_rx`/`drain_completions`, so without this counter the bar's
+        // counts and `~` marker would only update on a manual `aft_inspect`.
+        self.reuse_completions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Snapshot the cumulative count of reuse-path (watcher-driven) Tier-2
+    /// completions. The main-thread drain compares this against its last-seen
+    /// value to detect background scans that finished since the previous tick.
+    pub fn reuse_completion_count(&self) -> u64 {
+        self.reuse_completions.load(Ordering::SeqCst)
     }
 
     fn completion_outcome(&self, result: InspectResult) -> JobOutcome {

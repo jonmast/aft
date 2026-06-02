@@ -521,6 +521,10 @@ pub struct AppContext {
     stdout_writer: SharedStdoutWriter,
     progress_sender: SharedProgressSender,
     configure_generation: AtomicU64,
+    /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
+    /// per-request inspect drain can detect watcher-driven Tier-2 scans that
+    /// finished since the previous tick and refresh the status bar (#3).
+    last_seen_reuse_completions: AtomicU64,
     configure_warnings_tx: mpsc::Sender<(u64, ConfigureWarningsFrame)>,
     configure_warnings_rx: mpsc::Receiver<(u64, ConfigureWarningsFrame)>,
     status_emitter: StatusEmitter,
@@ -602,6 +606,7 @@ impl AppContext {
             stdout_writer,
             progress_sender: Arc::clone(&progress_sender),
             configure_generation: AtomicU64::new(0),
+            last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
             status_emitter,
@@ -1178,6 +1183,18 @@ impl AppContext {
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
+    }
+
+    /// Returns true when one or more watcher-driven (reuse-path) Tier-2 scans
+    /// have completed since the last call, advancing the last-seen marker. The
+    /// per-request inspect drain uses this to refresh the status bar after a
+    /// background scan — those completions bypass `drain_completions`.
+    pub fn take_new_reuse_completions(&self) -> bool {
+        let current = self.inspect_manager.reuse_completion_count();
+        let previous = self
+            .last_seen_reuse_completions
+            .swap(current, Ordering::SeqCst);
+        current != previous
     }
 
     pub fn reset_tier2_refresh_scheduler(&self) {
