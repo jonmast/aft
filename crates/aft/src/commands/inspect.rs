@@ -81,40 +81,19 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 /// so the bar renders the `~` marker. Errors/warnings are NOT touched here —
 /// they're read live from the LSP store at attach time.
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
-    // Only refresh the bar's Tier-2 counts when at least one Tier-2 category
-    // actually produced data (Fresh, or Stale with a cached aggregate). A
-    // Pending/Failed/Stale-without-cache outcome means no scan has ever
-    // produced counts — populating from it would flip the bar to `populated`
-    // with fabricated `~D0 U0 C0` zeros and lie about project health (#1). In
-    // that state we leave the bar unpopulated so `status_bar_counts()` keeps
-    // suppressing it until a real scan lands.
-    let has_real_tier2 = [
-        InspectCategory::DeadCode,
-        InspectCategory::UnusedExports,
-        InspectCategory::Duplicates,
-    ]
-    .iter()
-    .any(|category| {
-        matches!(
-            outcomes.get(category),
-            Some(JobOutcome::Fresh { .. })
-                | Some(JobOutcome::Stale {
-                    cached: Some(_),
-                    ..
-                })
-        )
-    });
-    if !has_real_tier2 {
-        return;
-    }
-
-    let count_of = |category: InspectCategory| -> usize {
+    // Per-category count: `Some` only when the category actually produced data
+    // (Fresh, or Stale with a cached aggregate — `JobOutcome::payload()` returns
+    // `None` for Pending/Failed/Stale-without-cache). A `None` category is left
+    // untouched downstream rather than overwritten with a fabricated `0`, and
+    // the bar stays suppressed until all three categories hold a real value, so
+    // a partially-completed cold scan never lies about project health (#1).
+    let count_of = |category: InspectCategory| -> Option<usize> {
         outcomes
             .get(&category)
             .and_then(JobOutcome::payload)
             .and_then(|payload| payload.get("count"))
             .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
+            .map(|count| count as usize)
     };
     let any_tier2_stale = [
         InspectCategory::DeadCode,
@@ -755,21 +734,47 @@ mod status_bar_refresh_tests {
     }
 
     // Stale-WITH-cache populates (last-known counts) and marks the bar stale.
+    // All three categories must carry a cached value — the bar stays suppressed
+    // until every Tier-2 category is real, never fabricating a 0 (#1).
     #[test]
     fn stale_with_cache_populates_and_marks_stale() {
+        let ctx = ctx();
+        let stale_cache = |count: i64| JobOutcome::Stale {
+            cached: Some(serde_json::json!({ "count": count })),
+            in_flight: true,
+        };
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![
+                (InspectCategory::DeadCode, stale_cache(12)),
+                (InspectCategory::UnusedExports, stale_cache(4)),
+                (InspectCategory::Duplicates, stale_cache(2)),
+            ]),
+        );
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 12);
+        assert_eq!(counts.unused_exports, 4);
+        assert_eq!(counts.duplicates, 2);
+        assert!(counts.tier2_stale);
+    }
+
+    // A single category (others Pending) must NOT surface the bar — the core
+    // partial-completion fabrication guard at the sync refresh path (#1).
+    #[test]
+    fn single_category_does_not_populate_status_bar() {
         let ctx = ctx();
         refresh_status_bar_counts(
             &ctx,
             &outcomes(vec![(
                 InspectCategory::DeadCode,
-                JobOutcome::Stale {
-                    cached: Some(serde_json::json!({ "count": 12 })),
-                    in_flight: true,
+                JobOutcome::Fresh {
+                    payload: serde_json::json!({ "count": 9 }),
                 },
             )]),
         );
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 12);
-        assert!(counts.tier2_stale);
+        assert!(
+            ctx.status_bar_counts().is_none(),
+            "one real category must not surface a bar with fabricated U0 C0"
+        );
     }
 }

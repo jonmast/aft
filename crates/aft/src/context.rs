@@ -53,16 +53,19 @@ pub struct StatusBarCounts {
 
 /// Last-known Tier-2 + todos counts, refreshed off the hot path. `errors` and
 /// `warnings` are intentionally NOT cached here — they're read live per attach.
+///
+/// Each Tier-2 category is `Option`: `None` means "no scan has ever produced a
+/// count for this category", so we never fabricate a `0`. The bar is only
+/// surfaced once all three Tier-2 categories hold a real value — a partially
+/// completed cold scan (e.g. dead_code done, unused_exports/duplicates still
+/// running) must not render `D<real> U0 C0` and lie about project health (#1).
 #[derive(Debug, Clone, Default)]
 struct StatusBarTier2 {
-    dead_code: usize,
-    unused_exports: usize,
-    duplicates: usize,
-    todos: usize,
+    dead_code: Option<usize>,
+    unused_exports: Option<usize>,
+    duplicates: Option<usize>,
+    todos: Option<usize>,
     stale: bool,
-    /// Set once the first refresh has populated real counts, so we never emit a
-    /// bar claiming "0 dead code" before any scan has actually run.
-    populated: bool,
 }
 
 pub struct StatusEmitter {
@@ -628,17 +631,22 @@ impl AppContext {
     /// surface a bar that misleadingly claims "0 dead code" before any scan.
     pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
         let tier2 = self.status_bar_tier2.borrow();
-        if !tier2.populated {
+        // All three Tier-2 categories must hold a real value before the bar is
+        // surfaced — otherwise a partially-scanned cold run would render a
+        // fabricated `0` for the not-yet-completed categories (#1).
+        let (Some(dead_code), Some(unused_exports), Some(duplicates)) =
+            (tier2.dead_code, tier2.unused_exports, tier2.duplicates)
+        else {
             return None;
-        }
+        };
         let (errors, warnings) = self.lsp_manager.borrow().warm_error_warning_counts();
         Some(StatusBarCounts {
             errors,
             warnings,
-            dead_code: tier2.dead_code,
-            unused_exports: tier2.unused_exports,
-            duplicates: tier2.duplicates,
-            todos: tier2.todos,
+            dead_code,
+            unused_exports,
+            duplicates,
+            todos: tier2.todos.unwrap_or(0),
             tier2_stale: tier2.stale,
         })
     }
@@ -649,32 +657,40 @@ impl AppContext {
     /// next background scan completes. No-op before the first populate.
     pub fn mark_status_bar_tier2_stale(&self) {
         let mut tier2 = self.status_bar_tier2.borrow_mut();
-        if tier2.populated {
+        // No-op before the first full populate (nothing real to mark stale).
+        if tier2.dead_code.is_some() && tier2.unused_exports.is_some() && tier2.duplicates.is_some()
+        {
             tier2.stale = true;
         }
     }
 
-    /// Refresh the cached Tier-2 + todos counts for the status bar. `stale`
-    /// marks the Tier-2 numbers as not-yet-reconciled with the latest edits.
-    /// `todos` is `None` when the caller didn't recompute it (preserves the
-    /// last-known todo count).
+    /// Refresh the cached Tier-2 + todos counts for the status bar. Each count
+    /// is `Option`: `None` preserves the last-known value (the category wasn't
+    /// recomputed or has no real aggregate yet) so we never overwrite a real
+    /// count with a fabricated `0`. `stale` marks the Tier-2 numbers as
+    /// not-yet-reconciled with the latest edits.
     pub fn update_status_bar_tier2(
         &self,
-        dead_code: usize,
-        unused_exports: usize,
-        duplicates: usize,
+        dead_code: Option<usize>,
+        unused_exports: Option<usize>,
+        duplicates: Option<usize>,
         todos: Option<usize>,
         stale: bool,
     ) {
         let mut tier2 = self.status_bar_tier2.borrow_mut();
-        tier2.dead_code = dead_code;
-        tier2.unused_exports = unused_exports;
-        tier2.duplicates = duplicates;
+        if let Some(dead_code) = dead_code {
+            tier2.dead_code = Some(dead_code);
+        }
+        if let Some(unused_exports) = unused_exports {
+            tier2.unused_exports = Some(unused_exports);
+        }
+        if let Some(duplicates) = duplicates {
+            tier2.duplicates = Some(duplicates);
+        }
         if let Some(todos) = todos {
-            tier2.todos = todos;
+            tier2.todos = Some(todos);
         }
         tier2.stale = stale;
-        tier2.populated = true;
     }
 
     /// Borrow the cached project gitignore matcher. Returns `None` when no
@@ -1866,7 +1882,7 @@ mod status_bar_tests {
         // No scan has run yet — never surface a bar claiming "0 dead code".
         assert!(ctx.status_bar_counts().is_none());
 
-        ctx.update_status_bar_tier2(5, 3, 7, Some(2), false);
+        ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(counts.dead_code, 5);
         assert_eq!(counts.unused_exports, 3);
@@ -1879,14 +1895,52 @@ mod status_bar_tests {
     }
 
     #[test]
+    fn partial_tier2_does_not_fabricate_zeros() {
+        let ctx = ctx();
+        // Only dead_code has completed (the slow first serial category); the
+        // other two are still in flight. The bar must stay suppressed rather
+        // than render `D5 U0 C0` with fabricated zeros (#1).
+        ctx.update_status_bar_tier2(Some(5), None, None, None, true);
+        assert!(
+            ctx.status_bar_counts().is_none(),
+            "bar must not surface until all three Tier-2 categories are real"
+        );
+
+        // Second category completes — still incomplete, still suppressed.
+        ctx.update_status_bar_tier2(None, Some(3), None, None, true);
+        assert!(ctx.status_bar_counts().is_none());
+
+        // Final category completes → bar surfaces with all real counts, and
+        // none of them were ever fabricated.
+        ctx.update_status_bar_tier2(None, None, Some(7), None, false);
+        let counts = ctx.status_bar_counts().expect("all three real now");
+        assert_eq!(counts.dead_code, 5);
+        assert_eq!(counts.unused_exports, 3);
+        assert_eq!(counts.duplicates, 7);
+    }
+
+    #[test]
     fn update_with_none_todos_preserves_last_known_todos() {
         let ctx = ctx();
-        ctx.update_status_bar_tier2(1, 1, 1, Some(9), false);
+        ctx.update_status_bar_tier2(Some(1), Some(1), Some(1), Some(9), false);
         // A background-scan refresh passes todos=None → todo count preserved.
-        ctx.update_status_bar_tier2(2, 2, 2, None, false);
+        ctx.update_status_bar_tier2(Some(2), Some(2), Some(2), None, false);
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(counts.todos, 9);
         assert_eq!(counts.dead_code, 2);
+    }
+
+    #[test]
+    fn update_with_none_count_preserves_last_known_count() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(10), Some(20), Some(30), None, false);
+        // A refresh that only recomputed dead_code preserves the other two
+        // real counts rather than overwriting them with a fabricated 0.
+        ctx.update_status_bar_tier2(Some(11), None, None, None, false);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 11);
+        assert_eq!(counts.unused_exports, 20);
+        assert_eq!(counts.duplicates, 30);
     }
 
     #[test]
@@ -1896,12 +1950,12 @@ mod status_bar_tests {
         ctx.mark_status_bar_tier2_stale();
         assert!(ctx.status_bar_counts().is_none());
 
-        ctx.update_status_bar_tier2(4, 0, 0, Some(0), false);
+        ctx.update_status_bar_tier2(Some(4), Some(0), Some(0), Some(0), false);
         ctx.mark_status_bar_tier2_stale();
         assert!(ctx.status_bar_counts().expect("populated").tier2_stale);
 
         // A completed scan clears stale.
-        ctx.update_status_bar_tier2(4, 0, 0, None, false);
+        ctx.update_status_bar_tier2(Some(4), Some(0), Some(0), None, false);
         assert!(!ctx.status_bar_counts().expect("populated").tier2_stale);
     }
 
@@ -1916,7 +1970,7 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        ctx.update_status_bar_tier2(0, 0, 0, Some(0), false); // populate so the bar surfaces
+        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false); // populate so the bar surfaces
 
         let file = std::path::PathBuf::from("/proj/gone.ts");
         {

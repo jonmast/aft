@@ -403,7 +403,13 @@ fn drain_inspect_events(ctx: &AppContext) {
             let (dead_code, unused_exports, duplicates) = ctx
                 .inspect_manager()
                 .latest_tier2_counts(ctx.inspect_dir(), project_root);
-            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, false);
+            // Don't clear the `~` stale marker until the whole serial Tier-2
+            // cycle has drained — while any category is still in flight the
+            // already-persisted categories may predate the latest edit, so
+            // claiming fresh would be premature (#20). `None` counts preserve
+            // the last-known value rather than fabricating a `0` (#1).
+            let stale = ctx.inspect_manager().tier2_any_in_flight();
+            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, stale);
         }
     }
 }

@@ -308,16 +308,18 @@ impl InspectManager {
     /// `(dead_code, unused_exports, duplicates)` order. Reads the most recent
     /// aggregate regardless of contribution-hash freshness (last-known), so the
     /// agent status bar can refresh after a background scan completes without a
-    /// freshness round-trip. Missing/unreadable categories report 0.
+    /// freshness round-trip. A category with no readable aggregate reports
+    /// `None` (never a fabricated `0`), so the status bar can preserve any
+    /// last-known value and stay suppressed until every category is real (#1).
     pub fn latest_tier2_counts(
         &self,
         inspect_dir: PathBuf,
         project_root: PathBuf,
-    ) -> (usize, usize, usize) {
+    ) -> (Option<usize>, Option<usize>, Option<usize>) {
         let Ok(cache) = self.cache_for_paths(inspect_dir, project_root) else {
-            return (0, 0, 0);
+            return (None, None, None);
         };
-        let count_of = |category: InspectCategory| -> usize {
+        let count_of = |category: InspectCategory| -> Option<usize> {
             cache
                 .latest_aggregate_any_hash(category)
                 .ok()
@@ -328,7 +330,6 @@ impl InspectManager {
                         .and_then(serde_json::Value::as_u64)
                         .map(|count| count as usize)
                 })
-                .unwrap_or(0)
         };
         (
             count_of(InspectCategory::DeadCode),
