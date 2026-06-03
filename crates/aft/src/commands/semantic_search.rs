@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -514,7 +514,12 @@ fn handle_semantic_or_hybrid_search(
 
     // No score threshold: silent filtering produced "0 results" even when the
     // model had reasonable matches the agent could have judged. Surface every
-    // hit with its score so the caller can decide.
+    // hit so the caller can decide.
+
+    // Read display snippets from source on the fly (top 3 only, rank-budgeted)
+    // so both the text rendering and the JSON `results` carry fresh, correctly
+    // sized previews. Drives the conditional zoom hint.
+    let snippets_incomplete = enrich_snippets_from_source(&mut results);
 
     search_response(
         req,
@@ -525,7 +530,7 @@ fn handle_semantic_or_hybrid_search(
             semantic_status,
             status: "ready",
             complete: true,
-            text: format_semantic_text(&results, project_root),
+            text: format_semantic_text(&results, project_root, more_available, snippets_incomplete),
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
             engine_capped: lexical.engine_capped,
@@ -1309,16 +1314,31 @@ fn format_building_lexical_text(
     )
 }
 
-fn format_semantic_text(results: &[HybridResult], project_root: &Path) -> String {
+fn format_semantic_text(
+    results: &[HybridResult],
+    project_root: &Path,
+    more_available: bool,
+    snippets_incomplete: bool,
+) -> String {
     if results.is_empty() {
-        return "Found 0 semantic result(s). [index: ready]".to_string();
+        return "Found 0 results. [index: ready]".to_string();
     }
 
-    format!(
-        "{}\n\nFound {} semantic result(s). [index: ready]",
-        format_result_sections(results, project_root),
+    let mut text = format_result_sections(results, project_root);
+    text.push_str(&format!(
+        "\n\nFound {} result(s). [index: ready]",
         results.len()
-    )
+    ));
+    if more_available {
+        text.push_str(" More results available; raise topK to see more.");
+    }
+    // Only when snippet content was actually withheld (omitted for rank 4+, or
+    // truncated within the top 3) — so the hint appears exactly when it's
+    // actionable, not on every search.
+    if snippets_incomplete {
+        text.push_str("\nZoom any result for full source: aft_zoom <file> <symbol>.");
+    }
+    text
 }
 
 fn format_grep_search_text(
@@ -1330,47 +1350,130 @@ fn format_grep_search_text(
     format!("{base}\n[interpreted_as: {interpreted_as}]")
 }
 
-fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
-    let mut groups: BTreeMap<String, Vec<&HybridResult>> = BTreeMap::new();
+/// Snippet line budget by global rank (0-based). The fused score is an
+/// uncalibrated, scale-mixed artifact (raw cosine for semantic-only hits,
+/// cosine×boost for lexically-co-matched hits), so it is NOT shown to the
+/// agent — position conveys rank. We spend snippet tokens by rank instead: the
+/// top hit is disproportionately likely to be the final answer (a fuller
+/// preview there can save a follow-up aft_zoom), tail hits only need to be
+/// identifiable. Snippets are limited to the top 3; rank 4+ shows the symbol
+/// header only and the agent zooms the ones it cares about.
+fn snippet_line_budget(global_rank: usize) -> usize {
+    match global_rank {
+        0 => 10,
+        1 | 2 => 5,
+        _ => 0,
+    }
+}
 
-    for result in results {
+/// Replace each result's display snippet with source lines read on the fly from
+/// disk, bounded by the rank budget. Snippets are display-only (they never
+/// affect embeddings), so reading them at query time keeps the on-disk index
+/// free of display text, lets snippet sizing change without a re-index, and
+/// shows the current file content instead of whatever was captured at index
+/// time. Only the top 3 carry snippets; rank 4+ get a header only and the agent
+/// zooms the ones it cares about. Lexical rows keep their placeholder and file
+/// summaries keep the generated summary (not source lines). Returns true when
+/// any snippet was truncated or omitted, so the caller emits the zoom hint only
+/// when it is actionable.
+fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
+    // Cache reads so two top-3 hits in the same file read it once.
+    let mut file_lines: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let mut incomplete = false;
+
+    for (rank, result) in results.iter_mut().enumerate() {
+        if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
+            continue;
+        }
+
+        let budget = snippet_line_budget(rank);
+        if budget == 0 {
+            // Header-only tier: a real body means there is more to see.
+            if result.end_line >= result.start_line {
+                incomplete = true;
+            }
+            result.snippet = String::new();
+            continue;
+        }
+
+        let lines = file_lines.entry(result.file.clone()).or_insert_with(|| {
+            std::fs::read_to_string(&result.file)
+                .ok()
+                .map(|content| content.lines().map(str::to_string).collect())
+        });
+
+        let Some(lines) = lines else {
+            // File unreadable or gone — no snippet beats a stale one.
+            result.snippet = String::new();
+            continue;
+        };
+
+        // start_line/end_line are 0-based inclusive; +1 makes an exclusive bound.
+        let start = (result.start_line as usize).min(lines.len());
+        let end = ((result.end_line as usize) + 1).min(lines.len());
+        if start >= end {
+            result.snippet = String::new();
+            continue;
+        }
+
+        let range_len = end - start;
+        let shown = range_len.min(budget);
+        let mut snippet = lines[start..start + shown].join("\n");
+        let remaining = range_len - shown;
+        if remaining > 0 {
+            snippet.push_str(&format!("\n+{remaining} more"));
+            incomplete = true;
+        }
+        result.snippet = snippet;
+    }
+
+    incomplete
+}
+
+fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
+    // Results arrive sorted by fused score desc. Group by file preserving
+    // first-appearance order so the most relevant file's group renders first.
+    // A BTreeMap would re-sort groups alphabetically by path and scramble the
+    // ranking the agent relies on to read most-relevant-first. Snippets are
+    // already budgeted by enrich_snippets_from_source; render them verbatim.
+    let mut group_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&HybridResult>> = HashMap::new();
+
+    for result in results.iter() {
         let display_path = result
             .file
             .strip_prefix(project_root)
             .unwrap_or(&result.file)
             .display()
             .to_string();
+        if !groups.contains_key(&display_path) {
+            group_order.push(display_path.clone());
+        }
         groups.entry(display_path).or_default().push(result);
     }
 
-    groups
-        .into_iter()
-        .map(|(file, file_results)| {
-            let mut section = file;
+    group_order
+        .iter()
+        .map(|file| {
+            let mut section = file.clone();
 
-            for result in file_results {
+            for result in &groups[file] {
                 if result.source == "lexical" {
-                    section.push_str(&format!(" [lexical match — score: {:.3}]", result.score));
-                } else if matches!(result.kind, SymbolKind::FileSummary) {
-                    section.push_str(&format!(
-                        "\n{} [{}] [file summary] score {:.3} source {}",
-                        result.name,
-                        symbol_kind_label(&result.kind),
-                        result.score,
-                        result.source
-                    ));
+                    // Whole-file lexical match (no specific symbol).
+                    section.push_str(" [lexical match]");
+                    continue;
+                }
+                if matches!(result.kind, SymbolKind::FileSummary) {
+                    section.push_str(&format!("\n{} [file summary]", result.name));
                 } else {
                     section.push_str(&format!(
-                        "\n{} [{}] lines {}-{} score {:.3} source {}",
+                        "\n{} [{}] lines {}-{}",
                         result.name,
                         symbol_kind_label(&result.kind),
                         display_line_number(result.start_line),
                         display_line_number(result.end_line),
-                        result.score,
-                        result.source
                     ));
                 }
-
                 if !result.snippet.trim().is_empty() {
                     for line in result.snippet.lines() {
                         section.push_str("\n    ");
@@ -1838,10 +1941,164 @@ mod tests {
             hybrid_boosted: false,
         }];
 
-        let text = format_semantic_text(&results, project_root);
+        let text = format_semantic_text(&results, project_root, false, false);
 
-        assert!(text.contains("index [file-summary] [file summary] score 0.750 source semantic"));
+        // File-summary rows show "[file summary]" with no line range, and no
+        // longer leak the internal score/source.
+        assert!(text.contains("index [file summary]"));
         assert!(!text.contains("lines 1-1"));
+        assert!(!text.contains("score"));
+        assert!(!text.contains("source semantic"));
+    }
+
+    /// A symbol hit whose `file` points at a real on-disk file with `body_lines`
+    /// lines starting at line 0, so enrich_snippets_from_source can read it. The
+    /// stored `snippet` is left empty on purpose — enrichment fills it from disk.
+    fn write_symbol_hit(
+        dir: &Path,
+        file_name: &str,
+        name: &str,
+        body_lines: usize,
+    ) -> HybridResult {
+        let path = dir.join(file_name);
+        let body = (0..body_lines)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &body).expect("write symbol file");
+        HybridResult {
+            file: path,
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            start_line: 0,
+            end_line: (body_lines.saturating_sub(1)) as u32,
+            exported: false,
+            snippet: String::new(),
+            score: 0.5,
+            source: "semantic",
+            semantic_score: Some(0.5),
+            lexical_score: None,
+            hybrid_boosted: false,
+        }
+    }
+
+    #[test]
+    fn rows_omit_score_and_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![write_symbol_hit(dir.path(), "a.rs", "foo", 2)];
+        let incomplete = enrich_snippets_from_source(&mut results);
+        let text = format_semantic_text(&results, dir.path(), false, incomplete);
+        assert!(text.contains("foo [function] lines 1-2"));
+        assert!(!text.contains("score"));
+        assert!(!text.contains("source"));
+    }
+
+    #[test]
+    fn snippets_are_rank_tiered_top_three_only_from_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Five hits, each a 20-line body, in distinct files so grouping does not
+        // merge them. Rank order = vector order (already sorted).
+        let mut results: Vec<HybridResult> = (0..5)
+            .map(|i| write_symbol_hit(dir.path(), &format!("f{i}.rs"), &format!("fn{i}"), 20))
+            .collect();
+        let incomplete = enrich_snippets_from_source(&mut results);
+        assert!(incomplete);
+        let text = format_semantic_text(&results, dir.path(), false, incomplete);
+
+        // Rank 0 → 10 of 20 lines, +10 more. Ranks 1,2 → 5 of 20, +15 more.
+        assert!(text.contains("fn0 [function]"));
+        assert!(text.contains("+10 more"));
+        assert!(text.contains("+15 more"));
+        // Rank 0 genuinely shows MORE than ranks 1-2 (gradient not inverted).
+        assert!(
+            results[0]
+                .snippet
+                .lines()
+                .filter(|l| l.starts_with("line"))
+                .count()
+                == 10
+        );
+        assert!(
+            results[1]
+                .snippet
+                .lines()
+                .filter(|l| l.starts_with("line"))
+                .count()
+                == 5
+        );
+        // Ranks 3,4 → header only, no body lines.
+        assert!(
+            results[3].snippet.is_empty(),
+            "rank 4+ must have no snippet"
+        );
+        assert!(
+            results[4].snippet.is_empty(),
+            "rank 4+ must have no snippet"
+        );
+        // Zoom hint present because snippets were withheld.
+        assert!(text.contains("aft_zoom <file> <symbol>"));
+    }
+
+    #[test]
+    fn no_zoom_hint_when_all_snippets_fit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two small symbols (3 lines each), both within their rank budget.
+        let mut results = vec![
+            write_symbol_hit(dir.path(), "a.rs", "foo", 3),
+            write_symbol_hit(dir.path(), "b.rs", "bar", 3),
+        ];
+        let incomplete = enrich_snippets_from_source(&mut results);
+        assert!(!incomplete);
+        let text = format_semantic_text(&results, dir.path(), false, incomplete);
+        assert!(!text.contains("+"), "no truncation marker expected: {text}");
+        assert!(!text.contains("aft_zoom"), "no zoom hint expected: {text}");
+    }
+
+    #[test]
+    fn enrich_handles_missing_file_gracefully() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![HybridResult {
+            file: dir.path().join("does-not-exist.rs"),
+            name: "ghost".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 0,
+            end_line: 9,
+            exported: false,
+            snippet: String::new(),
+            score: 0.5,
+            source: "semantic",
+            semantic_score: Some(0.5),
+            lexical_score: None,
+            hybrid_boosted: false,
+        }];
+        // Must not panic; header renders, no snippet body.
+        let _ = enrich_snippets_from_source(&mut results);
+        assert!(results[0].snippet.is_empty());
+        let text = format_result_sections(&results, dir.path());
+        assert!(text.contains("ghost [function]"));
+    }
+
+    #[test]
+    fn groups_render_in_rank_order_not_alphabetical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // zzz.rs holds the top hit, aaa.rs the second. Alphabetical grouping
+        // (the old BTreeMap bug) would put aaa.rs first; rank order keeps zzz.
+        let results = vec![
+            write_symbol_hit(dir.path(), "zzz.rs", "top", 1),
+            write_symbol_hit(dir.path(), "aaa.rs", "second", 1),
+        ];
+        let text = format_result_sections(&results, dir.path());
+        let zzz_at = text.find("zzz.rs").expect("zzz present");
+        let aaa_at = text.find("aaa.rs").expect("aaa present");
+        assert!(zzz_at < aaa_at, "top-ranked file must render first: {text}");
+    }
+
+    #[test]
+    fn more_available_appends_raise_topk_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let results = vec![write_symbol_hit(dir.path(), "a.rs", "foo", 1)];
+        let text = format_semantic_text(&results, dir.path(), true, false);
+        assert!(text.contains("More results available; raise topK to see more."));
     }
 
     #[test]

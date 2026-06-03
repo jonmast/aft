@@ -73,14 +73,6 @@ function createMockSemanticHarness(
   };
 }
 
-function parseStructuredOutput(output: string): Record<string, unknown> {
-  const marker = "\n\nStructured response:\n";
-  const json = output.includes(marker)
-    ? output.slice(output.indexOf(marker) + marker.length)
-    : output;
-  return JSON.parse(json) as Record<string, unknown>;
-}
-
 describe("semanticTools", () => {
   test("registers aft_search", () => {
     const { tools } = createMockSemanticHarness({}, () => ({ success: true }));
@@ -88,11 +80,11 @@ describe("semanticTools", () => {
     expect(Object.keys(tools)).toEqual(["aft_search"]);
   });
 
-  test("returns text plus structured response and sends semantic_search params", async () => {
+  test("returns ONLY the clean text (no structured JSON dump) and sends params", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
     const bridgeResponse = {
       success: true,
-      text: "src/auth.ts\nvalidateToken [function] lines 10-32 score 0.913",
+      text: "src/auth.ts\nvalidateToken [function] lines 10-32\n\nFound 1 result(s). [index: ready]",
       interpreted_as: "hybrid",
       semantic_status: "ready",
       more_available: true,
@@ -106,6 +98,7 @@ describe("semanticTools", () => {
           kind: "function",
           source: "hybrid",
           score: 0.913,
+          semantic_score: 0.9,
         },
       ],
     };
@@ -128,17 +121,13 @@ describe("semanticTools", () => {
         },
       },
     ]);
-    expect(output).toContain(bridgeResponse.text);
-    expect(output).toContain("Search status: more results available.");
-    const structured = parseStructuredOutput(output);
-    expect(structured.interpreted_as).toBe("hybrid");
-    expect(structured.semantic_status).toBe("ready");
-    expect(structured.more_available).toBe(true);
-    expect(structured.engine_capped).toBe(false);
-    expect(structured.fully_degraded).toBe(false);
-    expect(structured.warnings).toEqual(["short_query_rerouted"]);
-    const results = structured.results as Array<Record<string, unknown>>;
-    expect(results[0].source).toBe("hybrid");
+    // The agent gets exactly Rust's clean text — no JSON dump, no leaked
+    // score/semantic_score/source/path fields.
+    expect(output).toBe(bridgeResponse.text);
+    expect(output).not.toContain("Structured response");
+    expect(output).not.toContain("semantic_score");
+    expect(output).not.toContain("0.913");
+    expect(output).not.toContain('"source"');
   });
 
   test("rejects blank queries before permission or bridge calls", async () => {
@@ -156,11 +145,12 @@ describe("semanticTools", () => {
     expect(sendImpl).not.toHaveBeenCalled();
   });
 
-  test("renders all semantic honesty flags when text is present", async () => {
+  test("appends only degraded/partial flags (more-available/capped live in Rust text)", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
     const { tools } = createMockSemanticHarness({}, () => ({
       success: true,
-      text: "partial results",
+      // Rust text already carries the count + "more results available" note.
+      text: "partial results\n\nFound 2 result(s). [index: ready] More results available; raise topK to see more.",
       more_available: true,
       engine_capped: true,
       fully_degraded: true,
@@ -170,11 +160,14 @@ describe("semanticTools", () => {
 
     const output = await tools.aft_search.execute({ query: "auth", topK: 5 }, sdkCtx);
 
-    expect(output).toContain(
-      "Search status: more results available; enumeration capped; fully degraded; partial/incomplete.",
-    );
-    const structured = parseStructuredOutput(output);
-    expect(structured.complete).toBe(false);
+    // Rust's text is preserved verbatim...
+    expect(output).toContain("partial results");
+    expect(output).toContain("More results available; raise topK to see more.");
+    // ...and only the flags NOT in text are appended (degraded/partial), not
+    // a duplicate "more results available; enumeration capped".
+    expect(output).toContain("Search status: fully degraded; partial/incomplete.");
+    expect(output).not.toContain("enumeration capped");
+    expect(output).not.toContain("Structured response");
   });
 
   test("throws semantic runtime errors with code and message", async () => {

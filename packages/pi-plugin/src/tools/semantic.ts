@@ -31,6 +31,19 @@ function semanticHonestyNote(response: Record<string, unknown>, theme: Theme): s
   return notes.length > 0 ? theme.fg("warning", `Search status: ${notes.join("; ")}.`) : undefined;
 }
 
+/**
+ * Degraded/partial flags NOT already conveyed by Rust's `text` (which carries
+ * the count line and the "more results available; raise topK" note). Appended
+ * to the agent text so the agent doesn't over-trust degraded results. The rich
+ * TUI renderer keeps its own fuller status line separately.
+ */
+function extraAgentHonestyNote(response: Record<string, unknown>): string | undefined {
+  const notes: string[] = [];
+  if (response.fully_degraded === true) notes.push("fully degraded");
+  if (response.complete === false) notes.push("partial/incomplete");
+  return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
+}
+
 const SearchParams = Type.Object({
   query: Type.String({
     description:
@@ -220,10 +233,15 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       // Pi has no grep-style permission prompt; callBridge throws success:false
       // envelopes so the host renders them via renderErrorResult below.
       const response = await callBridge(bridge, "semantic_search", req, extCtx);
-      return textResult(
-        (response.text as string | undefined) ?? JSON.stringify(response, null, 2),
-        response,
-      );
+      // Rust's `text` is the clean agent-facing rendering (ranked rows,
+      // rank-tiered snippets, count line, more-available + zoom hints). The
+      // full structured response still flows to the rich TUI renderer below.
+      // Only degraded/partial flags that `text` doesn't already carry are
+      // appended to the agent text.
+      let agentText = (response.text as string | undefined) ?? JSON.stringify(response, null, 2);
+      const extra = extraAgentHonestyNote(response);
+      if (extra) agentText = `${agentText}\n${extra}`;
+      return textResult(agentText, response);
     },
     renderCall(args, theme, context) {
       return renderSemanticCall(args, theme, context);

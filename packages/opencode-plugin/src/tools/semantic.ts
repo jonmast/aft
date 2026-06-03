@@ -15,6 +15,18 @@ function semanticHonestyNote(response: Record<string, unknown>): string | undefi
   return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
 }
 
+/**
+ * Honesty flags NOT already conveyed by Rust's `text` (which carries the count
+ * line and the "more results available; raise topK" note). Only degraded /
+ * partial states need appending so the agent doesn't over-trust the results.
+ */
+function extraHonestyNote(response: Record<string, unknown>): string | undefined {
+  const notes: string[] = [];
+  if (response.fully_degraded === true) notes.push("fully degraded");
+  if (response.complete === false) notes.push("partial/incomplete");
+  return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
+}
+
 type ToolArg = ToolDefinition["args"][string];
 
 function arg(schema: unknown): ToolArg {
@@ -91,23 +103,19 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         throw new Error(code ? `semantic_search: ${code} — ${message}` : message);
       }
 
-      const honestyNote = semanticHonestyNote(response);
-      if (
-        typeof response.text === "string" &&
-        response.status === "disabled" &&
-        Array.isArray(response.results) &&
-        response.results.length === 0
-      ) {
-        return honestyNote ? `${response.text}\n${honestyNote}` : response.text;
-      }
-
-      const structured = JSON.stringify(response, null, 2);
+      // Rust's `text` is the agent-facing rendering: ranked rows, rank-tiered
+      // snippets, count line, more-available note, and a conditional zoom hint.
+      // We deliberately do NOT dump the structured response — the full-path,
+      // score, semantic_score, hybrid_boosted JSON was pure clutter the agent
+      // never acted on (and inflated token cost). Honesty flags (degraded /
+      // partial) that aren't already in `text` are appended as a short note.
       if (typeof response.text === "string" && response.text.length > 0) {
-        const display = honestyNote ? `${response.text}\n${honestyNote}` : response.text;
-        return `${display}\n\nStructured response:\n${structured}`;
+        const note = extraHonestyNote(response);
+        return note ? `${response.text}\n${note}` : response.text;
       }
 
-      return honestyNote ? `${honestyNote}\n\nStructured response:\n${structured}` : structured;
+      // No text (shouldn't happen on success) — fall back to a minimal note.
+      return semanticHonestyNote(response) ?? "No results.";
     },
   };
 
