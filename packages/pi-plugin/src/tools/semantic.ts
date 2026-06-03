@@ -238,7 +238,12 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       // full structured response still flows to the rich TUI renderer below.
       // Only degraded/partial flags that `text` doesn't already carry are
       // appended to the agent text.
-      let agentText = (response.text as string | undefined) ?? JSON.stringify(response, null, 2);
+      // Never fall back to JSON.stringify(response) — that re-opens the exact
+      // structured dump the redesign removed (full paths/scores/ids the agent
+      // never acts on). On the should-never-happen path where Rust returns
+      // success without `text`, emit a minimal note instead, matching the
+      // OpenCode plugin's fallback.
+      let agentText = (response.text as string | undefined) ?? "No results.";
       const extra = extraAgentHonestyNote(response);
       if (extra) agentText = `${agentText}\n${extra}`;
       return textResult(agentText, response);

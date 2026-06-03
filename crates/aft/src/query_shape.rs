@@ -127,6 +127,19 @@ pub fn extract_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
     }
 }
 
+/// Lexical tokens for a short natural-language concept routed to Hybrid (e.g.
+/// "parse imports"). `extract_tokens` returns nothing for NL (its words are not
+/// code identifiers), but a short two-word concept is frequently a literal code
+/// phrase the trigram lane can match. Split on whitespace and keep words of at
+/// least 3 chars (the trigram floor).
+pub fn extract_short_nl_lexical_tokens(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter(|word| word.chars().count() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn pre_tier_exempt(query: &str) -> Option<&'static str> {
     if let Some(kind) = check_url_exemption(query) {
         return Some(kind);

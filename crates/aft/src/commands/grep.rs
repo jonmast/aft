@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::context::AppContext;
@@ -116,7 +116,14 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> String {
-    let mut groups: BTreeMap<String, Vec<&GrepMatch>> = BTreeMap::new();
+    // Preserve the incoming match order (callers sort by mtime-desc upstream via
+    // sort_grep_matches_by_mtime_desc). A BTreeMap here would re-sort groups
+    // alphabetically by path and silently discard that ordering — both wasting
+    // the upstream sort and giving a different ordering contract than the
+    // semantic path, which groups in result order. Group by file preserving
+    // first-appearance order instead.
+    let mut group_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&GrepMatch>> = HashMap::new();
 
     for grep_match in &result.matches {
         // Use relative path within project, absolute otherwise
@@ -126,12 +133,16 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
             .unwrap_or(&grep_match.file)
             .display()
             .to_string();
+        if !groups.contains_key(&display_path) {
+            group_order.push(display_path.clone());
+        }
         groups.entry(display_path).or_default().push(grep_match);
     }
 
     let mut sections = Vec::new();
 
-    for (file, matches) in groups {
+    for file in &group_order {
+        let matches = &groups[file];
         let mut section = file.clone();
         let display_count = if matches.len() > MAX_MATCHES_PER_FILE {
             MAX_DISPLAY_MATCHES_PER_FILE

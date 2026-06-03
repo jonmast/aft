@@ -12,9 +12,7 @@ use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
 };
-use crate::semantic_index::{
-    is_onnx_runtime_unavailable, is_semantic_indexed_extension, EmbeddingModel, SemanticResult,
-};
+use crate::semantic_index::{is_onnx_runtime_unavailable, EmbeddingModel, SemanticResult};
 use crate::symbols::SymbolKind;
 
 const DEFAULT_TOP_K: usize = 10;
@@ -202,6 +200,14 @@ fn choose_mode(
                 return SearchMode::Literal;
             }
             if shape.kind == QueryKind::NaturalLanguage {
+                // Short NL concepts (e.g. "parse imports", "retry backoff") are
+                // frequently literal code tokens the trigram lane nails exactly.
+                // Run them as Hybrid so lexical still contributes; only longer
+                // NL phrases go pure semantic. One extra trigram lookup.
+                let word_count = query.split_whitespace().count();
+                if lexical_ready && word_count <= 2 {
+                    return SearchMode::Hybrid;
+                }
                 return SearchMode::Semantic;
             }
             if lexical_ready {
@@ -1039,22 +1045,28 @@ fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> L
         };
     };
 
-    if !shape.weights.should_use_lexical {
-        return LexicalCollection {
-            files: Vec::new(),
-            ready: true,
-            engine_capped: false,
-        };
-    }
-
-    let tokens = query_shape::extract_tokens(query, shape);
+    // No `should_use_lexical` gate here: collect_lexical_files is only called
+    // when choose_mode picked Hybrid, which already means we want the lexical
+    // lane. The shape weight was a second, conflicting gate that suppressed
+    // lexical for short NL concepts routed to Hybrid.
+    //
+    // NL shapes yield no tokens from extract_tokens (their words aren't code
+    // identifiers), but a short NL concept routed to Hybrid (e.g. "parse
+    // imports") is exactly the case where the literal words should hit the
+    // trigram lane — so use the short-NL extractor there.
+    let tokens = if shape.kind == QueryKind::NaturalLanguage {
+        query_shape::extract_short_nl_lexical_tokens(query)
+    } else {
+        query_shape::extract_tokens(query, shape)
+    };
     let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
     let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
-    let ranked = index.lexical_rank_with_stats(
-        &query_trigrams,
-        Some(&is_semantic_indexed_extension),
-        LEXICAL_ENUMERATION_LIMIT,
-    );
+    // No extension filter: the trigram index already covers the project's text
+    // files. Gating the lexical candidate set on the *semantic* extension
+    // allow-list made named config/doc files (Cargo.toml, README.md,
+    // package.json) structurally unreachable in hybrid mode — exactly the
+    // literal-filename hits the lexical lane exists to catch.
+    let ranked = index.lexical_rank_with_stats(&query_trigrams, None, LEXICAL_ENUMERATION_LIMIT);
     LexicalCollection {
         files: ranked.files,
         ready: true,
@@ -1314,6 +1326,23 @@ fn format_building_lexical_text(
     )
 }
 
+/// Top semantic cosine below this floor means the embedder found nothing
+/// genuinely relevant — the query likely whiffed. We don't show the raw score
+/// (uncalibrated for ranking), but its absolute floor is a real signal: an
+/// all-weak result set looks identical to a strong one without it.
+const WEAK_MATCH_COSINE_FLOOR: f32 = 0.35;
+
+/// True when the best result's raw semantic cosine is below the weak floor.
+/// Uses `semantic_score` (the raw cosine), not the fused `score`. Lexical-only
+/// top results have no cosine and are not flagged here (lexical relevance is
+/// judged differently).
+fn results_are_low_confidence(results: &[HybridResult]) -> bool {
+    results
+        .first()
+        .and_then(|r| r.semantic_score)
+        .is_some_and(|cosine| cosine < WEAK_MATCH_COSINE_FLOOR)
+}
+
 fn format_semantic_text(
     results: &[HybridResult],
     project_root: &Path,
@@ -1321,16 +1350,22 @@ fn format_semantic_text(
     snippets_incomplete: bool,
 ) -> String {
     if results.is_empty() {
-        return "Found 0 results. [index: ready]".to_string();
+        return "Found 0 results.".to_string();
     }
 
     let mut text = format_result_sections(results, project_root);
-    text.push_str(&format!(
-        "\n\nFound {} result(s). [index: ready]",
-        results.len()
-    ));
+    // Drop the unconditional "[index: ready]" tag — it was pure per-call tax on
+    // the common path. Degraded/building/unavailable paths carry their own
+    // distinct "[semantic: ...]" labels, so absence of a label means ready.
+    text.push_str(&format!("\n\nFound {} result(s).", results.len()));
     if more_available {
         text.push_str(" More results available; raise topK to see more.");
+    }
+    // Recover the "did the search whiff" signal we lost by hiding the score:
+    // one coarse flag when the top match is weak, so the agent reformulates or
+    // falls back to grep instead of trusting a uniformly-weak ranking.
+    if results_are_low_confidence(results) {
+        text.push_str("\nTop match is weak — consider rephrasing or using grep for exact terms.");
     }
     // Only when snippet content was actually withheld (omitted for rank 4+, or
     // truncated within the top 3) — so the hint appears exactly when it's
@@ -1360,7 +1395,10 @@ fn format_grep_search_text(
 /// header only and the agent zooms the ones it cares about.
 fn snippet_line_budget(global_rank: usize) -> usize {
     match global_rank {
-        0 => 10,
+        // Rank 0 gets a fuller preview: 10 lines was often half a real function,
+        // forcing a zoom anyway and defeating the "preview saves a follow-up"
+        // goal. 20 (capped at the symbol's real length) clears most functions.
+        0 => 20,
         1 | 2 => 5,
         _ => 0,
     }
@@ -1421,7 +1459,10 @@ fn enrich_snippets_from_source(results: &mut [HybridResult]) -> bool {
         let mut snippet = lines[start..start + shown].join("\n");
         let remaining = range_len - shown;
         if remaining > 0 {
-            snippet.push_str(&format!("\n+{remaining} more"));
+            // "lines" is load-bearing: a bare "+N more" reads as "N more
+            // results" to a weak model, prompting a wrong topK bump. This is
+            // N more lines of THIS symbol's body — zoom to see them.
+            snippet.push_str(&format!("\n+{remaining} more lines"));
             incomplete = true;
         }
         result.snippet = snippet;
@@ -1457,6 +1498,11 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
         .map(|file| {
             let mut section = file.clone();
 
+            // Three distinct indent levels disambiguate the three roles for a
+            // weak model at a glance: file path at col 0 (with its `/` and
+            // extension), symbol header at 2 spaces, snippet body at 6. Without
+            // this, file paths and symbol headers were both at col 0 and could
+            // only be told apart by parsing the "[kind] lines X-Y" suffix.
             for result in &groups[file] {
                 if result.source == "lexical" {
                     // Whole-file lexical match (no specific symbol).
@@ -1464,10 +1510,10 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
                     continue;
                 }
                 if matches!(result.kind, SymbolKind::FileSummary) {
-                    section.push_str(&format!("\n{} [file summary]", result.name));
+                    section.push_str(&format!("\n  {} [file summary]", result.name));
                 } else {
                     section.push_str(&format!(
-                        "\n{} [{}] lines {}-{}",
+                        "\n  {} [{}] lines {}-{}",
                         result.name,
                         symbol_kind_label(&result.kind),
                         display_line_number(result.start_line),
@@ -1476,7 +1522,7 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
                 }
                 if !result.snippet.trim().is_empty() {
                     for line in result.snippet.lines() {
-                        section.push_str("\n    ");
+                        section.push_str("\n      ");
                         section.push_str(line);
                     }
                 }
@@ -1746,6 +1792,47 @@ mod tests {
     }
 
     #[test]
+    fn short_nl_concept_routes_to_hybrid_when_lexical_ready() {
+        // "parse imports" classifies as a two-word lowercase NL concept, but it
+        // is a literal code phrase the trigram lane can hit. With lexical ready
+        // it must route to Hybrid (run the lexical lane), not pure Semantic.
+        let shape = query_shape::classify("parse imports");
+        assert_eq!(shape.kind, QueryKind::NaturalLanguage);
+        let mut warnings = Vec::new();
+        let mode = choose_mode(
+            SearchHint::Auto,
+            "parse imports",
+            &shape,
+            true,
+            &mut warnings,
+        );
+        assert_eq!(mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn long_nl_phrase_stays_semantic() {
+        // A longer NL phrase (>2 words) is a genuine concept query → pure
+        // Semantic; the lexical lane would only add noise.
+        let q = "how does the bridge resolve the binary";
+        let shape = query_shape::classify(q);
+        assert_eq!(shape.kind, QueryKind::NaturalLanguage);
+        let mut warnings = Vec::new();
+        let mode = choose_mode(SearchHint::Auto, q, &shape, true, &mut warnings);
+        assert_eq!(mode, SearchMode::Semantic);
+    }
+
+    #[test]
+    fn short_nl_extracts_lexical_tokens() {
+        // The short-NL Hybrid path needs tokens; extract_tokens returns none for
+        // NL, so collect_lexical_files uses the short-NL extractor.
+        let tokens = query_shape::extract_short_nl_lexical_tokens("parse imports");
+        assert_eq!(tokens, vec!["parse".to_string(), "imports".to_string()]);
+        // Sub-3-char words are dropped (trigram floor).
+        let tokens2 = query_shape::extract_short_nl_lexical_tokens("go to");
+        assert!(tokens2.is_empty());
+    }
+
+    #[test]
     fn building_status_returns_lexical_fallback_results() {
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/lib.rs");
@@ -1996,36 +2083,26 @@ mod tests {
     #[test]
     fn snippets_are_rank_tiered_top_three_only_from_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Five hits, each a 20-line body, in distinct files so grouping does not
-        // merge them. Rank order = vector order (already sorted).
+        // Five hits, each a 30-line body, in distinct files so grouping does not
+        // merge them. Rank order = vector order (already sorted). Budgets:
+        // rank 0 = 20 lines (+10 more lines), ranks 1-2 = 5 lines (+25 more
+        // lines), rank 3+ = header only.
         let mut results: Vec<HybridResult> = (0..5)
-            .map(|i| write_symbol_hit(dir.path(), &format!("f{i}.rs"), &format!("fn{i}"), 20))
+            .map(|i| write_symbol_hit(dir.path(), &format!("f{i}.rs"), &format!("fn{i}"), 30))
             .collect();
         let incomplete = enrich_snippets_from_source(&mut results);
         assert!(incomplete);
         let text = format_semantic_text(&results, dir.path(), false, incomplete);
 
-        // Rank 0 → 10 of 20 lines, +10 more. Ranks 1,2 → 5 of 20, +15 more.
         assert!(text.contains("fn0 [function]"));
-        assert!(text.contains("+10 more"));
-        assert!(text.contains("+15 more"));
+        // "lines" wording is load-bearing (vs "+N more" reading as results).
+        assert!(text.contains("+10 more lines"));
+        assert!(text.contains("+25 more lines"));
         // Rank 0 genuinely shows MORE than ranks 1-2 (gradient not inverted).
-        assert!(
-            results[0]
-                .snippet
-                .lines()
-                .filter(|l| l.starts_with("line"))
-                .count()
-                == 10
-        );
-        assert!(
-            results[1]
-                .snippet
-                .lines()
-                .filter(|l| l.starts_with("line"))
-                .count()
-                == 5
-        );
+        let body_lines =
+            |r: &HybridResult| r.snippet.lines().filter(|l| l.starts_with("line")).count();
+        assert_eq!(body_lines(&results[0]), 20);
+        assert_eq!(body_lines(&results[1]), 5);
         // Ranks 3,4 → header only, no body lines.
         assert!(
             results[3].snippet.is_empty(),
@@ -2037,6 +2114,34 @@ mod tests {
         );
         // Zoom hint present because snippets were withheld.
         assert!(text.contains("aft_zoom <file> <symbol>"));
+    }
+
+    #[test]
+    fn weak_top_match_emits_low_confidence_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut hit = write_symbol_hit(dir.path(), "a.rs", "foo", 2);
+        // Top semantic cosine below the weak floor.
+        hit.semantic_score = Some(0.22);
+        hit.score = 0.22;
+        let results = vec![hit];
+        let text = format_semantic_text(&results, dir.path(), false, false);
+        assert!(
+            text.contains("Top match is weak"),
+            "expected weak-match note, got: {text}"
+        );
+    }
+
+    #[test]
+    fn strong_top_match_has_no_low_confidence_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut hit = write_symbol_hit(dir.path(), "a.rs", "foo", 2);
+        hit.semantic_score = Some(0.72);
+        hit.score = 0.72;
+        let results = vec![hit];
+        let text = format_semantic_text(&results, dir.path(), false, false);
+        assert!(!text.contains("Top match is weak"), "got: {text}");
+        // And no unconditional "[index: ready]" tax on the happy path.
+        assert!(!text.contains("[index: ready]"), "got: {text}");
     }
 
     #[test]
