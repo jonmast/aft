@@ -1,32 +1,20 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { z } from "zod";
 import type { PluginContext } from "../types.js";
-import { callBridge, resolvePathFromProjectRoot, resolveProjectRoot } from "./_shared.js";
+import {
+  callBridge,
+  expandTilde,
+  resolvePathFromProjectRoot,
+  resolveProjectRoot,
+} from "./_shared.js";
 import {
   askGlobPermission,
   askGrepPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
 } from "./permissions.js";
-
-/**
- * Expand a leading `~` to the user's home directory. Mirrors shell-style
- * expansion so agent calls like `grep ... in ~/Work/...` resolve before
- * any permission check or bridge call sees the literal tilde. Required
- * because Node's `path.resolve` treats `~` as a literal directory name,
- * so `~/foo` ends up resolved to `<cwd>/~/foo`.
- */
-function expandTilde(input: string): string {
-  if (!input || !input.startsWith("~")) return input;
-  if (input === "~") return os.homedir();
-  if (input.startsWith("~/") || input.startsWith(`~${path.sep}`)) {
-    return path.resolve(os.homedir(), input.slice(2));
-  }
-  return input;
-}
 
 type ToolArg = ToolDefinition["args"][string];
 type SearchPathKind = "file" | "directory";

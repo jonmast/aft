@@ -17,6 +17,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
@@ -315,10 +316,29 @@ export async function resolveProjectRoot(
   return projectRootFor(runtime);
 }
 
-/** Resolve a user path exactly as a bridge request will: absolute paths are
- * preserved; relative paths are rooted at the session/project root. */
+/**
+ * Expand a leading `~` to the user's home directory. Node's `path.resolve`
+ * treats `~` as a literal segment, so `~/foo` would otherwise resolve to
+ * `<projectRoot>/~/foo`. Applied before any absolute/relative decision so all
+ * file tools (read/write/edit/outline/zoom/delete/refactor/imports/safety)
+ * accept `~/...` the same way the search tools already do.
+ */
+export function expandTilde(input: string): string {
+  if (!input || !input.startsWith("~")) return input;
+  if (input === "~") return os.homedir();
+  if (input.startsWith("~/") || input.startsWith(`~${path.sep}`)) {
+    return path.resolve(os.homedir(), input.slice(2));
+  }
+  // Leave `~user` forms untouched — we don't resolve other users' homes.
+  return input;
+}
+
+/** Resolve a user path exactly as a bridge request will: `~` expands to home,
+ * absolute paths are preserved; relative paths are rooted at the
+ * session/project root. */
 export function resolvePathFromProjectRoot(projectRoot: string, target: string): string {
-  return path.isAbsolute(target) ? target : path.resolve(projectRoot, target);
+  const expanded = expandTilde(target);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(projectRoot, expanded);
 }
 
 export async function resolvePathArg(

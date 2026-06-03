@@ -1,7 +1,14 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
+import { homedir } from "node:os";
+import { resolve, sep } from "node:path";
 import { tool } from "@opencode-ai/plugin";
-import { coerceOptionalInt, optionalInt } from "../tools/_shared.js";
+import {
+  coerceOptionalInt,
+  expandTilde,
+  optionalInt,
+  resolvePathFromProjectRoot,
+} from "../tools/_shared.js";
 
 const z = tool.schema;
 
@@ -65,5 +72,49 @@ describe("coerceOptionalInt", () => {
     expect(() => coerceOptionalInt(24.5, "x", 1, 100)).toThrow(
       "x must be an integer between 1 and 100",
     );
+  });
+});
+
+describe("expandTilde", () => {
+  test("expands a bare ~ to home", () => {
+    expect(expandTilde("~")).toBe(homedir());
+  });
+
+  test("expands ~/path to home-rooted path", () => {
+    expect(expandTilde("~/Work/OSS/toon/SPEC.md")).toBe(
+      resolve(homedir(), "Work/OSS/toon/SPEC.md"),
+    );
+  });
+
+  test("expands ~<sep>path on the platform separator", () => {
+    expect(expandTilde(`~${sep}Work`)).toBe(resolve(homedir(), "Work"));
+  });
+
+  test("leaves absolute, relative, and ~user paths untouched", () => {
+    expect(expandTilde("/abs/path")).toBe("/abs/path");
+    expect(expandTilde("rel/path")).toBe("rel/path");
+    expect(expandTilde("~otheruser/foo")).toBe("~otheruser/foo");
+    expect(expandTilde("")).toBe("");
+  });
+});
+
+describe("resolvePathFromProjectRoot", () => {
+  const root = "/tmp/project-root";
+
+  test("expands ~/ before resolving (regression: ~ was joined as a literal segment)", () => {
+    // The bug: resolvePathFromProjectRoot("~/Work/...") produced
+    // "<projectRoot>/~/Work/..." because path.resolve treats ~ literally.
+    expect(resolvePathFromProjectRoot(root, "~/Work/OSS/toon/SPEC.md")).toBe(
+      resolve(homedir(), "Work/OSS/toon/SPEC.md"),
+    );
+    expect(resolvePathFromProjectRoot(root, "~/Work/OSS/toon/SPEC.md")).not.toContain(`${root}/~`);
+  });
+
+  test("preserves absolute paths", () => {
+    expect(resolvePathFromProjectRoot(root, "/abs/file.ts")).toBe("/abs/file.ts");
+  });
+
+  test("roots relative paths at the project root", () => {
+    expect(resolvePathFromProjectRoot(root, "src/file.ts")).toBe(resolve(root, "src/file.ts"));
   });
 });
