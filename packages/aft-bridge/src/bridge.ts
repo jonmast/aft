@@ -778,7 +778,9 @@ export class BinaryBridge {
     const snapshot = frame.snapshot;
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
     this.cachedStatus = snapshot as StatusSnapshot;
-    this.logVia("Received status_changed push frame; cached AFT status snapshot");
+    // Status-changed frames arrive frequently (every Tier-2 completion,
+    // semantic progress tick, watcher refresh). Logging each one floods the
+    // plugin log, so this cache update is intentionally silent.
     for (const listener of this.statusListeners) {
       this.deliverStatusSnapshot(listener, this.cachedStatus);
     }
