@@ -118,6 +118,12 @@ export function isEmptyParam(value: unknown): boolean {
  * file tree or wait on external I/O (embedding API, index build). The
  * goal is to absorb slow first-call spikes without masking real hangs.
  */
+// Bridge transport budget for bash-family calls. Rust bash returns `running`
+// promptly and plugin-side polling handles task lifetime, so transport only
+// covers spawn/control RPC round-trips. Keep this centralized so every
+// bash-family RPC also keeps the shared bridge alive on transport timeout.
+export const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
+
 export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
   callers: 60_000,
   trace_to: 60_000,
@@ -410,6 +416,26 @@ export async function callBridge(
   );
   ingestBgCompletions(runtime.sessionID, response.bg_completions);
   return response;
+}
+
+/**
+ * Send a bash-family command without restarting the shared bridge on transport
+ * timeout. Bash has its own child-process timeout/watchdog handling; a late
+ * transport response must not sacrifice the warm shared bridge and reject
+ * unrelated sibling requests.
+ */
+export async function callBashBridge(
+  ctx: PluginContext,
+  runtime: ToolRuntime,
+  command: string,
+  params: Record<string, unknown> = {},
+  options?: BridgeRequestOptions,
+): Promise<Record<string, unknown>> {
+  return await callBridge(ctx, runtime, command, params, {
+    transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
+    ...options,
+    keepBridgeOnTimeout: true,
+  });
 }
 
 /**

@@ -220,6 +220,20 @@ interface RenderContextLike {
   isError: boolean;
 }
 
+async function callBashBridge(
+  bridge: BinaryBridge,
+  command: string,
+  params: Record<string, unknown> = {},
+  extCtx?: ExtensionContext,
+  options?: BridgeRequestOptions,
+): Promise<Record<string, unknown>> {
+  return await callBridge(bridge, command, params, extCtx, {
+    transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
+    ...options,
+    keepBridgeOnTimeout: true,
+  });
+}
+
 /** Truncate output to last N visual lines for terminal width. */
 function truncateToVisualLines(text: string, maxLines: number): string {
   const lines = text.split("\n");
@@ -297,7 +311,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       }
 
       let streamed = "";
-      const response = await callBridge(
+      const response = await callBashBridge(
         bridge,
         "bash",
         {
@@ -315,13 +329,11 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
         },
         extCtx,
         {
-          transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
           // Rust bash has its own watchdog that kills the child shell on the
           // bash-level timeout and returns a normal timed_out response well
           // before our transport timeout fires. If we hit the transport
           // deadline anyway it means the response is just late — don't
           // sacrifice the bridge (and all its warm state) for that.
-          keepBridgeOnTimeout: true,
           onProgress: ({ text }) => {
             streamed += text;
             // Stream truncated output to avoid overwhelming the UI
@@ -363,7 +375,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
           timeout !== undefined ? Math.min(timeout, foregroundWaitMs) : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
-          const status = await callBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
+          const status = await callBashBridge(bridge, "bash_status", { task_id: taskId }, extCtx);
           if (status.success === false) {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
@@ -377,7 +389,12 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
             });
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
-            const promoted = await callBridge(bridge, "bash_promote", { task_id: taskId }, extCtx);
+            const promoted = await callBashBridge(
+              bridge,
+              "bash_promote",
+              { task_id: taskId },
+              extCtx,
+            );
             if (promoted.success === false) {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
@@ -546,7 +563,7 @@ export function createBashWatchTool(ctx: PluginContext) {
         markExplicitControl(sessionId, params.task_id, false);
         let registered: Record<string, unknown>;
         try {
-          registered = await callBridge(bridge, "bash_notify", notifyParams, extCtx);
+          registered = await callBashBridge(bridge, "bash_notify", notifyParams, extCtx);
         } catch (err) {
           unmarkExplicitControl(sessionId, params.task_id);
           throw err;
@@ -608,7 +625,7 @@ export function createBashWriteTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const data = await callBridge(
+      const data = await callBashBridge(
         bridge,
         "bash_write",
         { task_id: params.task_id, input: params.input },
@@ -638,7 +655,7 @@ export function createBashKillTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const data = await callBridge(bridge, "bash_kill", { task_id: params.task_id }, extCtx);
+      const data = await callBashBridge(bridge, "bash_kill", { task_id: params.task_id }, extCtx);
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
@@ -701,7 +718,7 @@ async function bashStatusSnapshot(
   outputMode: string | undefined,
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  return await callBridge(
+  return await callBashBridge(
     bridge,
     "bash_status",
     { task_id: taskId, output_mode: outputMode },

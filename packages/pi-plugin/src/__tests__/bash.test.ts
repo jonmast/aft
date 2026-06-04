@@ -213,8 +213,12 @@ describe("bash tool adapter", () => {
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
     const bridge = {
-      send: async (command: string, params: Record<string, unknown>) => {
-        calls.push([command, params]);
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
         if (command === "bash") return { success: true, status: "running", task_id: "task-inline" };
         return {
           success: true,
@@ -241,6 +245,10 @@ describe("bash tool adapter", () => {
 
     expect(result.content[0].text).toBe("done");
     expect(calls.map((call) => (call as [string])[0])).toEqual(["bash", "bash_status"]);
+    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
+      expect(call[2].keepBridgeOnTimeout).toBe(true);
+      expect(call[2].transportTimeoutMs).toBe(30_000);
+    }
     expect((calls[0] as [string, Record<string, unknown>])[1].notify_on_completion).toBe(false);
   });
 
@@ -249,8 +257,12 @@ describe("bash tool adapter", () => {
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
     const bridge = {
-      send: async (command: string, params: Record<string, unknown>) => {
-        calls.push([command, params]);
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
         if (command === "bash")
           return { success: true, status: "running", task_id: "task-promote" };
         if (command === "bash_status") return { success: true, status: "running" };
@@ -277,6 +289,10 @@ describe("bash tool adapter", () => {
       "bash_status",
       "bash_promote",
     ]);
+    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
+      expect(call[2].keepBridgeOnTimeout).toBe(true);
+      expect(call[2].transportTimeoutMs).toBe(30_000);
+    }
   });
 
   test("BashSpawnHook modifies command before bridge call", async () => {
@@ -478,6 +494,54 @@ describe("bash tool adapter", () => {
     await expect(
       bashTool.execute("test-call", { command: "rm -rf /" }, undefined, undefined, extCtx),
     ).rejects.toThrow("Permission ask reached Pi adapter");
+  });
+
+  test("bash-family control RPCs keep the bridge on transport timeout", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: unknown[] = [];
+    const bridge = {
+      send: async (...args: unknown[]) => {
+        calls.push(args);
+        const command = args[0];
+        if (command === "bash_notify") return { success: true, watch_id: "watch-1" };
+        if (command === "bash_write") return { success: true, bytes_written: 3 };
+        if (command === "bash_kill") return { success: true, status: "killed" };
+        return { success: true, status: "running", duration_ms: 0 };
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(api, makeMockContext(bridge));
+    const extCtx = { cwd: "/test" };
+
+    await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-control" }, undefined, undefined, extCtx);
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-control", pattern: "ready", background: true },
+        undefined,
+        undefined,
+        extCtx,
+      );
+    await tools
+      .get("bash_write")!
+      .execute("call", { task_id: "bash-control", input: "abc" }, undefined, undefined, extCtx);
+    await tools
+      .get("bash_kill")!
+      .execute("call", { task_id: "bash-control" }, undefined, undefined, extCtx);
+
+    expect(calls.map((call) => (call as [string])[0])).toEqual([
+      "bash_status",
+      "bash_notify",
+      "bash_write",
+      "bash_kill",
+    ]);
+    for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
+      expect(call[2].keepBridgeOnTimeout).toBe(true);
+      expect(call[2].transportTimeoutMs).toBe(30_000);
+    }
   });
 
   test("bash_watch pattern substring returns waited matched details", async () => {

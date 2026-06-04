@@ -14,13 +14,12 @@ import { resolveBashConfig } from "../config.js";
 import { disposePtyTerminal, getOrCreatePtyTerminal, readPtyBytes } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt, projectRootFor } from "./_shared.js";
+import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
 
 const z = tool.schema;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
-const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
@@ -85,7 +84,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         markExplicitControl(context.sessionID, taskId, false);
         let registered: Record<string, unknown>;
         try {
-          registered = await callBridge(ctx, context, "bash_notify", notifyParams);
+          registered = await callBashBridge(ctx, context, "bash_notify", notifyParams);
         } catch (err) {
           unmarkExplicitControl(context.sessionID, taskId);
           throw err;
@@ -161,7 +160,7 @@ async function bashStatusSnapshot(
   outputMode: string | undefined,
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  const data = await callBridge(
+  const data = await callBashBridge(
     ctx,
     runtime,
     "bash_status",
@@ -186,10 +185,7 @@ export async function waitForBashStatus(
   let spillCursor: OutputCursor = { output: 0, stderr: 0, combined: 0 };
   let scanText = "";
   let scanBaseOffset = 0;
-  const bridgeOptions: BridgeRequestOptions = {
-    keepBridgeOnTimeout: true,
-    transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
-  };
+  const bridgeOptions: BridgeRequestOptions = {};
   markTaskWaiting(runtime.sessionID, taskId);
   let sawTerminal = false;
   try {

@@ -13,7 +13,7 @@ import {
 } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt, projectRootFor } from "./_shared.js";
+import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -25,14 +25,6 @@ const METADATA_PREVIEW_LIMIT = 30 * 1024;
 // The value is resolved per-call from bash config (default 8000ms, floored at
 // 5000ms) via resolveBashConfig().foreground_wait_window_ms.
 const FOREGROUND_POLL_INTERVAL_MS = 100;
-// Bridge transport timeout for `bash` calls. The Rust handler returns a
-// `running` status immediately and the plugin polls separately, so transport
-// only needs to cover spawn + protocol round-trip. 30s is conservative for
-// Rust-side spawn (project_root resolution, bash_background registry write,
-// LSP integration overhead). NOT a function of args.timeout — explicit short
-// timeouts kill the task in Rust, not via transport. See council audit
-// `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.
-const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 // Default hard-kill cap when caller doesn't pass `args.timeout`. Mirrors the
 // Rust-side `DEFAULT_BG_TIMEOUT` (30 minutes). Used as the subagent foreground
 // poll-window when no explicit timeout was provided — subagents cannot survive
@@ -47,7 +39,7 @@ interface PermissionAsk {
   always: string[];
 }
 
-type BridgeCaller = typeof callBridge;
+type BridgeCaller = typeof callBashBridge;
 
 async function withPermissionLoop(
   ctx: PluginContext,
@@ -202,15 +194,8 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
           pty_cols: args.ptyCols,
           permissions_requested: true,
         },
-        callBridge,
+        callBashBridge,
         {
-          transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
-          // Rust bash has its own watchdog that kills the child shell on the
-          // bash-level timeout (`args.timeout`) and returns a normal timed_out
-          // response well before our transport timeout fires. If we hit the
-          // transport deadline anyway it means the response is just late —
-          // don't sacrifice the bridge (and all its warm state) for that.
-          keepBridgeOnTimeout: true,
           onProgress: ({ text }) => {
             accumulatedOutput = preview(accumulatedOutput + text);
             metadata?.({ output: accumulatedOutput, description });
@@ -266,7 +251,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
             : foregroundWaitMs;
         const startedAt = Date.now();
         while (true) {
-          const status = await callBridge(ctx, context, "bash_status", { task_id: taskId });
+          const status = await callBashBridge(ctx, context, "bash_status", { task_id: taskId });
           if (status.success === false) {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
@@ -287,7 +272,9 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
               await sleep(FOREGROUND_POLL_INTERVAL_MS);
               continue;
             }
-            const promoted = await callBridge(ctx, context, "bash_promote", { task_id: taskId });
+            const promoted = await callBashBridge(ctx, context, "bash_promote", {
+              task_id: taskId,
+            });
             if (promoted.success === false) {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");
             }
@@ -394,7 +381,7 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
         .describe("Background task ID returned by bash({ background: true }), e.g. bash-6b454047."),
     },
     execute: async (args, context) => {
-      const data = await callBridge(ctx, context, "bash_kill", {
+      const data = await callBashBridge(ctx, context, "bash_kill", {
         task_id: args.taskId as string,
       });
       if (data.success === false) {
@@ -416,7 +403,7 @@ async function bashStatusSnapshot(
   outputMode: string | undefined,
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  const data = await callBridge(
+  const data = await callBashBridge(
     ctx,
     runtime,
     "bash_status",

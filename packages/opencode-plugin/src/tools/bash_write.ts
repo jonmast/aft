@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBashBridge } from "./_shared.js";
 
 const z = tool.schema;
 
@@ -74,7 +74,7 @@ export function createBashWriteTool(ctx: PluginContext): ToolDefinition {
         ),
     },
     execute: async (args, context) => {
-      const data = await callBridge(ctx, context, "bash_write", {
+      const data = await callBashBridge(ctx, context, "bash_write", {
         task_id: args.taskId as string,
         input: args.input as unknown,
       });

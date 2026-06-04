@@ -14,6 +14,7 @@ import { consumeToolMetadata } from "../metadata-store.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
+import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
 import { mockAsk, noopAsk } from "./test-helpers";
 
@@ -246,6 +247,7 @@ describe("OpenCode bash adapter", () => {
     // But transport timeout is the 30s baseline — wait-window (5s) plus
     // overhead (5s) is well below the floor.
     expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
+    expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
   });
 
   test("progress callback forwards rolling output previews through ctx.metadata", async () => {
@@ -386,6 +388,10 @@ describe("OpenCode bash adapter", () => {
 
     expect(output).toBe("done");
     expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status"]);
+    for (const call of calls) {
+      expect(call.options?.keepBridgeOnTimeout).toBe(true);
+      expect(call.options?.transportTimeoutMs).toBe(30_000);
+    }
     expect(calls[0].params.notify_on_completion).toBe(false);
   });
 
@@ -403,6 +409,10 @@ describe("OpenCode bash adapter", () => {
 
     expect(output).toContain("promoted to background: task-promote");
     expect(calls.map((call) => call.command)).toEqual(["bash", "bash_status", "bash_promote"]);
+    for (const call of calls) {
+      expect(call.options?.keepBridgeOnTimeout).toBe(true);
+      expect(call.options?.transportTimeoutMs).toBe(30_000);
+    }
   });
 
   test("explicit background spawn enables completion notifications", async () => {
@@ -459,8 +469,46 @@ describe("bash_status tool", () => {
       statusTool: createBashStatusTool(ctx),
       watchTool: createBashWatchTool(ctx),
       killTool: createBashKillTool(ctx),
+      writeTool: createBashWriteTool(ctx),
     };
   }
+
+  test("bash-family control RPCs keep the bridge on transport timeout", async () => {
+    const { calls, statusTool, watchTool, writeTool, killTool } = makeCtx((cmd) => {
+      if (cmd === "bash_notify") return { success: true, watch_id: "watch-1" };
+      if (cmd === "bash_write") return { success: true, bytes_written: 3 };
+      if (cmd === "bash_kill") return { success: true, status: "killed" };
+      return { success: true, status: "running", duration_ms: 0 };
+    });
+    const runtime = createMockSdkContext();
+
+    await statusTool.execute({ taskId: "bash-control" }, runtime);
+    await watchTool.execute(
+      { taskId: "bash-control", pattern: "ready", background: true },
+      runtime,
+    );
+    await writeTool.execute({ taskId: "bash-control", input: "abc" }, runtime);
+    await killTool.execute({ taskId: "bash-control" }, runtime);
+
+    expect(calls.map((call) => call.cmd)).toEqual([
+      "bash_status",
+      "bash_notify",
+      "bash_write",
+      "bash_kill",
+    ]);
+    for (const call of calls) {
+      expect(call.options?.keepBridgeOnTimeout).toBe(true);
+    }
+    expect(calls.find((call) => call.cmd === "bash_status")?.options?.transportTimeoutMs).toBe(
+      30_000,
+    );
+    expect(calls.find((call) => call.cmd === "bash_notify")?.options?.transportTimeoutMs).toBe(
+      30_000,
+    );
+    expect(calls.find((call) => call.cmd === "bash_kill")?.options?.transportTimeoutMs).toBe(
+      30_000,
+    );
+  });
 
   test("returns running status with anti-polling reminder, no output preview", async () => {
     const { statusTool } = makeCtx((_cmd, _params) => ({
@@ -737,6 +785,8 @@ describe("bash_status tool", () => {
     expect(result).toBe("Task bash-deadbeef: killed");
     expect(calls[0].cmd).toBe("bash_kill");
     expect(calls[0].params.task_id).toBe("bash-deadbeef");
+    expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
+    expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
   });
 
   test("bash_kill surfaces already-terminal status from bridge", async () => {
