@@ -2104,8 +2104,33 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                         return Ok((cached, model));
                                     }
                                     Err(error) => {
-                                        // Hard failure (dimension mismatch, embed backend
-                                        // error). Drop the cache and do a full rebuild.
+                                        if crate::semantic_index::embedding_failure_is_transient(
+                                            &error,
+                                        ) {
+                                            // TRANSIENT backend error (e.g. the embedding
+                                            // server is overloaded by concurrent bridges, or
+                                            // briefly unreachable). Do NOT drop the cache and
+                                            // full-rebuild: a full corpus re-embed against an
+                                            // already-overloaded backend amplifies the overload
+                                            // and cascades to other bridges AND the main
+                                            // session (every bridge's incremental refresh then
+                                            // fails transiently and full-rebuilds too). Keep
+                                            // serving the valid cached index; the handful of
+                                            // changed files re-embed on a later refresh once the
+                                            // backend recovers. Mirrors the watcher-refresh
+                                            // self-heal in main.rs.
+                                            let clean =
+                                                crate::semantic_index::strip_transient_embedding_marker(
+                                                    &error,
+                                                );
+                                            slog_warn!(
+                                                "incremental refresh hit a transient backend error ({}); keeping the cached index instead of full-rebuilding",
+                                                clean
+                                            );
+                                            return Ok((cached, model));
+                                        }
+                                        // Permanent failure (dimension mismatch, etc.): the
+                                        // cache is genuinely unusable, drop it and full-rebuild.
                                         slog_warn!(
                                             "incremental refresh failed ({}), falling back to full rebuild",
                                             error
