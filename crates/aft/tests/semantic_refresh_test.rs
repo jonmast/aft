@@ -361,6 +361,11 @@ fn refresh_reembeds_only_edited_symbol_in_changed_file() {
     let _guard = shared_lock().lock();
     let project = tempfile::tempdir().expect("create project dir");
     let (mut index, file_a, file_b) = build_two_file_index(project.path());
+    let count_for_a_before = count_entries_for_file(&index, &file_a);
+    assert!(
+        count_for_a_before >= 2,
+        "file_a starts with multiple symbols"
+    );
 
     rewrite_with_new_mtime(
         &file_a,
@@ -373,7 +378,7 @@ fn refresh_reembeds_only_edited_symbol_in_changed_file() {
     let summary = index
         .refresh_stale_files(
             project.path(),
-            &[file_a, file_b],
+            &[file_a.clone(), file_b],
             &mut embed,
             16,
             &mut progress,
@@ -383,6 +388,121 @@ fn refresh_reembeds_only_edited_symbol_in_changed_file() {
     assert_eq!(summary.changed, 1);
     assert_eq!(stub.total_embedded_texts(), 1);
     assert!(stub.embedded_texts()[0].contains("name:alpha"));
+    // Duplication guard: the unchanged siblings are reused (embed-count==1 above
+    // proves only the edited symbol was embedded), and the post-refresh entry
+    // count for the file is unchanged — no chunk dropped, none duplicated.
+    assert_eq!(
+        count_entries_for_file(&index, &file_a),
+        count_for_a_before,
+        "entry count unchanged after partial-reuse refresh"
+    );
+}
+
+#[test]
+fn refresh_stale_files_collect_failure_keeps_stale_entries() {
+    // The corpus-refresh path (refresh_stale_files) must KEEP stale-but-valid
+    // entries when a changed file fails to re-collect (transient/parse error) —
+    // the deliberate opposite of the watcher path, which drops them up front.
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut index, file_a, file_b) = build_two_file_index(project.path());
+    let count_for_a_before = count_entries_for_file(&index, &file_a);
+    assert!(count_for_a_before > 0, "file_a starts with entries");
+
+    // Corrupt file_a (invalid UTF-8 → collect yields nothing) and advance its
+    // mtime so it is bucketed as "changed" rather than fresh.
+    fs::write(&file_a, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+    let advanced = fs::metadata(&file_a)
+        .expect("stat after corrupt")
+        .modified()
+        .expect("mtime after corrupt")
+        .checked_add(Duration::from_secs(2))
+        .expect("advance mtime");
+    filetime::set_file_mtime(&file_a, filetime::FileTime::from_system_time(advanced))
+        .expect("set advanced mtime");
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_stale_files(
+            project.path(),
+            &[file_a.clone(), file_b],
+            &mut embed,
+            16,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    assert_eq!(
+        stub.total_embedded_texts(),
+        0,
+        "nothing embeds when the changed file fails to collect"
+    );
+    assert_eq!(
+        count_entries_for_file(&index, &file_a),
+        count_for_a_before,
+        "stale entries kept (not dropped, not duplicated) on collect failure"
+    );
+}
+
+#[test]
+fn invalidated_refresh_mixed_reuse_and_miss_retains_all_after_apply() {
+    // Editing one symbol's body in a multi-symbol file: that symbol's chunk is a
+    // cache miss (re-embedded) while siblings + file-summary are reused. The
+    // applied delta must carry the FULL replacement set so the serving index
+    // neither drops the reused chunks nor duplicates them.
+    let _guard = shared_lock().lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let (mut worker_index, file_a, _file_b) = build_two_file_index(project.path());
+    let mut serving_index = worker_index.clone();
+    let count_for_a_before = count_entries_for_file(&serving_index, &file_a);
+    assert!(count_for_a_before >= 2, "file_a has multiple symbols");
+
+    // Edit only alpha's body; alpha_helper is byte-identical and reused.
+    rewrite_with_new_mtime(
+        &file_a,
+        "pub fn alpha() -> i32 {\n    let x = 99;\n    x\n}\n\npub fn alpha_helper() -> i32 {\n    let y = 2;\n    y\n}\n",
+    );
+
+    let stub = StubEmbedder::new();
+    let mut embed = |texts: Vec<String>| stub.embed(texts);
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = worker_index
+        .refresh_invalidated_files(
+            project.path(),
+            std::slice::from_ref(&file_a),
+            &mut embed,
+            16,
+            100,
+            &mut progress,
+        )
+        .expect("refresh succeeds");
+
+    // Mixed path: exactly the edited symbol re-embeds; the full set is still
+    // delivered as the delta (reused + newly embedded).
+    assert_eq!(
+        stub.total_embedded_texts(),
+        1,
+        "only the edited symbol re-embeds; siblings reused"
+    );
+    assert_eq!(
+        update.added_entries.len(),
+        count_for_a_before,
+        "delta is the full replacement set, not just the miss"
+    );
+
+    serving_index.apply_refresh_update(
+        update.added_entries,
+        update.updated_metadata,
+        &update.completed_paths,
+    );
+
+    assert_eq!(
+        count_entries_for_file(&serving_index, &file_a),
+        count_for_a_before,
+        "no chunk dropped, none duplicated after applying the mixed delta"
+    );
 }
 
 #[test]
