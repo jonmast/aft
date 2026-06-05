@@ -548,14 +548,16 @@ impl InspectManager {
     fn tier2_run_with_reuse_job_result(&self, mut job: InspectJob) -> InspectResult {
         let started = Instant::now();
         if !job.category.is_active() {
-            return InspectResult::failed(
+            let result = InspectResult::failed(
                 &job,
                 format!("inspect category '{}' is disabled in v0.33", job.category),
                 started.elapsed(),
             );
+            log_tier2_benchmark_category_end(&result);
+            return result;
         }
         if !job.category.is_tier2() {
-            return InspectResult::failed(
+            let result = InspectResult::failed(
                 &job,
                 format!(
                     "inspect category '{}' is not a Tier 2 category",
@@ -563,22 +565,33 @@ impl InspectManager {
                 ),
                 started.elapsed(),
             );
+            log_tier2_benchmark_category_end(&result);
+            return result;
         }
 
         let project_scope = JobScope::for_project(job.project_root.clone());
         job.scope_files = scope_files(&job.project_root, &project_scope);
+        log_tier2_benchmark_category_start(&job);
         let cache = match self.cache_for_paths(job.inspect_dir.clone(), job.project_root.clone()) {
             Ok(cache) => cache,
-            Err(message) => return InspectResult::failed(&job, message, started.elapsed()),
+            Err(message) => {
+                let result = InspectResult::failed(&job, message, started.elapsed());
+                log_tier2_benchmark_category_end(&result);
+                return result;
+            }
         };
         if let Ok(Some(success)) = self.tier2_quick_reuse_success(&job, cache.as_ref()) {
-            return InspectResult::success(&job, success, started.elapsed());
+            let result = InspectResult::success(&job, success, started.elapsed());
+            log_tier2_benchmark_category_end(&result);
+            return result;
         }
 
-        match self.tier2_run_with_reuse_job(&job, &cache) {
+        let result = match self.tier2_run_with_reuse_job(&job, &cache) {
             Ok(success) => InspectResult::success(&job, success, started.elapsed()),
             Err(message) => InspectResult::failed(&job, message, started.elapsed()),
-        }
+        };
+        log_tier2_benchmark_category_end(&result);
+        result
     }
 
     fn tier2_reuse_job(
@@ -1088,9 +1101,65 @@ fn current_project_files(project_root: &Path, files: &[PathBuf]) -> BTreeMap<Str
         .collect()
 }
 
+fn tier2_benchmark_logging_enabled() -> bool {
+    std::env::var_os("AFT_SETTLE_BENCH_LOG").is_some()
+}
+
+fn log_tier2_benchmark_category_start(job: &InspectJob) {
+    if !tier2_benchmark_logging_enabled() {
+        return;
+    }
+    crate::slog_info!(
+        "settle bench: tier2_category_start category={} job_id={} files={}",
+        job.category.as_str(),
+        job.job_id,
+        job.scope_files.len()
+    );
+}
+
+fn log_tier2_benchmark_category_end(result: &InspectResult) {
+    if !tier2_benchmark_logging_enabled() {
+        return;
+    }
+    match &result.outcome {
+        Ok(success) => {
+            let count = success
+                .aggregate
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            crate::slog_info!(
+                "settle bench: tier2_category_end category={} job_id={} status=success total_ms={} scanned_files={} contributions={} count={}",
+                result.category.as_str(),
+                result.job_id,
+                result.duration.as_millis(),
+                success.scanned_files.len(),
+                success.contributions.len(),
+                count
+            );
+        }
+        Err(message) => {
+            crate::slog_info!(
+                "settle bench: tier2_category_end category={} job_id={} status=failed total_ms={} error={}",
+                result.category.as_str(),
+                result.job_id,
+                result.duration.as_millis(),
+                message.replace('\n', " ")
+            );
+        }
+    }
+}
+
 fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot> {
+    let started = Instant::now();
     let mut graph = CallGraph::new(project_root.to_path_buf());
     let graph_files = graph.project_files().to_vec();
+    if tier2_benchmark_logging_enabled() {
+        crate::slog_info!(
+            "settle bench: tier2_callgraph_snapshot_start files={}",
+            graph_files.len()
+        );
+    }
     let files = graph_files
         .iter()
         .map(canonicalize_for_snapshot)
@@ -1100,6 +1169,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
     let mut exported_symbols = Vec::new();
     let mut outbound_calls = Vec::new();
     let mut entry_points = BTreeSet::new();
+    let mut built_files = 0usize;
 
     for file in &graph_files {
         let snapshot_file = canonicalize_for_snapshot(file);
@@ -1111,6 +1181,7 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
             Ok(file_data) => file_data.clone(),
             Err(_) => continue,
         };
+        built_files += 1;
 
         for symbol in &file_data.exported_symbols {
             let metadata = file_data.symbol_metadata_for(symbol);
@@ -1182,6 +1253,18 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
                 });
             }
         }
+    }
+
+    if tier2_benchmark_logging_enabled() {
+        crate::slog_info!(
+            "settle bench: tier2_callgraph_snapshot_end files={} built_files={} exported_symbols={} outbound_calls={} entry_points={} ms={}",
+            graph_files.len(),
+            built_files,
+            exported_symbols.len(),
+            outbound_calls.len(),
+            entry_points.len(),
+            started.elapsed().as_millis()
+        );
     }
 
     Arc::new(CallgraphSnapshot {
