@@ -2624,9 +2624,9 @@ fn callgraph_configure_reports_source_file_count_exceeds_max() {
     aft.shutdown();
 }
 
-/// `callers` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `callers` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_callers_project_too_large() {
+fn callgraph_callers_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
@@ -2643,22 +2643,21 @@ fn callgraph_callers_project_too_large() {
         crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
-    // Error message should mention max_callgraph_files so users know what to tune.
-    let msg = resp["message"].as_str().unwrap_or("");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed callers should succeed: {resp:?}"
+    );
     assert!(
-        msg.contains("max_callgraph_files"),
-        "error message should mention max_callgraph_files: {}",
-        msg
+        resp["total_callers"].as_u64().unwrap_or(0) > 0,
+        "validate should still report callers despite cap=1: {resp:?}"
     );
 
     aft.shutdown();
 }
 
-/// `trace_to` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `trace_to` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_trace_to_project_too_large() {
+fn callgraph_trace_to_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
@@ -2674,15 +2673,18 @@ fn callgraph_trace_to_project_too_large() {
         crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed trace_to should succeed: {resp:?}"
+    );
+    assert!(resp["total_paths"].as_u64().is_some());
 
     aft.shutdown();
 }
 
-/// `impact` returns `project_too_large` when project exceeds `max_callgraph_files`.
+/// Store-backed `impact` ignores the legacy `max_callgraph_files` cap.
 #[test]
-fn callgraph_impact_project_too_large() {
+fn callgraph_impact_ignores_legacy_project_size_cap() {
     let mut aft = AftProcess::spawn();
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
@@ -2698,8 +2700,14 @@ fn callgraph_impact_project_too_large() {
         crate::helpers::json_string(&format!("{}/helpers.ts", root))
     ));
 
-    assert_eq!(resp["success"], false);
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(
+        resp["success"], true,
+        "store-backed impact should succeed: {resp:?}"
+    );
+    assert!(
+        resp["total_affected"].as_u64().unwrap_or(0) > 0,
+        "validate should still report impact callers despite cap=1: {resp:?}"
+    );
 
     aft.shutdown();
 }

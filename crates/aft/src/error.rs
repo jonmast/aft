@@ -157,7 +157,7 @@ impl fmt::Display for AftError {
             AftError::ProjectTooLarge { count, max } => {
                 write!(
                     f,
-                    "project has {count} source files, exceeding max_callgraph_files={max}. Call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
+                    "project has {count} source files, exceeding max_callgraph_files={max}. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, and symbol move analysis) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
                 )
             }
         }

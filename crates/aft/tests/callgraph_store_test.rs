@@ -1,10 +1,12 @@
-use aft::callgraph::walk_project_files;
+use aft::callgraph::{walk_project_files, CallGraph};
 use aft::callgraph_store::{live_callgraph_edge_snapshot, CallGraphStore, StoredEdge};
+use aft::commands::callgraph_store_adapter;
 use aft::config::Config;
 use aft::context::AppContext;
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use filetime::FileTime;
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,411 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use tempfile::tempdir;
 
 static NEXT_MTIME: AtomicI64 = AtomicI64::new(1_800_000_000);
+
+#[test]
+fn store_op_outputs_match_legacy_for_tier1_languages() {
+    let dir = tempdir().unwrap();
+    write_parity_project(dir.path());
+    let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let files = project_files(&root);
+    let store = CallGraphStore::open(root.join(".store-op-parity"), root.clone()).unwrap();
+    store.cold_build(&files).unwrap();
+
+    assert_op_parity(
+        &root,
+        &store,
+        "typescript callers",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .callers_of(&root.join("src/foo.ts"), "foo", 2, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::callers_result(&store, &root.join("src/foo.ts"), "foo", 2)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "typescript call_tree",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .forward_tree(&root.join("src/main.ts"), "main", 2)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::call_tree_result(
+                    &store,
+                    &root.join("src/main.ts"),
+                    "main",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "typescript impact",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .impact(&root.join("src/foo.ts"), "foo", 2, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::impact_result(&store, &root.join("src/foo.ts"), "foo", 2)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "typescript trace_to",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_to(&root.join("src/foo.ts"), "foo", 4, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::trace_to_result(
+                    &store,
+                    &root.join("src/foo.ts"),
+                    "foo",
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "typescript trace_to_symbol",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_to_symbol(
+                        &root.join("src/main.ts"),
+                        "main",
+                        "foo",
+                        Some(&root.join("src/foo.ts")),
+                        4,
+                        usize::MAX,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::trace_to_symbol_result(
+                    &store,
+                    &root.join("src/main.ts"),
+                    "main",
+                    "foo",
+                    Some(&root.join("src/foo.ts")),
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+
+    assert_op_parity(
+        &root,
+        &store,
+        "javascript callers",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .callers_of(&root.join("src/js_helper.js"), "jsHelper", 2, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::callers_result(
+                    &store,
+                    &root.join("src/js_helper.js"),
+                    "jsHelper",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "javascript call_tree",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .forward_tree(&root.join("src/app.js"), "jsEntry", 2)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::call_tree_result(
+                    &store,
+                    &root.join("src/app.js"),
+                    "jsEntry",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "javascript impact",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .impact(&root.join("src/js_helper.js"), "jsHelper", 2, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::impact_result(
+                    &store,
+                    &root.join("src/js_helper.js"),
+                    "jsHelper",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "javascript trace_to",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_to(&root.join("src/js_helper.js"), "jsHelper", 4, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::trace_to_result(
+                    &store,
+                    &root.join("src/js_helper.js"),
+                    "jsHelper",
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "javascript trace_to_symbol",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_to_symbol(
+                        &root.join("src/app.js"),
+                        "jsEntry",
+                        "jsHelper",
+                        Some(&root.join("src/js_helper.js")),
+                        4,
+                        usize::MAX,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::trace_to_symbol_result(
+                    &store,
+                    &root.join("src/app.js"),
+                    "jsEntry",
+                    "jsHelper",
+                    Some(&root.join("src/js_helper.js")),
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+
+    assert_op_parity(
+        &root,
+        &store,
+        "rust callers",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .callers_of(&root.join("src/util.rs"), "rust_helper", 2, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::callers_result(
+                    &store,
+                    &root.join("src/util.rs"),
+                    "rust_helper",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "rust call_tree",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .forward_tree(&root.join("src/lib.rs"), "rust_entry", 2)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::call_tree_result(
+                    &store,
+                    &root.join("src/lib.rs"),
+                    "rust_entry",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "rust impact",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .impact(&root.join("src/util.rs"), "rust_helper", 2, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::impact_result(
+                    &store,
+                    &root.join("src/util.rs"),
+                    "rust_helper",
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "rust trace_to",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_to(&root.join("src/util.rs"), "rust_helper", 4, usize::MAX)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::trace_to_result(
+                    &store,
+                    &root.join("src/util.rs"),
+                    "rust_helper",
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+    assert_op_parity(
+        &root,
+        &store,
+        "rust trace_to_symbol",
+        |graph| {
+            serde_json::to_value(
+                graph
+                    .trace_to_symbol(
+                        &root.join("src/lib.rs"),
+                        "rust_entry",
+                        "rust_helper",
+                        Some(&root.join("src/util.rs")),
+                        4,
+                        usize::MAX,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        || {
+            serde_json::to_value(
+                callgraph_store_adapter::trace_to_symbol_result(
+                    &store,
+                    &root.join("src/lib.rs"),
+                    "rust_entry",
+                    "rust_helper",
+                    Some(&root.join("src/util.rs")),
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        },
+    );
+}
 
 #[test]
 fn store_edges_match_live_callgraph_for_tier1_languages() {
@@ -103,6 +510,86 @@ fn scenario_matrix_incremental_matches_cold_rebuild() {
                 "body-only edit must not select fan-in refs: {stats:?}"
             );
         }),
+    );
+}
+
+#[test]
+fn scenario_matrix_op_outputs_incremental_match_cold_rebuild() {
+    run_op_scenario(
+        "rename symbol",
+        setup_rename_symbol,
+        edit_rename_symbol,
+        ScenarioQuery::new("a.ts", "renamed", "a.ts", "outer", "renamed", Some("a.ts")),
+    );
+    run_op_scenario(
+        "delete file",
+        setup_delete_file,
+        edit_delete_file,
+        ScenarioQuery::new(
+            "main.ts",
+            "main",
+            "main.ts",
+            "main",
+            "main",
+            Some("main.ts"),
+        ),
+    );
+    run_op_scenario(
+        "delete reexport-only barrel",
+        setup_barrel,
+        edit_delete_barrel,
+        ScenarioQuery::new(
+            "main.ts",
+            "main",
+            "main.ts",
+            "main",
+            "main",
+            Some("main.ts"),
+        ),
+    );
+    run_op_scenario(
+        "add file satisfying prior unresolved import",
+        setup_unresolved_import,
+        edit_add_late_file,
+        ScenarioQuery::new(
+            "late.ts",
+            "late",
+            "main.ts",
+            "main",
+            "late",
+            Some("late.ts"),
+        ),
+    );
+    run_op_scenario(
+        "move symbol via reexport topology",
+        setup_barrel_move,
+        edit_move_reexport,
+        ScenarioQuery::new("alt.ts", "foo", "main.ts", "main", "foo", Some("alt.ts")),
+    );
+    run_op_scenario(
+        "barrel retarget while old target exists",
+        setup_barrel,
+        edit_retarget_barrel,
+        ScenarioQuery::new("alt.ts", "foo", "main.ts", "main", "foo", Some("alt.ts")),
+    );
+    run_op_scenario(
+        "file that both defines and calls",
+        setup_defines_and_calls,
+        edit_defines_and_calls,
+        ScenarioQuery::new(
+            "combo.ts",
+            "next",
+            "combo.ts",
+            "caller",
+            "next",
+            Some("combo.ts"),
+        ),
+    );
+    run_op_scenario(
+        "body-only edit does not invalidate fan-in",
+        setup_body_only,
+        edit_body_only,
+        ScenarioQuery::new("foo.ts", "foo", "main.ts", "main", "foo", Some("foo.ts")),
     );
 }
 
@@ -462,6 +949,121 @@ fn measure_current_worktree_cold_build() {
         stats.edges,
         stats.elapsed_ms,
         rss.unwrap_or(0)
+    );
+}
+
+#[derive(Clone, Copy)]
+struct ScenarioQuery {
+    target_file: &'static str,
+    target_symbol: &'static str,
+    tree_file: &'static str,
+    tree_symbol: &'static str,
+    to_symbol: &'static str,
+    to_file: Option<&'static str>,
+}
+
+impl ScenarioQuery {
+    fn new(
+        target_file: &'static str,
+        target_symbol: &'static str,
+        tree_file: &'static str,
+        tree_symbol: &'static str,
+        to_symbol: &'static str,
+        to_file: Option<&'static str>,
+    ) -> Self {
+        Self {
+            target_file,
+            target_symbol,
+            tree_file,
+            tree_symbol,
+            to_symbol,
+            to_file,
+        }
+    }
+}
+
+fn run_op_scenario(
+    name: &str,
+    setup: fn(&Path),
+    edit: fn(&Path) -> Vec<PathBuf>,
+    query: ScenarioQuery,
+) {
+    let dir = tempdir().unwrap();
+    setup(dir.path());
+
+    let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let files_before = project_files(&root);
+    let incremental_store =
+        CallGraphStore::open(root.join(".store-op-incremental"), root.clone()).unwrap();
+    incremental_store.cold_build(&files_before).unwrap();
+
+    let changed = edit(&root);
+    incremental_store.refresh_files(&changed).unwrap();
+    let incremental = scenario_op_snapshot(&incremental_store, &root, query);
+
+    let cold_store = CallGraphStore::open(root.join(".store-op-cold"), root.clone()).unwrap();
+    cold_store.cold_build(&project_files(&root)).unwrap();
+    let cold = scenario_op_snapshot(&cold_store, &root, query);
+
+    assert_eq!(
+        incremental, cold,
+        "scenario {name} op-layer output after incremental refresh must match cold rebuild"
+    );
+}
+
+fn scenario_op_snapshot(store: &CallGraphStore, root: &Path, query: ScenarioQuery) -> Value {
+    let target_file = root.join(query.target_file);
+    let tree_file = root.join(query.tree_file);
+    let to_file = query.to_file.map(|file| root.join(file));
+    json!({
+        "callers": serde_json::to_value(
+            callgraph_store_adapter::callers_result(store, &target_file, query.target_symbol, 2)
+                .unwrap()
+        )
+        .unwrap(),
+        "call_tree": serde_json::to_value(
+            callgraph_store_adapter::call_tree_result(store, &tree_file, query.tree_symbol, 2)
+                .unwrap()
+        )
+        .unwrap(),
+        "impact": serde_json::to_value(
+            callgraph_store_adapter::impact_result(store, &target_file, query.target_symbol, 2)
+                .unwrap()
+        )
+        .unwrap(),
+        "trace_to": serde_json::to_value(
+            callgraph_store_adapter::trace_to_result(store, &target_file, query.target_symbol, 4)
+                .unwrap()
+        )
+        .unwrap(),
+        "trace_to_symbol": serde_json::to_value(
+            callgraph_store_adapter::trace_to_symbol_result(
+                store,
+                &tree_file,
+                query.tree_symbol,
+                query.to_symbol,
+                to_file.as_deref(),
+                4,
+            )
+            .unwrap()
+        )
+        .unwrap(),
+    })
+}
+
+fn assert_op_parity<L, S>(root: &Path, _store: &CallGraphStore, label: &str, legacy: L, store: S)
+where
+    L: FnOnce(&mut CallGraph) -> serde_json::Value,
+    S: FnOnce() -> serde_json::Value,
+{
+    let mut graph = CallGraph::new(root.to_path_buf());
+    let legacy_json = legacy(&mut graph);
+    let store_json = store();
+    let legacy_bytes = serde_json::to_string(&legacy_json).unwrap();
+    let store_bytes = serde_json::to_string(&store_json).unwrap();
+    assert_eq!(
+        store_bytes, legacy_bytes,
+        "{label} store output must be byte-identical to legacy output\nlegacy: {legacy_json:#}\nstore: {store_json:#}"
     );
 }
 

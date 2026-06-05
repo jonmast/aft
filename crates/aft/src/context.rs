@@ -501,6 +501,7 @@ pub struct AppContext {
     degraded_reasons: RefCell<Vec<String>>,
     callgraph: RefCell<Option<CallGraph>>,
     callgraph_store: RefCell<Option<CallGraphStore>>,
+    callgraph_store_force_rebuild: RefCell<bool>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
@@ -590,6 +591,7 @@ impl AppContext {
             degraded_reasons: RefCell::new(Vec::new()),
             callgraph: RefCell::new(None),
             callgraph_store: RefCell::new(None),
+            callgraph_store_force_rebuild: RefCell::new(false),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
             pending_search_index_paths: RefCell::new(BTreeSet::new()),
@@ -1169,6 +1171,16 @@ impl AppContext {
         &self.callgraph_store
     }
 
+    pub fn mark_callgraph_store_force_rebuild(&self) {
+        *self.callgraph_store_force_rebuild.borrow_mut() = true;
+    }
+
+    fn take_callgraph_store_force_rebuild(&self) -> bool {
+        let force = *self.callgraph_store_force_rebuild.borrow();
+        *self.callgraph_store_force_rebuild.borrow_mut() = false;
+        force
+    }
+
     pub fn callgraph_store_dir(&self) -> PathBuf {
         match self.harness_opt() {
             Some(harness) => self.storage_dir().join(harness.as_str()).join("callgraph"),
@@ -1179,7 +1191,24 @@ impl AppContext {
     pub fn ensure_callgraph_store(
         &self,
     ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
-        if !self.config().callgraph_store {
+        self.ensure_callgraph_store_with_flag(true)
+    }
+
+    /// Ensure the persisted callgraph store for store-backed callgraph commands.
+    ///
+    /// Phase 2a cuts the five edge-query ops over to the store unconditionally,
+    /// so the old off-by-default substrate flag no longer gates these consumers.
+    pub fn ensure_callgraph_store_for_ops(
+        &self,
+    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+        self.ensure_callgraph_store_with_flag(false)
+    }
+
+    fn ensure_callgraph_store_with_flag(
+        &self,
+        respect_config_flag: bool,
+    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+        if respect_config_flag && !self.config().callgraph_store {
             return Ok(None);
         }
         if self.callgraph_store.borrow().is_none() {
@@ -1192,8 +1221,14 @@ impl AppContext {
                 return Ok(None);
             };
             let callgraph_dir = self.callgraph_store_dir();
+            let force_rebuild = self.take_callgraph_store_force_rebuild();
             let store = if self.is_worktree_bridge() {
                 CallGraphStore::open_readonly(callgraph_dir, project_root)?
+            } else if force_rebuild {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) =
+                    CallGraphStore::cold_build_with_lease(callgraph_dir, project_root, &files)?;
+                Some(store)
             } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =

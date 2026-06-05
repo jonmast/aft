@@ -1,26 +1,14 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::commands::callgraph_store_adapter::{
+    callers_result, store_error_response, unavailable_response,
+};
 use crate::context::AppContext;
-use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
 use crate::{slog_info, slog_warn};
 
 /// Handle a `callers` request.
-///
-/// Expects:
-/// - `file` (string, required) — path to the source file containing the target symbol
-/// - `symbol` (string, required) — name of the symbol to find callers for
-/// - `depth` (number, optional, default 1) — recursive depth (1 = direct callers only)
-///
-/// Returns callers grouped by file with fields: `symbol`, `file`,
-/// `callers` (array of `{ file, callers: [{ symbol, line }] }`),
-/// `total_callers`, `scanned_files`.
-///
-/// Returns error if:
-/// - required params missing
-/// - call graph not initialized (configure not called)
-/// - symbol not found in the file
 pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -51,18 +39,6 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(1)
         .min(100) as usize;
 
-    let mut cg_ref = ctx.callgraph().borrow_mut();
-    let graph = match cg_ref.as_mut() {
-        Some(g) => g,
-        None => {
-            return Response::error(
-                &req.id,
-                "not_configured",
-                "callers: project not configured — send 'configure' first",
-            );
-        }
-    };
-
     let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
@@ -91,26 +67,21 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
-        Ok(symbol) => symbol,
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    let store = match ctx.ensure_callgraph_store_for_ops() {
+        Ok(Some(store)) => store,
+        Ok(None) => return unavailable_response(&req.id, "callers", ctx.is_worktree_bridge()),
+        Err(error) => return store_error_response(&req.id, "callers", error),
     };
 
-    let max_files = ctx.config().max_callgraph_files;
-
-    // Time the whole query. A cold call-graph build on a large repo can run
-    // close to the bridge request timeout (which the host then renders as a
-    // failed/"red" tool call). Logging the duration + outcome makes a slow or
-    // rejected call attributable instead of looking like an opaque hang (#84).
     let started = Instant::now();
-    let outcome = graph.callers_of(&file_path, &symbol, depth, max_files);
+    let outcome = callers_result(&store, &file_path, symbol, depth);
     let elapsed_ms = started.elapsed().as_millis();
 
     match outcome {
         Ok(result) => {
             slog_info!(
                 "callers: '{}' in {} → {} sites in {}ms",
-                symbol,
+                result.symbol,
                 file_path.display(),
                 result.total_callers,
                 elapsed_ms
@@ -118,16 +89,14 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }
-        Err(err @ AftError::ProjectTooLarge { .. }) => {
+        Err(error) => {
             slog_warn!(
-                "callers: rejected project_too_large after {}ms (raise lsp.max_callgraph_files or scope the repo)",
-                elapsed_ms
+                "callers: '{}' failed after {}ms: {}",
+                symbol,
+                elapsed_ms,
+                error
             );
-            Response::error(&req.id, "project_too_large", format!("{}", err))
-        }
-        Err(e) => {
-            slog_warn!("callers: '{}' failed after {}ms: {}", symbol, elapsed_ms, e);
-            Response::error(&req.id, e.code(), e.to_string())
+            store_error_response(&req.id, "callers", error)
         }
     }
 }

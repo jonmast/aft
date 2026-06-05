@@ -138,10 +138,10 @@ pub struct Config {
     pub bash_permissions: bool,
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
-    /// Maximum number of source files allowed for call-graph operations
-    /// (`callers`, `trace_to`, `trace_data`, `impact`). When a project
-    /// exceeds this count the reverse index is not built and those
-    /// commands return a `project_too_large` error. Does not affect
+    /// Maximum number of source files allowed for legacy in-memory call-graph operations
+    /// (`trace_data`, symbol move analysis, and dead-code snapshots). Store-backed
+    /// edge-query commands (`callers`, `call_tree`, `impact`, `trace_to`,
+    /// `trace_to_symbol`) are not capped by this setting. Does not affect
     /// `grep`, `glob`, `read`, `edit`, or other non-callgraph features.
     /// Default: 5_000 (matches measured per-op cost ceilings; raise for
     /// very large projects if you accept multi-minute per-call latency).
@@ -216,7 +216,7 @@ impl Default for Config {
             bash_long_running_reminder_interval_ms: 600_000,
             bash_permissions: false,
             search_index_max_file_size: 1_048_576,
-            // Projects larger than this skip call-graph reverse index construction.
+            // Projects larger than this skip legacy in-memory reverse-index construction.
             //
             // The previous default (20_000) was set by hand-wave to "fits under
             // the 30 s bridge timeout" without measurement. Direct benchmarks
@@ -232,8 +232,9 @@ impl Default for Config {
             // matching the per-op timeout budget. Users with bigger projects
             // can raise this knob, but the default should not advertise
             // capabilities that fail in practice. Read/edit/grep/glob/outline/
-            // semantic_search/AST/LSP all remain unaffected by this cap —
-            // it only gates `aft_callgraph` and `aft_refactor op="move"`.
+            // semantic_search/AST/LSP and the store-backed callgraph edge ops all
+            // remain unaffected by this cap — it gates legacy `trace_data`,
+            // dead-code snapshots, and `aft_refactor op="move"`.
             max_callgraph_files: 5_000,
             semantic: SemanticBackendConfig::default(),
             experimental_lsp_ty: false,

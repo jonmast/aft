@@ -381,6 +381,9 @@ fn has_parent_component(path: &Path) -> bool {
 }
 
 fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
+    if std::env::var_os("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD").is_some() {
+        return (false, None);
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(project_root)
@@ -1716,7 +1719,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     if exceeds {
         slog_warn!(
-            "project has >{} source files. Call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
+            "project has >{} source files. Legacy in-memory call-graph operations (trace_data, dead_code snapshots, symbol move analysis) will be disabled. Store-backed callers/call_tree/impact/trace_to/trace_to_symbol remain available.",
             max_callgraph_files
         );
     }
@@ -1867,6 +1870,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
     *ctx.callgraph_store().borrow_mut() = None;
+    if previous_project_root.as_ref() == Some(&root_path) {
+        ctx.mark_callgraph_store_force_rebuild();
+    }
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
     ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;

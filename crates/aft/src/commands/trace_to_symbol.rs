@@ -1,23 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use crate::commands::callgraph_store_adapter::{
+    ensure_symbol_resolves, store_error_response, trace_to_symbol_candidates,
+    trace_to_symbol_result, unavailable_response,
+};
 use crate::context::AppContext;
-use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
-///
-/// Traces forward from one symbol to another symbol using breadth-first search,
-/// returning the first (shortest) resolved call path from origin to target.
-///
-/// Expects:
-/// - `file` (string, required) — path to the source file containing the FROM symbol
-/// - `symbol` (string, required) — name of the FROM symbol
-/// - `toSymbol` (string, required) — name of the TO symbol
-/// - `toFile` (string, optional) — file containing the TO symbol, required when ambiguous
-/// - `depth` (number, optional, default 10, max 16) — maximum forward BFS depth
-///
-/// Returns `TraceToSymbolResult` with fields: `path` (array of hops or null),
-/// `complete`, and `reason` when no path is returned.
 pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -59,22 +49,7 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(10)
         .min(16) as usize;
 
-    let (max_files, project_root) = {
-        let config = ctx.config();
-        (config.max_callgraph_files, config.project_root.clone())
-    };
-
-    let mut cg_ref = ctx.callgraph().borrow_mut();
-    let graph = match cg_ref.as_mut() {
-        Some(g) => g,
-        None => {
-            return Response::error(
-                &req.id,
-                "not_configured",
-                "trace_to_symbol: project not configured — send 'configure' first",
-            );
-        }
-    };
+    let project_root = ctx.config().project_root.clone();
 
     let file_path = match validate_callgraph_path(req, ctx, file) {
         Ok(path) => path,
@@ -101,17 +76,21 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
 
-    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
-        Ok(symbol) => symbol,
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    let store = match ctx.ensure_callgraph_store_for_ops() {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            return unavailable_response(&req.id, "trace_to_symbol", ctx.is_worktree_bridge())
+        }
+        Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
     };
 
-    let target_candidates = match graph.trace_to_symbol_candidates(to_symbol, max_files) {
+    if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {
+        return store_error_response(&req.id, "trace_to_symbol", error);
+    }
+
+    let target_candidates = match trace_to_symbol_candidates(&store, to_symbol) {
         Ok(candidates) => candidates,
-        Err(err @ AftError::ProjectTooLarge { .. }) => {
-            return Response::error(&req.id, "project_too_large", format!("{}", err));
-        }
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
     };
 
     if let Some(to_file_path) = to_file_path.as_deref() {
@@ -155,22 +134,19 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.trace_to_symbol(
+    match trace_to_symbol_result(
+        &store,
         &file_path,
-        &symbol,
+        symbol,
         to_symbol,
         to_file_path.as_deref(),
         depth,
-        max_files,
     ) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }
-        Err(err @ AftError::ProjectTooLarge { .. }) => {
-            Response::error(&req.id, "project_too_large", format!("{}", err))
-        }
-        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+        Err(error) => store_error_response(&req.id, "trace_to_symbol", error),
     }
 }
 
