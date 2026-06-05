@@ -120,6 +120,8 @@ pub struct Config {
     pub search_index: bool,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
+    /// Enable the persisted callgraph store substrate (default: false).
+    pub callgraph_store: bool,
     /// Enable experimental bash command rewriting (default: false).
     pub experimental_bash_rewrite: bool,
     /// Enable experimental bash command compression (default: false).
@@ -205,6 +207,7 @@ impl Default for Config {
             restrict_to_project_root: false,
             search_index: false,
             semantic_search: false,
+            callgraph_store: false,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
             experimental_bash_background: false,

@@ -486,7 +486,7 @@ pub fn extract_calls_in_range(
 
 /// Extract calls with full callee expressions (including namespace qualifiers).
 ///
-/// Returns `(full_callee, short_name, line)` triples.
+/// Returns `(full_callee, short_name, line, byte_start, byte_end)` tuples.
 /// `full_callee` is e.g. "utils.foo", `short_name` is "foo".
 pub fn extract_calls_full(
     source: &str,
@@ -494,7 +494,7 @@ pub fn extract_calls_full(
     byte_start: usize,
     byte_end: usize,
     lang: LangId,
-) -> Vec<(String, String, u32)> {
+) -> Vec<(String, String, u32, usize, usize)> {
     let mut results = Vec::new();
     let call_kinds = call_node_kinds(lang);
     collect_calls_full(
@@ -514,7 +514,7 @@ fn collect_calls_full(
     byte_start: usize,
     byte_end: usize,
     call_kinds: &[&str],
-    results: &mut Vec<(String, String, u32)>,
+    results: &mut Vec<(String, String, u32, usize, usize)>,
 ) {
     let node_start = node.start_byte();
     let node_end = node.end_byte();
@@ -528,7 +528,13 @@ fn collect_calls_full(
             extract_full_callee(&node, source),
             extract_callee_name(&node, source),
         ) {
-            results.push((full, short, node.start_position().row as u32 + 1));
+            results.push((
+                full,
+                short,
+                node.start_position().row as u32 + 1,
+                node_start,
+                node_end,
+            ));
         }
     }
 

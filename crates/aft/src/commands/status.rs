@@ -231,6 +231,7 @@ impl AppContext {
                 "restrict_to_project_root": config.restrict_to_project_root,
                 "search_index": config.search_index,
                 "semantic_search": config.semantic_search,
+                "callgraph_store": config.callgraph_store,
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,

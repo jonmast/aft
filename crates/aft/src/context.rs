@@ -14,6 +14,7 @@ use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskRegistry};
 use crate::callgraph::CallGraph;
+use crate::callgraph_store::{CallGraphStore, CallGraphStoreError};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
@@ -499,6 +500,7 @@ pub struct AppContext {
     /// Empty when the project is healthy / full-featured.
     degraded_reasons: RefCell<Vec<String>>,
     callgraph: RefCell<Option<CallGraph>>,
+    callgraph_store: RefCell<Option<CallGraphStore>>,
     search_index: RefCell<Option<SearchIndex>>,
     search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
@@ -587,6 +589,7 @@ impl AppContext {
             git_common_dir: RefCell::new(None),
             degraded_reasons: RefCell::new(Vec::new()),
             callgraph: RefCell::new(None),
+            callgraph_store: RefCell::new(None),
             search_index: RefCell::new(None),
             search_index_rx: RefCell::new(None),
             pending_search_index_paths: RefCell::new(BTreeSet::new()),
@@ -1159,6 +1162,50 @@ impl AppContext {
     /// Access the call graph engine.
     pub fn callgraph(&self) -> &RefCell<Option<CallGraph>> {
         &self.callgraph
+    }
+
+    /// Access the persisted call graph store.
+    pub fn callgraph_store(&self) -> &RefCell<Option<CallGraphStore>> {
+        &self.callgraph_store
+    }
+
+    pub fn callgraph_store_dir(&self) -> PathBuf {
+        match self.harness_opt() {
+            Some(harness) => self.storage_dir().join(harness.as_str()).join("callgraph"),
+            None => self.storage_dir().join("callgraph"),
+        }
+    }
+
+    pub fn ensure_callgraph_store(
+        &self,
+    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+        if !self.config().callgraph_store {
+            return Ok(None);
+        }
+        if self.callgraph_store.borrow().is_none() {
+            let Some(project_root) = self.canonical_cache_root_opt().or_else(|| {
+                self.config()
+                    .project_root
+                    .clone()
+                    .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+            }) else {
+                return Ok(None);
+            };
+            let callgraph_dir = self.callgraph_store_dir();
+            let store = if self.is_worktree_bridge() {
+                CallGraphStore::open_readonly(callgraph_dir, project_root)?
+            } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
+                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+                let (store, _stats) =
+                    CallGraphStore::ensure_built_with_lease(callgraph_dir, project_root, &files)?;
+                Some(store)
+            } else {
+                Some(CallGraphStore::open(callgraph_dir, project_root)?)
+            };
+            *self.callgraph_store.borrow_mut() = store;
+        }
+        let borrow = self.callgraph_store.borrow_mut();
+        Ok(RefMut::filter_map(borrow, Option::as_mut).ok())
     }
 
     /// Access the search index.

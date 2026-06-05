@@ -1513,6 +1513,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic_search = v;
     }
     if let Some(v) = params
+        .get(crate::callgraph_store::CALLGRAPH_STORE_FLAG)
+        .and_then(|v| v.as_bool())
+    {
+        next_config.callgraph_store = v;
+    }
+    if let Some(v) = params
         .get("experimental_bash_rewrite")
         .and_then(|v| v.as_bool())
     {
@@ -1860,6 +1866,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let symbol_cache_generation = ctx.reset_symbol_cache();
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
+    *ctx.callgraph_store().borrow_mut() = None;
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
     ctx.clear_semantic_refresh_worker();
     *ctx.semantic_embedding_model().borrow_mut() = None;

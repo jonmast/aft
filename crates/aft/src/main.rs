@@ -1118,6 +1118,34 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
         graph.invalidate_file(&root.join(".aftignore"));
     }
 
+    if config.callgraph_store && !ctx.is_worktree_bridge() {
+        if let Some(store) = ctx.callgraph_store().borrow_mut().as_mut() {
+            let current_files = aft::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+            match store.refresh_corpus(&current_files) {
+                Ok(stats) => {
+                    aft::slog_info!(
+                        "callgraph store corpus refresh after ignore-rule change: {} files, {} edges",
+                        stats.files,
+                        stats.edges
+                    );
+                    status_changed = true;
+                }
+                Err(error) => {
+                    aft::slog_warn!(
+                        "callgraph store corpus refresh after ignore-rule change failed: {}",
+                        error
+                    );
+                    if let Err(mark_error) = store.mark_files_stale(&current_files) {
+                        aft::slog_warn!(
+                            "failed to mark callgraph store corpus stale after refresh failure: {}",
+                            mark_error
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     if config.search_index {
         spawn_search_corpus_refresh(ctx, root.clone(), config.clone());
         status_changed = true;
@@ -1163,6 +1191,40 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     }
 
     status_changed
+}
+
+fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::path::PathBuf>) {
+    if ctx.is_worktree_bridge() {
+        return;
+    }
+    if !ctx.config().callgraph_store {
+        return;
+    }
+    let source_paths = changed
+        .iter()
+        .filter(|path| watcher_path_is_source(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if source_paths.is_empty() {
+        return;
+    }
+    let mut store_ref = ctx.callgraph_store().borrow_mut();
+    let Some(store) = store_ref.as_mut() else {
+        return;
+    };
+    if let Err(error) = store.refresh_files(&source_paths) {
+        aft::slog_warn!("callgraph store refresh failed: {}", error);
+        match store.mark_files_stale(&source_paths) {
+            Ok(marked) => aft::slog_warn!(
+                "marked {} callgraph store file(s) stale after refresh failure",
+                marked.len()
+            ),
+            Err(mark_error) => aft::slog_warn!(
+                "failed to mark callgraph store files stale after refresh failure: {}",
+                mark_error
+            ),
+        }
+    }
 }
 
 /// Borrows the watcher receiver and callgraph in separate phases to avoid
@@ -1299,6 +1361,8 @@ fn drain_watcher_events(ctx: &AppContext) {
             }
         }
     }
+    drop(graph_ref);
+    refresh_callgraph_store_for_watcher(ctx, &changed);
 
     let mut index_ref = ctx.search_index().borrow_mut();
     if let Some(index) = index_ref.as_mut() {
@@ -1854,6 +1918,7 @@ mod watcher_filter_tests {
         AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
         SemanticRefreshRequest, SemanticRefreshWorkerSlot,
     };
+    use aft::harness::Harness;
     use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
     use aft::lsp::registry::ServerKind;
     use aft::lsp::roots::ServerKey;
@@ -1996,6 +2061,57 @@ mod watcher_filter_tests {
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+
+    #[test]
+    fn watcher_drain_refreshes_open_callgraph_store() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let source = root.join("main.ts");
+        std::fs::write(
+            &source,
+            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(root.join("storage")),
+                callgraph_store: true,
+                ..Config::default()
+            },
+        );
+        ctx.set_harness(Harness::Opencode);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx.set_cache_role(false, None);
+        ctx.rebuild_gitignore();
+        let tx = install_watcher_rx(&ctx);
+        {
+            let store = ctx
+                .ensure_callgraph_store()
+                .unwrap()
+                .expect("store should build on demand");
+            let tree = store
+                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+                .unwrap();
+            assert_eq!(tree.children[0].name, "oldLeaf");
+        }
+
+        std::fs::write(
+            &source,
+            "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        tx.send(Ok(watcher_modify_event(source))).unwrap();
+        drain_watcher_events(&ctx);
+
+        let store_ref = ctx.callgraph_store().borrow();
+        let store = store_ref.as_ref().expect("store remains open");
+        let tree = store
+            .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+            .unwrap();
+        assert_eq!(tree.children[0].name, "newLeaf");
     }
 
     #[test]

@@ -2811,13 +2811,15 @@ pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
 
         let sites: Vec<CallSite> = raw_calls
             .into_iter()
-            .map(|(full, short, line)| CallSite {
-                callee_name: short,
-                full_callee: full,
-                line,
-                byte_start,
-                byte_end,
-            })
+            .map(
+                |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                    callee_name: short,
+                    full_callee: full,
+                    line,
+                    byte_start: call_byte_start,
+                    byte_end: call_byte_end,
+                },
+            )
             .collect();
 
         if !sites.is_empty() {
@@ -2865,14 +2867,16 @@ pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
             let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
             let sites: Vec<CallSite> = raw_calls
                 .into_iter()
-                .filter(|(_, short, _)| *short != default_export.symbol)
-                .map(|(full, short, line)| CallSite {
-                    callee_name: short,
-                    full_callee: full,
-                    line,
-                    byte_start,
-                    byte_end,
-                })
+                .filter(|(_, short, _, _, _)| *short != default_export.symbol)
+                .map(
+                    |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                        callee_name: short,
+                        full_callee: full,
+                        line,
+                        byte_start: call_byte_start,
+                        byte_end: call_byte_end,
+                    },
+                )
                 .collect();
             if !sites.is_empty() {
                 calls_by_symbol.insert(default_export.symbol.clone(), sites);

@@ -1,5 +1,9 @@
 use aft::callgraph::walk_project_files;
 use aft::callgraph_store::{live_callgraph_edge_snapshot, CallGraphStore, StoredEdge};
+use aft::config::Config;
+use aft::context::AppContext;
+use aft::harness::Harness;
+use aft::parser::TreeSitterProvider;
 use filetime::FileTime;
 use std::collections::BTreeSet;
 use std::fs;
@@ -100,6 +104,340 @@ fn scenario_matrix_incremental_matches_cold_rebuild() {
             );
         }),
     );
+}
+
+#[test]
+fn query_api_matches_hand_built_ts_expectations() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("main.ts"),
+        r#"export function entry() {
+  second();
+  missing();
+}
+
+function second() {
+  leaf();
+}
+
+function leaf() {}
+"#,
+    );
+    let store =
+        CallGraphStore::open(dir.path().join(".store-query"), dir.path().to_path_buf()).unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+
+    let entry = store.node_for(Path::new("main.ts"), "entry").unwrap();
+    assert_eq!(entry.symbol, "entry");
+    assert!(entry.is_entry_point);
+
+    let unresolved = store.unresolved_calls_of(&entry).unwrap();
+    assert_eq!(
+        unresolved
+            .iter()
+            .map(|call| call.symbol.as_str())
+            .collect::<Vec<_>>(),
+        vec!["missing"]
+    );
+
+    let tree = store.call_tree(Path::new("main.ts"), "entry", 2).unwrap();
+    assert_eq!(tree.name, "entry");
+    assert_eq!(
+        tree.children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["second", "missing"]
+    );
+    assert!(tree.children[0].resolved);
+    assert!(!tree.children[1].resolved);
+    assert_eq!(tree.children[0].children[0].name, "leaf");
+
+    let callers = store.callers_of(Path::new("main.ts"), "leaf", 2).unwrap();
+    assert_eq!(callers.target.symbol, "leaf");
+    assert!(callers
+        .callers
+        .iter()
+        .any(|site| site.caller.symbol == "second"));
+    assert!(callers
+        .callers
+        .iter()
+        .any(|site| site.caller.symbol == "entry"));
+
+    let impact = store.impact_of(Path::new("main.ts"), "leaf", 1).unwrap();
+    assert_eq!(impact.target.symbol, "leaf");
+    assert_eq!(impact.callers[0].site.caller.symbol, "second");
+    assert_eq!(
+        impact.callers[0].call_expression.as_deref(),
+        Some("leaf();")
+    );
+
+    let trace = store.trace_to(Path::new("main.ts"), "leaf", 4).unwrap();
+    assert_eq!(trace.entry_points_found, 1);
+    assert_eq!(
+        trace.paths[0]
+            .hops
+            .iter()
+            .map(|hop| hop.symbol.as_str())
+            .collect::<Vec<_>>(),
+        vec!["entry", "second", "leaf"]
+    );
+
+    let candidates = store.trace_to_symbol_candidates("leaf").unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].file, "main.ts");
+
+    let path = store
+        .trace_to_symbol(Path::new("main.ts"), "entry", "leaf", None, 4)
+        .unwrap()
+        .path
+        .unwrap();
+    assert_eq!(
+        path.iter()
+            .map(|hop| hop.symbol.as_str())
+            .collect::<Vec<_>>(),
+        vec!["entry", "second", "leaf"]
+    );
+}
+
+#[test]
+fn reverse_lookup_includes_orphan_target_edges() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("main.ts"),
+        r#"export function orphanCaller() {}
+export function leaf() {}
+"#,
+    );
+    let store =
+        CallGraphStore::open(dir.path().join(".store-orphan"), dir.path().to_path_buf()).unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+
+    let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
+    let source_node: String = conn
+        .query_row(
+            "SELECT id FROM nodes WHERE file_path = 'main.ts' AND scoped_name = 'orphanCaller'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO refs(ref_id, caller_node, caller_file, kind, short_name, full_ref, line, byte_start, byte_end, status, target_file, target_symbol, provenance, raw_payload)
+         VALUES('orphan-ref', ?1, 'main.ts', 'call', 'leaf', 'leaf', 1, 1, 5, 'resolved', 'main.ts', 'leaf', 'test', '{}')",
+        rusqlite::params![source_node],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges(edge_id, ref_id, source_node, target_node, target_file, target_symbol, kind, line, provenance)
+         VALUES('orphan-edge', 'orphan-ref', ?1, NULL, 'main.ts', 'leaf', 'call', 1, 'test')",
+        rusqlite::params![source_node],
+    )
+    .unwrap();
+    drop(conn);
+
+    let callers = store.callers_of(Path::new("main.ts"), "leaf", 1).unwrap();
+    assert!(
+        callers
+            .callers
+            .iter()
+            .any(|site| site.caller.symbol == "orphanCaller" && site.target.is_none()),
+        "target_node=NULL edge should still be found by target file/symbol: {callers:#?}"
+    );
+}
+
+#[test]
+fn cold_build_skips_failed_extracts_and_marks_them_stale() {
+    let dir = tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    let bad = dir.path().join("bad.txt");
+    write_file(&good, "export function good() {}\n");
+    write_file(&bad, "not a callgraph language\n");
+
+    let store = CallGraphStore::open(
+        dir.path().join(".store-best-effort"),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    let stats = store.cold_build(&[good, bad.clone()]).unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.failed_files, vec!["bad.txt"]);
+    assert_eq!(
+        store.backend_status_for_file(&bad).unwrap().as_deref(),
+        Some("stale")
+    );
+    assert!(store.node_for(Path::new("good.ts"), "good").is_ok());
+}
+
+#[test]
+fn scoped_entry_point_flag_matches_legacy_scoped_input() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("suite.ts"),
+        r#"class Suite {
+  setup() {}
+}
+"#,
+    );
+    let store =
+        CallGraphStore::open(dir.path().join(".store-entry"), dir.path().to_path_buf()).unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+
+    let setup = store
+        .node_for(Path::new("suite.ts"), "Suite::setup")
+        .unwrap();
+    assert!(
+        !setup.is_entry_point,
+        "scoped Suite::setup must not be treated like bare setup"
+    );
+}
+
+#[test]
+fn outgoing_calls_are_returned_in_source_order() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("order.ts"),
+        r#"export function entry() { beta(); alpha(); }
+function alpha() {}
+function beta() {}
+"#,
+    );
+    let store =
+        CallGraphStore::open(dir.path().join(".store-order"), dir.path().to_path_buf()).unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+
+    let entry = store.node_for(Path::new("order.ts"), "entry").unwrap();
+    let calls = store.outgoing_calls_of(&entry).unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.target_symbol.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta", "alpha"]
+    );
+}
+
+#[test]
+fn cold_build_with_lease_swaps_atomically_over_old_ready_db() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("main.ts"),
+        "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+    );
+    let files = project_files(dir.path());
+    let store_dir = dir.path().join(".store-atomic");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), dir.path().to_path_buf(), &files)
+            .unwrap();
+    let old_edges = store.edge_snapshot().unwrap();
+    assert!(!old_edges.is_empty());
+
+    write_file(
+        &dir.path().join("main.ts"),
+        "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
+    );
+    let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed_for_hook = observed.clone();
+    let root = dir.path().to_path_buf();
+    let store_dir_for_hook = store_dir.clone();
+    let old_edges_for_hook = old_edges.clone();
+    aft::callgraph_store::set_cold_build_swap_observer(Some(std::sync::Arc::new(
+        move |_tmp, _target| {
+            let reader = CallGraphStore::open_readonly(store_dir_for_hook.clone(), root.clone())
+                .unwrap()
+                .expect("old ready DB should remain visible before swap");
+            assert_eq!(reader.edge_snapshot().unwrap(), old_edges_for_hook);
+            observed_for_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    )));
+    let rebuilt = CallGraphStore::cold_build_with_lease(
+        store_dir,
+        dir.path().to_path_buf(),
+        &project_files(dir.path()),
+    );
+    aft::callgraph_store::set_cold_build_swap_observer(None);
+    let (store, _) = rebuilt.unwrap();
+    assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+    let tree = store.call_tree(Path::new("main.ts"), "entry", 1).unwrap();
+    assert_eq!(tree.children[0].name, "newLeaf");
+}
+
+#[test]
+fn app_context_demand_builds_once_and_worktree_reads_readonly() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("main.ts"),
+        "export function entry() { leaf(); }\nfunction leaf() {}\n",
+    );
+    let storage = dir.path().join("storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(dir.path().to_path_buf()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(dir.path().to_path_buf());
+    ctx.set_cache_role(false, None);
+
+    {
+        let store = ctx
+            .ensure_callgraph_store()
+            .unwrap()
+            .expect("main checkout builds store");
+        assert!(store.sqlite_path().is_file());
+    }
+    let sqlite_path = ctx
+        .callgraph_store()
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .sqlite_path()
+        .to_path_buf();
+    let first_mtime = fs::metadata(&sqlite_path).unwrap().modified().unwrap();
+    {
+        let store = ctx
+            .ensure_callgraph_store()
+            .unwrap()
+            .expect("second ensure reuses open store");
+        let tree = store.call_tree(Path::new("main.ts"), "entry", 1).unwrap();
+        assert_eq!(tree.children[0].name, "leaf");
+    }
+    assert_eq!(
+        fs::metadata(&sqlite_path).unwrap().modified().unwrap(),
+        first_mtime
+    );
+
+    let worktree_ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(dir.path().to_path_buf()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    worktree_ctx.set_harness(Harness::Opencode);
+    worktree_ctx.set_canonical_cache_root(dir.path().to_path_buf());
+    worktree_ctx.set_cache_role(true, None);
+    assert!(worktree_ctx.ensure_callgraph_store().unwrap().is_some());
+
+    let unavailable_dir = tempdir().unwrap();
+    let unavailable_ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(unavailable_dir.path().to_path_buf()),
+            storage_dir: Some(unavailable_dir.path().join("storage")),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    unavailable_ctx.set_harness(Harness::Opencode);
+    unavailable_ctx.set_canonical_cache_root(unavailable_dir.path().to_path_buf());
+    unavailable_ctx.set_cache_role(true, None);
+    assert!(unavailable_ctx.ensure_callgraph_store().unwrap().is_none());
 }
 
 #[test]
