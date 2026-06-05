@@ -148,7 +148,7 @@ strip = false
 
 fn compress_builtin(command: &str, output: &str) -> String {
     let registry = build_registry(ALL, None, None);
-    aft::compress::compress_with_registry(command, output, &registry)
+    aft::compress::compress_with_registry(command, output, &registry).text
 }
 
 #[test]

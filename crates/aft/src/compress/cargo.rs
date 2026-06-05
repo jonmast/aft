@@ -1,5 +1,6 @@
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::GenericCompressor;
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 pub struct CargoCompressor;
 
@@ -11,11 +12,11 @@ impl Compressor for CargoCompressor {
             .is_some_and(|head| head == "cargo")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         match cargo_subcommand(command).as_deref() {
             Some("build" | "check" | "clippy") => compress_build_like(output),
             Some("test") => compress_test(output),
-            _ => GenericCompressor::compress_output(output),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 
@@ -23,7 +24,7 @@ impl Compressor for CargoCompressor {
         output.lines().any(is_cargo_test_signature_line)
     }
 
-    fn compress_output_match(&self, output: &str) -> String {
+    fn compress_output_match(&self, output: &str) -> CompressionResult {
         compress_test(output)
     }
 }
@@ -51,17 +52,17 @@ fn cargo_subcommand(command: &str) -> Option<String> {
     None
 }
 
-fn compress_build_like(output: &str) -> String {
+fn compress_build_like(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_diagnostic = lines
         .iter()
         .any(|line| is_warning_or_error(line) || line.trim_start().starts_with("error["));
 
     if !has_diagnostic {
-        return output.trim_end().to_string();
+        return CompressionResult::new(output.trim_end().to_string());
     }
 
-    let mut result = Vec::new();
+    let mut blocks = Vec::new();
     let mut index = 0usize;
 
     while index < lines.len() {
@@ -72,22 +73,28 @@ fn compress_build_like(output: &str) -> String {
         }
 
         if is_warning_or_error(line) || line.trim_start().starts_with("error[") {
+            let class = if line.trim_start().starts_with("warning:") {
+                DropClass::Warning
+            } else {
+                DropClass::Error
+            };
             let start = index;
             index += 1;
             while index < lines.len() && !starts_next_build_message(lines[index]) {
                 index += 1;
             }
-            result.extend(lines[start..index].iter().map(|line| (*line).to_string()));
+            blocks.push(ClassifiedBlock::new(class, lines[start..index].join("\n")));
             continue;
         }
 
         if is_final_cargo_summary(line) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         }
         index += 1;
     }
 
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 fn starts_next_build_message(line: &str) -> bool {
@@ -129,7 +136,7 @@ fn is_final_cargo_summary(line: &str) -> bool {
         || trimmed.starts_with("test result:")
 }
 
-fn compress_test(output: &str) -> String {
+fn compress_test(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
     if !has_failures {
@@ -143,28 +150,28 @@ fn compress_test(output: &str) -> String {
             })
             .map(|line| (*line).to_string())
             .collect();
-        return trim_trailing_lines(&result.join("\n"));
+        return CompressionResult::new(trim_trailing_lines(&result.join("\n")));
     }
 
-    let mut result = Vec::new();
+    let mut blocks = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
         if trimmed.starts_with("running ") || trimmed.starts_with("test result:") {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
 
         if trimmed == "failures:" {
-            result.extend(lines[index..].iter().map(|line| (*line).to_string()));
+            blocks.push(ClassifiedBlock::unclassified(lines[index..].join("\n")));
             break;
         }
 
         if line.starts_with("---- ") {
+            let start = index;
             while index < lines.len() {
-                result.push(lines[index].to_string());
                 index += 1;
                 if index < lines.len()
                     && (lines[index].trim_start().starts_with("test result:")
@@ -173,13 +180,18 @@ fn compress_test(output: &str) -> String {
                     break;
                 }
             }
+            blocks.push(ClassifiedBlock::new(
+                DropClass::Failure,
+                lines[start..index].join("\n"),
+            ));
             continue;
         }
 
         index += 1;
     }
 
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 fn trim_trailing_lines(input: &str) -> String {

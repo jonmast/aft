@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, GenericCompressor};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const STATUS_SHORT_LIMIT: usize = 1024;
 const STATUS_KEEP_PER_SECTION: usize = 10;
@@ -21,21 +21,21 @@ impl Compressor for GitCompressor {
         command_head(command).is_some_and(|head| head == "git")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         match git_subcommand(command).as_deref() {
-            Some("add") => compress_add(output),
-            Some("status") => compress_status(output),
-            Some("diff") => compress_diff(output, false),
-            Some("log") => compress_log(output),
-            Some("show") => compress_diff(output, true),
-            Some("branch") => trim_trailing_lines(&dedup_consecutive(output)),
-            Some("blame") => compress_blame(output),
-            Some("commit") => compress_commit(output),
-            Some("push") => compress_push(output),
-            Some("pull") => compress_pull(output),
-            Some("fetch") => compress_fetch(output),
-            Some("stash") => compress_stash(command, output),
-            _ => GenericCompressor::compress_output(output),
+            Some("add") => compress_add(output).into(),
+            Some("status") => compress_status(output).into(),
+            Some("diff") => compress_diff(output, false).into(),
+            Some("log") => compress_log(output).into(),
+            Some("show") => compress_diff(output, true).into(),
+            Some("branch") => trim_trailing_lines(&dedup_consecutive(output)).into(),
+            Some("blame") => compress_blame(output).into(),
+            Some("commit") => compress_commit(output).into(),
+            Some("push") => compress_push(output).into(),
+            Some("pull") => compress_pull(output).into(),
+            Some("fetch") => compress_fetch(output).into(),
+            Some("stash") => compress_stash(command, output).into(),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 }

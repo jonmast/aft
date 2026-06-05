@@ -83,7 +83,7 @@ fn main() {
         ctx.bash_background()
             .set_compressor(move |command: &str, output: String| {
                 if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return output;
+                    return aft::compress::CompressionResult::new(output);
                 }
                 let registry_guard = match filter_registry_handle.read() {
                     Ok(g) => g,

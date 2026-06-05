@@ -1,12 +1,8 @@
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{Compressor, Specificity};
+use crate::compress::{CompressionResult, Compressor, Specificity};
 
 pub struct BunCompressor;
-
-/// Maximum number of failure blocks to preserve in a `bun test` run.
-/// Beyond this, additional failures are dropped with a "+N more failures"
-/// trailer so a catastrophic 1000-failure run still fits in the inline cap.
-const MAX_FAILURES: usize = 25;
 
 impl Compressor for BunCompressor {
     fn specificity(&self) -> Specificity {
@@ -20,12 +16,12 @@ impl Compressor for BunCompressor {
             .is_some_and(|head| head == "bun")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         match bun_subcommand(command).as_deref() {
-            Some("install" | "i" | "add" | "remove") => compress_package(output),
+            Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
             Some("test") => compress_test(output),
             Some("build") => compress_build(output),
-            _ => GenericCompressor::compress_output(output),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 
@@ -45,7 +41,7 @@ impl Compressor for BunCompressor {
         false
     }
 
-    fn compress_output_match(&self, output: &str) -> String {
+    fn compress_output_match(&self, output: &str) -> CompressionResult {
         compress_test(output)
     }
 }
@@ -102,24 +98,17 @@ fn compress_package(output: &str) -> String {
     trim_trailing_lines(&result.join("\n"))
 }
 
-fn compress_build(output: &str) -> String {
-    let mut result = Vec::new();
-    let mut timing_seen = 0usize;
-    let mut timing_omitted = 0usize;
+fn compress_build(output: &str) -> CompressionResult {
+    let mut blocks = Vec::new();
     for line in output.lines() {
         if is_timing_line(line) {
-            timing_seen += 1;
-            if timing_seen > 10 {
-                timing_omitted += 1;
-                continue;
-            }
+            blocks.push(ClassifiedBlock::new(DropClass::Timing, line.to_string()));
+        } else {
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         }
-        result.push(line.to_string());
     }
-    if timing_omitted > 0 {
-        result.push(format!("... and {timing_omitted} more timing lines"));
-    }
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 /// Compress `bun test` output. Preserves:
@@ -135,17 +124,17 @@ fn compress_build(output: &str) -> String {
 ///     already conveys count) — but if no failures exist, returns the
 ///     full original output via the generic compressor for safety
 ///
-/// Cap: `MAX_FAILURES` failure blocks preserved; further blocks dropped
-/// with a `+N more failures` trailer.
+/// Failure blocks are class-capped by the shared semantic cap helper; the
+/// registry emits the single visible omission marker.
 ///
 /// Why this matters: bun test writes failure blocks INLINE between the
 /// header and the final summary. With the 30KB inline cap, large test
 /// runs middle-truncate and lose the failure block entirely — agents
 /// see only the header + summary count and have no debugging context.
-fn compress_test(output: &str) -> String {
+fn compress_test(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     if lines.is_empty() {
-        return output.to_string();
+        return CompressionResult::new(output.to_string());
     }
 
     // Quick pre-scan: if no failures, defer to generic. This keeps the
@@ -153,14 +142,13 @@ fn compress_test(output: &str) -> String {
     // the truncation problem (small all-pass runs are already short).
     let has_failures = lines.iter().any(|line| is_bun_test_fail_marker(line));
     if !has_failures {
-        return compress_test_pass_only(&lines);
+        return CompressionResult::new(compress_test_pass_only(&lines));
     }
 
-    let mut result: Vec<String> = Vec::new();
-    let mut failures_kept = 0usize;
-    let mut failures_dropped = 0usize;
+    let mut blocks: Vec<ClassifiedBlock> = Vec::new();
     let mut index = 0usize;
     let mut saw_ran_summary = false;
+    let mut pending_section: Option<String> = None;
 
     while index < lines.len() {
         let line = lines[index];
@@ -171,14 +159,14 @@ fn compress_test(output: &str) -> String {
             // so chains don't silently lose the next command's output.
             // (Note: `&&` short-circuits on test failure so this is mainly
             // relevant for `;` separators or `|| fallback_cmd`.)
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
 
         // Bun version header — always keep.
         if is_bun_test_header(line) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
@@ -197,7 +185,7 @@ fn compress_test(output: &str) -> String {
                 (None, _) => false,
             };
             if keep_section {
-                result.push(line.to_string());
+                pending_section = Some(line.to_string());
             }
             index += 1;
             continue;
@@ -205,7 +193,7 @@ fn compress_test(output: &str) -> String {
 
         // Summary tail — always keep.
         if is_summary_line(line) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             // The `Ran N tests across M files. [Xms]` line marks the
             // boundary between bun-test output and any chained-command
             // output that follows. (Bun uses `file. [` singular when
@@ -240,14 +228,19 @@ fn compress_test(output: &str) -> String {
                 block_end += 1;
             }
 
-            failures_kept += 1;
-            if failures_kept <= MAX_FAILURES {
-                for line in &lines[block_start..block_end] {
-                    result.push((*line).to_string());
-                }
-            } else {
-                failures_dropped += 1;
+            let mut block_lines = Vec::new();
+            if let Some(section) = pending_section.take() {
+                block_lines.push(section);
             }
+            block_lines.extend(
+                lines[block_start..block_end]
+                    .iter()
+                    .map(|line| (*line).to_string()),
+            );
+            blocks.push(ClassifiedBlock::new(
+                DropClass::Failure,
+                block_lines.join("\n"),
+            ));
             index = block_end;
             continue;
         }
@@ -256,16 +249,13 @@ fn compress_test(output: &str) -> String {
         index += 1;
     }
 
-    if failures_dropped > 0 {
-        result.push(format!("+{failures_dropped} more failures"));
-    }
-
     // Safety net: if we somehow stripped everything, fall back so the
     // agent at least sees the raw bytes truncated by the generic path.
-    if result.is_empty() {
-        return GenericCompressor::compress_output(output);
+    if blocks.is_empty() {
+        return GenericCompressor::compress_output(output).into();
     }
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
 }
 
 /// All-pass `bun test` output: keep version header + summary + drop the

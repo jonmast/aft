@@ -1,4 +1,5 @@
-use crate::compress::Compressor;
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
+use crate::compress::{CompressionResult, Compressor};
 
 pub struct PytestCompressor;
 
@@ -11,7 +12,7 @@ impl Compressor for PytestCompressor {
                 .any(|window| matches!(window, ["python" | "python3", "-m", "pytest"]))
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
         compress_pytest(output)
     }
 
@@ -26,9 +27,9 @@ impl Compressor for PytestCompressor {
     }
 }
 
-fn compress_pytest(output: &str) -> String {
+fn compress_pytest(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
-    let mut result = Vec::new();
+    let mut blocks = Vec::new();
     let mut index = 0usize;
 
     while index < lines.len() {
@@ -36,38 +37,32 @@ fn compress_pytest(output: &str) -> String {
         let trimmed = line.trim();
 
         if is_header_line(trimmed) || is_failure_or_error_test_line(trimmed) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
 
         if is_section_header(trimmed, "FAILURES") || is_section_header(trimmed, "ERRORS") {
-            while index < lines.len() {
-                let current = lines[index];
-                let current_trimmed = current.trim();
-                if index != 0
-                    && index != lines.len() - 1
-                    && current_trimmed.starts_with('=')
-                    && !is_section_header(current_trimmed, "FAILURES")
-                    && !is_section_header(current_trimmed, "ERRORS")
-                {
-                    break;
-                }
-                result.push(current.to_string());
-                index += 1;
-            }
+            let class = if is_section_header(trimmed, "ERRORS") {
+                DropClass::Error
+            } else {
+                DropClass::Failure
+            };
+            let (section_blocks, next_index) = compress_failure_section(&lines, index, class);
+            blocks.extend(section_blocks);
+            index = next_index;
             continue;
         }
 
         if is_section_header(trimmed, "warnings summary") {
             let (warnings, next_index) = compress_warnings(&lines, index);
-            result.extend(warnings);
+            blocks.extend(warnings);
             index = next_index;
             continue;
         }
 
         if is_section_header(trimmed, "short test summary info") || is_final_summary(trimmed) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
         }
@@ -80,7 +75,45 @@ fn compress_pytest(output: &str) -> String {
         index += 1;
     }
 
-    trim_trailing_lines(&result.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
+}
+
+fn compress_failure_section(
+    lines: &[&str],
+    start: usize,
+    class: DropClass,
+) -> (Vec<ClassifiedBlock>, usize) {
+    let mut blocks = vec![ClassifiedBlock::unclassified(lines[start].to_string())];
+    let mut index = start + 1;
+    let mut current: Vec<String> = Vec::new();
+
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+        if trimmed.starts_with('=') && trimmed.ends_with('=') {
+            break;
+        }
+        if is_pytest_case_header(trimmed) && !current.is_empty() {
+            blocks.push(ClassifiedBlock::new(class, current.join("\n")));
+            current.clear();
+        }
+        current.push(line.to_string());
+        index += 1;
+    }
+
+    if !current.is_empty() {
+        blocks.push(ClassifiedBlock::new(class, current.join("\n")));
+    }
+
+    (blocks, index)
+}
+
+fn is_pytest_case_header(trimmed: &str) -> bool {
+    (trimmed.starts_with('_') && trimmed.ends_with('_'))
+        || trimmed.starts_with("ERROR at ")
+        || trimmed.starts_with("FAILED ")
+        || trimmed.starts_with("ERROR ")
 }
 
 fn is_header_line(trimmed: &str) -> bool {
@@ -142,11 +175,10 @@ fn is_final_summary(trimmed: &str) -> bool {
         && trimmed.ends_with('=')
 }
 
-fn compress_warnings(lines: &[&str], start: usize) -> (Vec<String>, usize) {
-    let mut result = vec![lines[start].to_string()];
+fn compress_warnings(lines: &[&str], start: usize) -> (Vec<ClassifiedBlock>, usize) {
+    let mut blocks = vec![ClassifiedBlock::unclassified(lines[start].to_string())];
     let mut index = start + 1;
-    let mut warnings_seen = 0usize;
-    let mut omitted = 0usize;
+    let mut current: Vec<String> = Vec::new();
 
     while index < lines.len() {
         let line = lines[index];
@@ -154,24 +186,19 @@ fn compress_warnings(lines: &[&str], start: usize) -> (Vec<String>, usize) {
         if trimmed.starts_with('=') && trimmed.ends_with('=') {
             break;
         }
-        if is_warning_entry(trimmed) {
-            warnings_seen += 1;
-            if warnings_seen <= 5 {
-                result.push(line.to_string());
-            } else {
-                omitted += 1;
-            }
-        } else if warnings_seen <= 5 {
-            result.push(line.to_string());
+        if is_warning_entry(trimmed) && !current.is_empty() {
+            blocks.push(ClassifiedBlock::new(DropClass::Warning, current.join("\n")));
+            current.clear();
         }
+        current.push(line.to_string());
         index += 1;
     }
 
-    if omitted > 0 {
-        result.push(format!("... and {omitted} more warnings"));
+    if !current.is_empty() {
+        blocks.push(ClassifiedBlock::new(DropClass::Warning, current.join("\n")));
     }
 
-    (result, index)
+    (blocks, index)
 }
 
 fn is_warning_entry(trimmed: &str) -> bool {

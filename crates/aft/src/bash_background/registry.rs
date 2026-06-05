@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::compress::caps::DropClass;
+use crate::compress::CompressionResult;
 use crate::context::SharedProgressSender;
 use crate::harness::Harness;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
@@ -23,10 +25,11 @@ use std::os::windows::process::CommandExt;
 
 use super::buffer::{combine_streams, BgBuffer, StreamKind, TokenCountInput};
 use super::output::{
-    cap_completion_output, cap_final_output, json_output_pointer, COMPLETION_OUTPUT_PREVIEW_BYTES,
+    cap_completion_output, cap_completion_output_with_marker, cap_final_output,
+    cap_final_output_with_marker, json_output_pointer, COMPLETION_OUTPUT_PREVIEW_BYTES,
     COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
-    RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES, RAW_PASSTHROUGH_TAIL_BYTES,
-    RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
+    FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
+    RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
 };
 use super::persistence::{
     create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
@@ -130,6 +133,26 @@ struct TerminalOutputCache {
     output_truncated: bool,
     kind: TerminalOutputKind,
     output_path: Option<String>,
+    stderr_path: Option<String>,
+    recovery: Option<RecoveryContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryContext {
+    dropped_by_class: BTreeMap<DropClass, usize>,
+    had_inner_drop: bool,
+    offset_hint_eligible: bool,
+    offset_start_line: Option<usize>,
+    byte_truncated: bool,
+    output_path: Option<String>,
+    stderr_path: Option<String>,
+    include_stderr_path: bool,
+}
+
+impl RecoveryContext {
+    fn has_visible_drop(&self) -> bool {
+        self.byte_truncated || self.had_inner_drop || !self.dropped_by_class.is_empty()
+    }
 }
 
 #[derive(Clone)]
@@ -153,7 +176,8 @@ pub(crate) struct RegistryInner {
     /// the watchdog thread when a task reaches a terminal state and from
     /// `bash_status`/`list` snapshot reads. When `None`, output is returned
     /// uncompressed.
-    pub(crate) compressor: Mutex<Option<Box<dyn Fn(&str, String) -> String + Send + Sync>>>,
+    pub(crate) compressor:
+        Mutex<Option<Box<dyn Fn(&str, String) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
@@ -246,7 +270,7 @@ impl BgTaskRegistry {
     /// reference. When called multiple times, the latest installation wins.
     pub fn set_compressor<F>(&self, compressor: F)
     where
-        F: Fn(&str, String) -> String + Send + Sync + 'static,
+        F: Fn(&str, String) -> CompressionResult + Send + Sync + 'static,
     {
         if let Ok(mut slot) = self.inner.compressor.lock() {
             *slot = Some(Box::new(compressor));
@@ -255,13 +279,13 @@ impl BgTaskRegistry {
 
     /// Apply the installed compressor (if any) to `output`. Returns `output`
     /// untouched when no compressor is installed.
-    pub(crate) fn compress_output(&self, command: &str, output: String) -> String {
+    pub(crate) fn compress_output(&self, command: &str, output: String) -> CompressionResult {
         let Ok(slot) = self.inner.compressor.lock() else {
-            return output;
+            return CompressionResult::new(output);
         };
         match slot.as_ref() {
             Some(compressor) => compressor(command, output),
-            None => output,
+            None => CompressionResult::new(output),
         }
     }
 
@@ -300,6 +324,8 @@ impl BgTaskRegistry {
                 output_truncated: false,
                 kind: TerminalOutputKind::Raw,
                 output_path: buffer.output_path().map(|path| path.display().to_string()),
+                stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+                recovery: None,
             };
         }
 
@@ -317,13 +343,7 @@ impl BgTaskRegistry {
             COMPRESS_INPUT_TAIL_BYTES,
         );
         let compressed = self.compress_output(&metadata.command, raw.text);
-        let capped = cap_final_output(&compressed);
-        TerminalOutputCache {
-            output_preview: capped.text,
-            output_truncated: raw.truncated || capped.truncated,
-            kind: TerminalOutputKind::Compressed,
-            output_path: buffer.output_path().map(|path| path.display().to_string()),
-        }
+        render_compressed_with_recovery(buffer, compressed, raw.truncated)
     }
 
     fn snapshot_with_terminal_cache(
@@ -2683,6 +2703,180 @@ impl BgTaskRegistry {
     }
 }
 
+fn render_compressed_with_recovery(
+    buffer: &BgBuffer,
+    mut compressed: CompressionResult,
+    input_truncated: bool,
+) -> TerminalOutputCache {
+    compressed.text = strip_plain_truncation_marker_lines(&compressed.text)
+        .trim_end()
+        .to_string();
+
+    let output_path = buffer.output_path().map(|path| path.display().to_string());
+    let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
+    let include_stderr_path = buffer.stream_len(StreamKind::Stderr) > 0;
+    let mut recovery = RecoveryContext {
+        dropped_by_class: compressed.dropped_by_class,
+        had_inner_drop: compressed.had_inner_drop,
+        offset_hint_eligible: compressed.offset_hint_eligible,
+        offset_start_line: compressed.offset_start_line,
+        byte_truncated: input_truncated,
+        output_path: output_path.clone(),
+        stderr_path: stderr_path.clone(),
+        include_stderr_path,
+    };
+
+    let (output_preview, output_truncated) =
+        render_body_with_recovery_marker(&compressed.text, &mut recovery);
+    TerminalOutputCache {
+        output_preview,
+        output_truncated,
+        kind: TerminalOutputKind::Compressed,
+        output_path,
+        stderr_path,
+        recovery: Some(recovery),
+    }
+}
+
+fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) -> (String, bool) {
+    let needs_marker = recovery.has_visible_drop();
+    if body.len() > FINAL_OUTPUT_CAP_BYTES {
+        recovery.byte_truncated = true;
+        if let Some(marker) = recovery_marker(recovery) {
+            let capped = cap_final_output_with_marker(body, &marker);
+            return (capped.text, true);
+        }
+        let capped = cap_final_output(body);
+        return (capped.text, capped.truncated || needs_marker);
+    }
+
+    if !needs_marker {
+        return (body.to_string(), false);
+    }
+
+    let Some(marker) = recovery_marker(recovery) else {
+        return (body.to_string(), true);
+    };
+    let with_marker = append_recovery_marker(body, &marker);
+    if with_marker.len() <= FINAL_OUTPUT_CAP_BYTES {
+        return (with_marker, true);
+    }
+
+    recovery.byte_truncated = true;
+    let marker = recovery_marker(recovery).unwrap_or(marker);
+    let capped = cap_final_output_with_marker(body, &marker);
+    (capped.text, true)
+}
+
+fn append_recovery_marker(body: &str, marker: &str) -> String {
+    if body.is_empty() {
+        return marker.to_string();
+    }
+    let mut output = body.trim_end().to_string();
+    output.push('\n');
+    output.push_str(marker);
+    output
+}
+
+fn recovery_marker(recovery: &RecoveryContext) -> Option<String> {
+    let mut parts = Vec::new();
+    for (class, count) in &recovery.dropped_by_class {
+        let label = if *count == 1 {
+            class.singular()
+        } else {
+            class.plural()
+        };
+        parts.push(format!("+{count} more {label}"));
+    }
+    if recovery.byte_truncated {
+        parts.push("truncated output".to_string());
+    } else if recovery.had_inner_drop && parts.is_empty() {
+        parts.push("omitted output".to_string());
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let hint = recovery_hint(recovery);
+    Some(format!("[{}; {hint}]", parts.join(", ")))
+}
+
+fn recovery_hint(recovery: &RecoveryContext) -> String {
+    // AFT stores stdout/stderr separately and combines them in memory. Class caps,
+    // middle truncation, and mixed stdout/stderr renders are not line-offset
+    // portable. Only a single-file contiguous-prefix drop may use `tail -n +N`.
+    if recovery.offset_hint_eligible
+        && !recovery.byte_truncated
+        && recovery.dropped_by_class.is_empty()
+        && !recovery.include_stderr_path
+    {
+        if let (Some(path), Some(line)) =
+            (recovery.output_path.as_deref(), recovery.offset_start_line)
+        {
+            return format!("see remaining: tail -n +{line} {}", quote_path(path));
+        }
+    }
+
+    let mut paths = Vec::new();
+    if let Some(path) = recovery.output_path.as_deref() {
+        paths.push(path);
+    }
+    if recovery.include_stderr_path {
+        if let Some(path) = recovery.stderr_path.as_deref() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        return "full output unavailable".to_string();
+    }
+
+    let reads = paths
+        .into_iter()
+        .map(|path| format!("read {}", quote_path(path)))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("full output: {reads}")
+}
+
+fn quote_path(path: &str) -> String {
+    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn strip_plain_truncation_marker_lines(input: &str) -> String {
+    input
+        .lines()
+        .filter(|line| !is_plain_truncation_marker(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_recovery_marker_lines(input: &str) -> String {
+    input
+        .lines()
+        .filter(|line| !is_recovery_marker(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_plain_truncation_marker(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("...<truncated ") else {
+        return false;
+    };
+    let Some(bytes) = rest.strip_suffix(" bytes>...") else {
+        return false;
+    };
+    !bytes.is_empty() && bytes.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_recovery_marker(line: &str) -> bool {
+    line.starts_with('[') && line.ends_with(']') && line.contains("full output: read ")
+}
+
 fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<TerminalOutputCache> {
     if !is_gh_structured_command(command) {
         return None;
@@ -2705,6 +2899,8 @@ fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<Terminal
             output_truncated: true,
             kind: TerminalOutputKind::Structured,
             output_path: Some(output_path),
+            stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+            recovery: None,
         });
     }
 
@@ -2718,6 +2914,8 @@ fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<Terminal
         output_truncated: false,
         kind: TerminalOutputKind::Structured,
         output_path: Some(output_path),
+        stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+        recovery: None,
     })
 }
 
@@ -2732,6 +2930,8 @@ fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
         output_truncated: raw.truncated,
         kind: TerminalOutputKind::Raw,
         output_path: buffer.output_path().map(|path| path.display().to_string()),
+        stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
+        recovery: None,
     }
 }
 
@@ -2746,6 +2946,19 @@ fn completion_preview_for_cache(cache: &TerminalOutputCache) -> (String, bool) {
             );
         }
         return (cache.output_preview.clone(), cache.output_truncated);
+    }
+
+    if let Some(recovery) = cache.recovery.as_ref() {
+        if cache.output_preview.len() <= BG_COMPLETION_PREVIEW_BYTES {
+            return (cache.output_preview.clone(), cache.output_truncated);
+        }
+        let body = strip_recovery_marker_lines(&cache.output_preview);
+        let mut completion_recovery = recovery.clone();
+        completion_recovery.byte_truncated = true;
+        if let Some(marker) = recovery_marker(&completion_recovery) {
+            let capped = cap_completion_output_with_marker(&body, &marker);
+            return (capped.text, true);
+        }
     }
 
     let capped = cap_completion_output(&cache.output_preview);
@@ -3676,7 +3889,7 @@ mod tests {
                     unlocked_for_closure.store(true, Ordering::SeqCst);
                 }
             }
-            format!("compressed {} bytes", output.len())
+            CompressionResult::new(format!("compressed {} bytes", output.len()))
         });
 
         let first = registry
@@ -3741,7 +3954,7 @@ mod tests {
         let calls_for_closure = Arc::clone(&calls);
         registry.set_compressor(move |_command, output| {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            output
+            CompressionResult::new(output)
         });
         let (task_id, _task) = insert_terminal_piped_task(
             &registry,
@@ -3770,6 +3983,120 @@ mod tests {
             0,
             "structured JSON bypasses compression"
         );
+    }
+
+    #[test]
+    fn registry_emits_single_recovery_marker_for_class_drops() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        registry.set_compressor(move |_command, _output| {
+            let mut dropped = BTreeMap::new();
+            dropped.insert(DropClass::Error, 18);
+            dropped.insert(DropClass::Warning, 6);
+            CompressionResult::with_class_drops("kept diagnostic", dropped)
+        });
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "custom-tool", "raw", "", true);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.output_preview.matches("full output:").count(), 1);
+        assert!(snapshot.output_preview.contains("+18 more errors"));
+        assert!(snapshot.output_preview.contains("+6 more warnings"));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stdout.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
+        assert!(snapshot.output_truncated);
+    }
+
+    #[test]
+    fn registry_marker_reports_semantic_and_byte_drops_once() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        registry.set_compressor(move |_command, _output| {
+            let mut dropped = BTreeMap::new();
+            dropped.insert(DropClass::Error, 1);
+            CompressionResult::with_class_drops(
+                format!("HEAD-SIGNAL\n{}TAIL-SIGNAL", "middle\n".repeat(8_000)),
+                dropped,
+            )
+        });
+        let (task_id, _task) =
+            insert_terminal_piped_task(&registry, &dir, "custom-tool", "raw", "", true);
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.output_preview.matches("full output:").count(), 1);
+        assert!(snapshot.output_preview.contains("+1 more error"));
+        assert!(snapshot.output_preview.contains("truncated output"));
+        assert!(snapshot.output_preview.contains("HEAD-SIGNAL"));
+        assert!(snapshot.output_preview.contains("TAIL-SIGNAL"));
+        assert!(!snapshot.output_preview.contains("...<truncated"));
+        assert!(snapshot.output_truncated);
+    }
+
+    #[test]
+    fn cargo_stderr_class_drops_name_both_capture_paths() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let filter_registry = crate::compress::toml_filter::FilterRegistry::default();
+        registry.set_compressor(move |command, output| {
+            crate::compress::compress_with_registry(command, &output, &filter_registry)
+        });
+        let stderr = (0..22)
+            .map(|index| {
+                format!(
+                    "error: cargo failure {index}\n  --> src/lib.rs:{}:1\n   |\n{} | boom\n",
+                    index + 1,
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "cargo check",
+            "Finished dev [unoptimized] target(s) in 0.01s\n",
+            &stderr,
+            true,
+        );
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+
+        assert!(snapshot.output_preview.contains("+2 more errors"));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stdout.display())));
+        assert!(snapshot
+            .output_preview
+            .contains(&format!("read \"{}\"", task.paths.stderr.display())));
+        assert!(!snapshot.output_preview.contains("tail -n +"));
     }
 
     #[test]
@@ -3837,7 +4164,7 @@ mod tests {
         let calls_for_closure = Arc::clone(&calls);
         registry.set_compressor(move |_command, output| {
             calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            output
+            CompressionResult::new(output)
         });
         let (task_id, _task) = insert_terminal_pty_task(&registry, &dir, "raw\u{1b}[31m pty bytes");
 

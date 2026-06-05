@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::compress::{generic::GenericCompressor, Compressor};
+use crate::compress::{generic::GenericCompressor, CompressionResult, Compressor};
 
 pub struct TscCompressor;
 
@@ -9,8 +9,8 @@ impl Compressor for TscCompressor {
         command.split_whitespace().any(|token| token == "tsc")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_tsc(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_tsc(output).into()
     }
 
     fn matches_output(&self, output: &str) -> bool {

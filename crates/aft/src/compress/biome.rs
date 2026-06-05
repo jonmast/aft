@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 200;
 const MAX_DIAGNOSTICS_PER_RULE: usize = 10;
@@ -24,8 +24,8 @@ impl Compressor for BiomeCompressor {
         command_tokens(command).any(|token| token == "biome")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_biome(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_biome(output).into()
     }
 
     fn matches_output(&self, output: &str) -> bool {

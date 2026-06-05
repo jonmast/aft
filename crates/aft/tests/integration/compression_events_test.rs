@@ -289,7 +289,7 @@ fn compression_event_for_compressed_output_shows_savings() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
-    registry.set_compressor(|_, _| "short".to_string());
+    registry.set_compressor(|_, _| "short".to_string().into());
 
     let task_id = spawn_task(
         &registry,

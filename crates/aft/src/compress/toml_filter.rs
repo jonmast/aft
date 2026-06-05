@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 
+use crate::compress::caps::{cap_classified_blocks_with, ClassifiedBlock, DropClass};
+use crate::compress::CompressionResult;
+
 /// Approximate per-regex byte budget. Matches the budget RTK uses for its
 /// declarative filters; far more than any realistic compress regex needs.
 const REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -58,6 +61,7 @@ pub struct TomlFilter {
     pub line_max: usize,
     pub max_lines: usize,
     pub keep: KeepMode,
+    pub class_cap: Option<TomlClassCap>,
     pub shortcircuit_when: Option<Regex>,
     pub shortcircuit_replacement: Option<String>,
     pub strip_ansi: bool,
@@ -77,6 +81,13 @@ pub enum KeepMode {
     #[default]
     Tail,
     Middle,
+}
+
+#[derive(Debug, Clone)]
+pub struct TomlClassCap {
+    pub class: DropClass,
+    pub max: usize,
+    pub patterns: Vec<Regex>,
 }
 
 /// Aggregate registry of all loaded filters across all sources.
@@ -230,6 +241,8 @@ struct RawFilter {
     #[serde(default)]
     cap: Option<RawCap>,
     #[serde(default)]
+    class_cap: Option<RawClassCap>,
+    #[serde(default)]
     shortcircuit: Option<RawShortcircuit>,
     #[serde(default)]
     ansi: Option<RawAnsi>,
@@ -261,6 +274,16 @@ struct RawCap {
     max_lines: Option<usize>,
     #[serde(default)]
     keep: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawClassCap {
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    max: Option<usize>,
+    #[serde(default)]
+    patterns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -323,6 +346,30 @@ pub fn parse_filter(name: &str, content: &str, source: FilterSource) -> Result<T
         Some(other) => return Err(format!("invalid cap.keep {other:?}")),
     };
 
+    let class_cap = match raw.class_cap {
+        Some(raw_class_cap) => {
+            if raw_class_cap.patterns.len() > MAX_PATTERNS_PER_FILTER {
+                return Err(format!(
+                    "too many class_cap patterns ({} > {MAX_PATTERNS_PER_FILTER})",
+                    raw_class_cap.patterns.len()
+                ));
+            }
+            let class = parse_drop_class(raw_class_cap.class.as_deref().unwrap_or("list"))?;
+            let mut patterns = Vec::with_capacity(raw_class_cap.patterns.len());
+            for pattern in raw_class_cap.patterns {
+                let regex = build_regex(&pattern, true)
+                    .map_err(|e| format!("class_cap pattern {pattern:?}: {e}"))?;
+                patterns.push(regex);
+            }
+            Some(TomlClassCap {
+                class,
+                max: raw_class_cap.max.unwrap_or_else(|| class.default_cap()),
+                patterns,
+            })
+        }
+        None => None,
+    };
+
     let shortcircuit = raw.shortcircuit.unwrap_or_default();
     let (shortcircuit_when, shortcircuit_replacement) =
         match (shortcircuit.when, shortcircuit.replacement) {
@@ -347,6 +394,7 @@ pub fn parse_filter(name: &str, content: &str, source: FilterSource) -> Result<T
         line_max,
         max_lines,
         keep,
+        class_cap,
         shortcircuit_when,
         shortcircuit_replacement,
         strip_ansi,
@@ -369,7 +417,7 @@ fn build_regex(pattern: &str, multiline: bool) -> Result<Regex, String> {
 /// 3. `[shortcircuit]` — if remainder matches `when`, return `replacement`
 /// 4. `[truncate]` — middle-truncate per line at `line_max`
 /// 5. `[cap]` — apply `max_lines` with `keep` mode
-pub fn apply_filter(filter: &TomlFilter, output: &str) -> String {
+pub fn apply_filter(filter: &TomlFilter, output: &str) -> CompressionResult {
     let stripped_ansi = if filter.strip_ansi {
         crate::compress::generic::strip_ansi(output)
     } else {
@@ -388,7 +436,7 @@ pub fn apply_filter(filter: &TomlFilter, output: &str) -> String {
         (&filter.shortcircuit_when, &filter.shortcircuit_replacement)
     {
         if when.is_match(&after_strip) {
-            return replacement.clone();
+            return CompressionResult::new(replacement.clone());
         }
     }
 
@@ -401,7 +449,12 @@ pub fn apply_filter(filter: &TomlFilter, output: &str) -> String {
             .collect()
     };
 
-    // Phase 4: line cap
+    // Phase 4: class cap replaces plain [cap] when present; the two never stack.
+    if let Some(class_cap) = &filter.class_cap {
+        return cap_class_lines(&truncated, class_cap);
+    }
+
+    // Phase 5: plain line cap
     cap_lines(&truncated, filter.max_lines, filter.keep)
 }
 
@@ -423,42 +476,76 @@ fn truncate_line(line: &str, line_max: usize) -> String {
     format!("{head}…{tail}")
 }
 
-fn cap_lines(lines: &[String], max_lines: usize, keep: KeepMode) -> String {
+fn cap_class_lines(lines: &[String], class_cap: &TomlClassCap) -> CompressionResult {
+    let blocks = lines
+        .iter()
+        .map(|line| {
+            if class_cap.patterns.is_empty()
+                || class_cap
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(line))
+            {
+                ClassifiedBlock::new(class_cap.class, line.clone())
+            } else {
+                ClassifiedBlock::unclassified(line.clone())
+            }
+        })
+        .collect();
+    let capped = cap_classified_blocks_with(blocks, |class| {
+        if class == class_cap.class {
+            class_cap.max
+        } else {
+            class.default_cap()
+        }
+    });
+    CompressionResult::with_class_drops(capped.text, capped.dropped_by_class)
+}
+
+fn cap_lines(lines: &[String], max_lines: usize, keep: KeepMode) -> CompressionResult {
     if lines.len() <= max_lines || max_lines == usize::MAX {
-        return lines.join("\n");
+        return CompressionResult::new(lines.join("\n"));
     }
 
     if max_lines == 0 {
-        return String::new();
+        return CompressionResult::with_inner_drop(String::new(), false);
     }
 
-    let content_slots = max_lines - 1;
-
-    match keep {
-        KeepMode::Head => {
-            let omitted = lines.len() - content_slots;
-            let marker = format!("… ({omitted} more lines)");
-            let mut out: Vec<String> = lines.iter().take(content_slots).cloned().collect();
-            out.push(marker);
-            out.join("\n")
-        }
-        KeepMode::Tail => {
-            let omitted = lines.len() - content_slots;
-            let marker = format!("… ({omitted} more lines)");
-            let mut out = vec![marker];
-            out.extend(lines.iter().skip(omitted).cloned());
-            out.join("\n")
-        }
+    let kept = match keep {
+        KeepMode::Head => lines.iter().take(max_lines).cloned().collect::<Vec<_>>(),
+        KeepMode::Tail => lines
+            .iter()
+            .skip(lines.len().saturating_sub(max_lines))
+            .cloned()
+            .collect::<Vec<_>>(),
         KeepMode::Middle => {
-            let head_count = content_slots / 2;
-            let tail_count = content_slots - head_count;
-            let omitted = lines.len() - head_count - tail_count;
-            let marker = format!("… ({omitted} more lines)");
-            let mut out: Vec<String> = lines.iter().take(head_count).cloned().collect();
-            out.push(marker);
-            out.extend(lines.iter().skip(lines.len() - tail_count).cloned());
-            out.join("\n")
+            let head_count = max_lines / 2;
+            let tail_count = max_lines - head_count;
+            let mut kept: Vec<String> = lines.iter().take(head_count).cloned().collect();
+            kept.extend(lines.iter().skip(lines.len() - tail_count).cloned());
+            kept
         }
+    };
+    if matches!(keep, KeepMode::Tail) {
+        let dropped_prefix_lines = lines.len().saturating_sub(max_lines);
+        CompressionResult::with_prefix_drop(kept.join("\n"), dropped_prefix_lines + 1)
+    } else {
+        CompressionResult::with_inner_drop(kept.join("\n"), false)
+    }
+}
+
+fn parse_drop_class(value: &str) -> Result<DropClass, String> {
+    match value {
+        "error" | "errors" => Ok(DropClass::Error),
+        "warning" | "warnings" => Ok(DropClass::Warning),
+        "failure" | "failures" => Ok(DropClass::Failure),
+        "issue" | "issues" => Ok(DropClass::Issue),
+        "list" | "list_item" | "list-items" | "list items" => Ok(DropClass::List),
+        "inventory" | "inventory_item" | "inventory-items" | "inventory items" => {
+            Ok(DropClass::Inventory)
+        }
+        "timing" | "timing_line" | "timing-lines" | "timing lines" => Ok(DropClass::Timing),
+        other => Err(format!("invalid class_cap.class {other:?}")),
     }
 }
 
@@ -577,7 +664,7 @@ patterns = ['^Entering directory', '^Leaving directory']
 "#,
         );
         let input = "Entering directory `/tmp`\ngcc -c foo.c\nLeaving directory `/tmp`";
-        let out = apply_filter(&filter, input);
+        let out = apply_filter(&filter, input).text;
         assert_eq!(out, "gcc -c foo.c");
     }
 
@@ -597,7 +684,7 @@ replacement = "make: ok"
 "#,
         );
         let input = "make[1]: Entering directory `/tmp`\nmake[1]: Leaving directory `/tmp`";
-        let out = apply_filter(&filter, input);
+        let out = apply_filter(&filter, input).text;
         assert_eq!(out, "make: ok");
     }
 
@@ -613,7 +700,7 @@ when = '^\s*$'
 replacement = "ok"
 "#,
         );
-        let out = apply_filter(&filter, "error\n\nhint");
+        let out = apply_filter(&filter, "error\n\nhint").text;
         assert_eq!(out, "error\n\nhint");
     }
 
@@ -631,8 +718,10 @@ keep = "tail"
         );
         let input = "1\n2\n3\n4\n5";
         let out = apply_filter(&filter, input);
-        assert_eq!(out, "… (3 more lines)\n4\n5");
-        assert_eq!(out.lines().count(), 3);
+        assert_eq!(out.text, "3\n4\n5");
+        assert!(out.had_inner_drop);
+        assert!(out.offset_hint_eligible);
+        assert_eq!(out.text.lines().count(), 3);
     }
 
     #[test]
@@ -649,8 +738,10 @@ keep = "head"
         );
         let input = "1\n2\n3\n4";
         let out = apply_filter(&filter, input);
-        assert_eq!(out, "1\n… (3 more lines)");
-        assert_eq!(out.lines().count(), 2);
+        assert_eq!(out.text, "1\n2");
+        assert!(out.had_inner_drop);
+        assert!(!out.offset_hint_eligible);
+        assert_eq!(out.text.lines().count(), 2);
     }
 
     #[test]
@@ -667,9 +758,10 @@ keep = "middle"
         );
         let input = "1\n2\n3\n4\n5\n6\n7\n8";
         let out = apply_filter(&filter, input);
-        // max_lines includes the marker: 1 head + marker + 2 tail = 4 total lines.
-        assert_eq!(out, "1\n… (5 more lines)\n7\n8");
-        assert_eq!(out.lines().count(), 4);
+        assert_eq!(out.text, "1\n2\n7\n8");
+        assert!(out.had_inner_drop);
+        assert!(!out.offset_hint_eligible);
+        assert_eq!(out.text.lines().count(), 4);
     }
 
     #[test]
@@ -685,11 +777,12 @@ keep = "head"
 "#,
         );
         let out = apply_filter(&filter, "1\n2\n3");
-        assert_eq!(out, "");
+        assert_eq!(out.text, "");
+        assert!(out.had_inner_drop);
     }
 
     #[test]
-    fn cap_one_keeps_only_marker_when_truncated() {
+    fn cap_one_keeps_one_tail_line_without_marker() {
         let filter = parse(
             r#"
 [filter]
@@ -701,12 +794,14 @@ keep = "tail"
 "#,
         );
         let out = apply_filter(&filter, "1\n2\n3");
-        assert_eq!(out, "… (3 more lines)");
-        assert_eq!(out.lines().count(), 1);
+        assert_eq!(out.text, "3");
+        assert!(out.had_inner_drop);
+        assert!(out.offset_hint_eligible);
+        assert_eq!(out.text.lines().count(), 1);
     }
 
     #[test]
-    fn cap_two_reserves_one_line_for_marker() {
+    fn cap_two_keeps_two_tail_lines_without_marker() {
         let filter = parse(
             r#"
 [filter]
@@ -718,8 +813,37 @@ keep = "tail"
 "#,
         );
         let out = apply_filter(&filter, "1\n2\n3\n4");
-        assert_eq!(out, "… (3 more lines)\n4");
-        assert_eq!(out.lines().count(), 2);
+        assert_eq!(out.text, "3\n4");
+        assert!(out.had_inner_drop);
+        assert!(out.offset_hint_eligible);
+        assert_eq!(out.text.lines().count(), 2);
+    }
+
+    #[test]
+    fn class_cap_replaces_plain_cap_without_stacking() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[class_cap]
+class = "warning"
+max = 2
+patterns = ["^warning"]
+
+[cap]
+max_lines = 1
+keep = "head"
+"#,
+        );
+        let out = apply_filter(&filter, "warning 1\nkeep me\nwarning 2\nwarning 3");
+
+        assert!(out.text.contains("warning 1"));
+        assert!(out.text.contains("keep me"));
+        assert!(out.text.contains("warning 2"));
+        assert!(!out.text.contains("warning 3"));
+        assert_eq!(out.dropped_by_class.get(&DropClass::Warning), Some(&1));
+        assert!(out.text.lines().count() > 1, "plain [cap] must not stack");
     }
 
     #[test]
@@ -734,7 +858,7 @@ line_max = 10
 "#,
         );
         let input = "shortline\nthis is a very long line indeed";
-        let out = apply_filter(&filter, input);
+        let out = apply_filter(&filter, input).text;
         assert!(out.contains("shortline"));
         assert!(out.contains("…"));
         assert!(out.lines().any(|l| l.chars().count() <= 10));
@@ -749,7 +873,7 @@ matches = ["x"]
 "#,
         );
         let input = "\x1b[31mred\x1b[0m text";
-        let out = apply_filter(&filter, input);
+        let out = apply_filter(&filter, input).text;
         assert_eq!(out, "red text");
     }
 
@@ -765,7 +889,7 @@ strip = false
 "#,
         );
         let input = "\x1b[31mred\x1b[0m text";
-        let out = apply_filter(&filter, input);
+        let out = apply_filter(&filter, input).text;
         assert_eq!(out, input);
     }
 
@@ -785,7 +909,7 @@ when = '^$'
 replacement = "ok"
 "#,
         );
-        assert_eq!(apply_filter(&filter, "anything\nat all"), "ok");
+        assert_eq!(apply_filter(&filter, "anything\nat all").text, "ok");
     }
 
     #[test]

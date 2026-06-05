@@ -1,5 +1,5 @@
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 500;
 
@@ -11,8 +11,8 @@ impl Compressor for NextCompressor {
         tokens.iter().any(|token| token == "next") && tokens.iter().any(|token| token == "build")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_next(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_next(output).into()
     }
 }
 

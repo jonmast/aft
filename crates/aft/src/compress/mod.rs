@@ -20,6 +20,7 @@
 pub mod biome;
 pub mod builtin_filters;
 pub mod bun;
+pub mod caps;
 pub mod cargo;
 pub mod eslint;
 pub mod generic;
@@ -42,6 +43,7 @@ use crate::context::AppContext;
 use crate::harness::Harness;
 use biome::BiomeCompressor;
 use bun::BunCompressor;
+use caps::DropClass;
 use cargo::CargoCompressor;
 use eslint::EslintCompressor;
 use generic::{strip_ansi, GenericCompressor};
@@ -55,6 +57,7 @@ use pnpm::PnpmCompressor;
 use prettier::PrettierCompressor;
 use pytest::PytestCompressor;
 use ruff::RuffCompressor;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -90,6 +93,115 @@ pub enum Specificity {
     PackageManager,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressionResult {
+    pub text: String,
+    pub dropped_by_class: BTreeMap<DropClass, usize>,
+    pub had_inner_drop: bool,
+    pub offset_hint_eligible: bool,
+    pub offset_start_line: Option<usize>,
+}
+
+impl CompressionResult {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            dropped_by_class: BTreeMap::new(),
+            had_inner_drop: false,
+            offset_hint_eligible: true,
+            offset_start_line: None,
+        }
+    }
+
+    pub fn with_class_drops(
+        text: impl Into<String>,
+        dropped_by_class: BTreeMap<DropClass, usize>,
+    ) -> Self {
+        let had_inner_drop = !dropped_by_class.is_empty();
+        Self {
+            text: text.into(),
+            dropped_by_class,
+            had_inner_drop,
+            offset_hint_eligible: !had_inner_drop,
+            offset_start_line: None,
+        }
+    }
+
+    pub fn with_inner_drop(text: impl Into<String>, offset_hint_eligible: bool) -> Self {
+        Self {
+            text: text.into(),
+            dropped_by_class: BTreeMap::new(),
+            had_inner_drop: true,
+            offset_hint_eligible,
+            offset_start_line: None,
+        }
+    }
+
+    pub fn with_prefix_drop(text: impl Into<String>, offset_start_line: usize) -> Self {
+        Self {
+            text: text.into(),
+            dropped_by_class: BTreeMap::new(),
+            had_inner_drop: true,
+            offset_hint_eligible: true,
+            offset_start_line: Some(offset_start_line),
+        }
+    }
+
+    pub fn has_semantic_drops(&self) -> bool {
+        !self.dropped_by_class.is_empty()
+    }
+
+    pub fn has_any_drop(&self) -> bool {
+        self.had_inner_drop || self.has_semantic_drops()
+    }
+
+    pub fn map_text<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&str) -> String,
+    {
+        self.text = f(&self.text);
+        self
+    }
+}
+
+impl std::fmt::Display for CompressionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for CompressionResult {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
+    }
+}
+
+impl PartialEq<&str> for CompressionResult {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for CompressionResult {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
+}
+
+impl From<String> for CompressionResult {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for CompressionResult {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
 /// A `Compressor` knows how to reduce one specific command's output to fewer
 /// tokens while preserving the information the agent needs.
 pub trait Compressor: Send + Sync {
@@ -98,7 +210,7 @@ pub trait Compressor: Send + Sync {
     fn matches(&self, command: &str) -> bool;
 
     /// Compress the output. Original is left untouched if compression fails.
-    fn compress(&self, command: &str, output: &str) -> String;
+    fn compress(&self, command: &str, output: &str) -> CompressionResult;
 
     fn specificity(&self) -> Specificity {
         Specificity::Specific
@@ -114,7 +226,7 @@ pub trait Compressor: Send + Sync {
 
     /// Compress output after an output-shape match. Compressors that branch by
     /// subcommand override this to jump directly to the matched branch.
-    fn compress_output_match(&self, output: &str) -> String {
+    fn compress_output_match(&self, output: &str) -> CompressionResult {
         self.compress("", output)
     }
 }
@@ -124,9 +236,9 @@ pub trait Compressor: Send + Sync {
 /// Convenience wrapper for command handlers that already hold an `AppContext`.
 /// Backs onto [`compress_with_registry`] which is thread-safe for use from the
 /// `BgTaskRegistry` watchdog.
-pub fn compress(command: &str, output: String, ctx: &AppContext) -> String {
+pub fn compress(command: &str, output: String, ctx: &AppContext) -> CompressionResult {
     if !ctx.config().experimental_bash_compress {
-        return output;
+        return CompressionResult::new(output);
     }
     let registry_handle = ctx.shared_filter_registry();
     let guard = match registry_handle.read() {
@@ -141,7 +253,11 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> String {
 ///
 /// Used from background threads (notably the `BgTaskRegistry` watchdog and
 /// completion-frame emitter) where lock-free access is required.
-pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegistry) -> String {
+pub fn compress_with_registry(
+    command: &str,
+    output: &str,
+    registry: &FilterRegistry,
+) -> CompressionResult {
     let stripped_for_generic = strip_ansi(output);
 
     // Normalize the command so shell-prefix idioms like `cd /path && bun test`,
@@ -654,7 +770,20 @@ mod dispatch_specificity_tests {
     /// (We can't easily compare Compressor instances by identity, so we
     /// dispatch and check for module-distinctive markers in the output.)
     fn dispatch(cmd: &str, output: &str) -> String {
-        compress_with_registry(cmd, output, &empty_registry())
+        compress_with_registry(cmd, output, &empty_registry()).text
+    }
+
+    #[test]
+    fn generic_dispatch_does_not_classify_error_or_warning_words() {
+        let result = compress_with_registry(
+            "unknown-tool",
+            "error: this is just a log line\nwarning: this too",
+            &empty_registry(),
+        );
+
+        assert!(result.dropped_by_class.is_empty());
+        assert!(!result.had_inner_drop);
+        assert!(result.text.contains("error: this is just a log line"));
     }
 
     #[test]

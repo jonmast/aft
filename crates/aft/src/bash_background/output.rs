@@ -34,12 +34,32 @@ pub fn cap_final_output(input: &str) -> CappedText {
     )
 }
 
+pub fn cap_final_output_with_marker(input: &str, marker: &str) -> CappedText {
+    cap_head_tail_with_marker(
+        input,
+        FINAL_OUTPUT_CAP_BYTES,
+        FINAL_OUTPUT_HEAD_BYTES,
+        FINAL_OUTPUT_TAIL_BYTES,
+        marker,
+    )
+}
+
 pub fn cap_completion_output(input: &str) -> CappedText {
     cap_head_tail(
         input,
         COMPLETION_OUTPUT_PREVIEW_BYTES,
         COMPLETION_OUTPUT_HEAD_BYTES,
         COMPLETION_OUTPUT_TAIL_BYTES,
+    )
+}
+
+pub fn cap_completion_output_with_marker(input: &str, marker: &str) -> CappedText {
+    cap_head_tail_with_marker(
+        input,
+        COMPLETION_OUTPUT_PREVIEW_BYTES,
+        COMPLETION_OUTPUT_HEAD_BYTES,
+        COMPLETION_OUTPUT_TAIL_BYTES,
+        marker,
     )
 }
 
@@ -100,6 +120,79 @@ pub fn cap_head_tail(
     output.push_str("...<truncated ");
     output.push_str(&truncated_bytes.to_string());
     output.push_str(" bytes>...\n");
+    output.push_str(&input[tail_start..]);
+
+    CappedText {
+        text: output,
+        truncated: true,
+    }
+}
+
+pub fn cap_head_tail_with_marker(
+    input: &str,
+    threshold_bytes: usize,
+    keep_head: usize,
+    keep_tail: usize,
+    marker: &str,
+) -> CappedText {
+    if input.len() <= threshold_bytes {
+        return CappedText {
+            text: input.to_string(),
+            truncated: false,
+        };
+    }
+    if marker.is_empty() {
+        return cap_head_tail(input, threshold_bytes, keep_head, keep_tail);
+    }
+
+    let mut head_budget = keep_head.min(input.len());
+    let mut tail_budget = keep_tail.min(input.len());
+
+    for _ in 0..8 {
+        let head_end = floor_char_boundary(input, head_budget);
+        let tail_start = ceil_char_boundary(input, input.len().saturating_sub(tail_budget));
+        if head_end >= tail_start {
+            return CappedText {
+                text: input.to_string(),
+                truncated: false,
+            };
+        }
+
+        let marker_prefix_len = if head_end == 0 || input[..head_end].ends_with('\n') {
+            0
+        } else {
+            1
+        };
+        let marker_len = marker_prefix_len + marker.len() + 1;
+        let available = threshold_bytes.saturating_sub(marker_len);
+        let next_head = keep_head.min(available).min(input.len());
+        let next_tail = keep_tail
+            .min(available.saturating_sub(next_head))
+            .min(input.len().saturating_sub(next_head));
+
+        if next_head == head_budget && next_tail == tail_budget {
+            break;
+        }
+        head_budget = next_head;
+        tail_budget = next_tail;
+    }
+
+    let head_end = floor_char_boundary(input, head_budget);
+    let tail_start = ceil_char_boundary(input, input.len().saturating_sub(tail_budget));
+    if head_end >= tail_start {
+        return CappedText {
+            text: input.to_string(),
+            truncated: false,
+        };
+    }
+
+    let mut output = String::with_capacity(threshold_bytes.min(input.len()).max(marker.len() + 1));
+    output.push_str(&input[..head_end]);
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(marker);
+    output.push('\n');
     output.push_str(&input[tail_start..]);
 
     CappedText {

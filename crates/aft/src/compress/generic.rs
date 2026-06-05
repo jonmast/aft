@@ -1,4 +1,4 @@
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 pub fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -143,8 +143,8 @@ impl Compressor for GenericCompressor {
         true
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        Self::compress_output(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        Self::compress_output(output).into()
     }
 }
 

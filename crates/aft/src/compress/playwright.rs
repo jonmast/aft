@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 400;
 const MAX_JSON_FAILURES: usize = 20;
@@ -22,8 +22,8 @@ impl Compressor for PlaywrightCompressor {
         command_tokens(command).any(|token| token == "playwright")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_playwright(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_playwright(output).into()
     }
 
     fn matches_output(&self, output: &str) -> bool {

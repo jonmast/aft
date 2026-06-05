@@ -13,12 +13,12 @@ fn empty_registry() -> FilterRegistry {
 }
 
 fn compress(command: &str, output: &str) -> String {
-    compress::compress_with_registry(command, output, &empty_registry())
+    compress::compress_with_registry(command, output, &empty_registry()).text
 }
 
 fn compress_with_builtin_filters(command: &str, output: &str) -> String {
     let registry = build_registry(ALL, None, None);
-    compress::compress_with_registry(command, output, &registry)
+    compress::compress_with_registry(command, output, &registry).text
 }
 
 fn bun_failure_output(summary: &str) -> String {

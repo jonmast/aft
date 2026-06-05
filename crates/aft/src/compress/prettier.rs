@@ -1,5 +1,5 @@
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 250;
 
@@ -10,8 +10,8 @@ impl Compressor for PrettierCompressor {
         command_tokens(command).any(|token| token == "prettier")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_prettier(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_prettier(output).into()
     }
 
     fn matches_output(&self, output: &str) -> bool {

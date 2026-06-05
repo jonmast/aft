@@ -1,11 +1,10 @@
 use serde_json::Value;
 
-use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
+use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
+use crate::compress::{CompressionResult, Compressor};
 
-const MAX_FAILURES: usize = 5;
 const MAX_FAILURE_MESSAGE_LINES: usize = 5;
-const MAX_LINES: usize = 250;
 
 pub struct VitestCompressor;
 
@@ -20,7 +19,7 @@ impl Compressor for VitestCompressor {
         command_tokens(command).any(|token| matches!(token.as_str(), "vitest" | "jest"))
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         compress_test_runner(command, output)
     }
 
@@ -30,7 +29,7 @@ impl Compressor for VitestCompressor {
             || looks_like_jest_json_output(output)
     }
 
-    fn compress_output_match(&self, output: &str) -> String {
+    fn compress_output_match(&self, output: &str) -> CompressionResult {
         if looks_like_jest_output(output) {
             compress_test_runner("jest", output)
         } else {
@@ -73,16 +72,16 @@ fn looks_like_jest_json_output(output: &str) -> bool {
         })
 }
 
-fn compress_test_runner(command: &str, output: &str) -> String {
+fn compress_test_runner(command: &str, output: &str) -> CompressionResult {
     let trimmed = output.trim_start();
     if trimmed.starts_with('{') {
         if let Some(compressed) = compress_json(command, trimmed) {
-            return finish(&compressed);
+            return finish(compressed);
         }
-        return GenericCompressor::compress_output(output);
+        return GenericCompressor::compress_output(output).into();
     }
 
-    finish(&compress_text(output))
+    finish(compress_text(output))
 }
 
 fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
@@ -100,7 +99,7 @@ fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
         })
 }
 
-fn compress_json(command: &str, input: &str) -> Option<String> {
+fn compress_json(command: &str, input: &str) -> Option<CompressionResult> {
     let value: Value = serde_json::from_str(input).ok()?;
     let total = number_field(&value, "numTotalTests").unwrap_or(0);
     let passed = number_field(&value, "numPassedTests").unwrap_or(0);
@@ -108,25 +107,32 @@ fn compress_json(command: &str, input: &str) -> Option<String> {
     let failures = json_failures(&value);
     let runner = runner_name(command);
 
-    let mut lines = vec![format!(
+    let mut blocks = vec![ClassifiedBlock::unclassified(format!(
         "{runner}: {passed} pass, {failed} fail (out of {total})"
-    )];
+    ))];
     if failures.is_empty() {
-        return Some(lines.join("\n"));
+        return Some(CompressionResult::new(
+            blocks
+                .into_iter()
+                .map(|block| block.text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
     }
 
-    lines.push(String::new());
-    for failure in failures.iter().take(MAX_FAILURES) {
-        lines.push(format!("FAIL {}", failure.name));
+    for failure in failures {
+        let mut lines = vec![format!("FAIL {}", failure.name)];
         for message in failure.messages.iter().take(MAX_FAILURE_MESSAGE_LINES) {
             lines.push(format!("  {message}"));
         }
-    }
-    if failures.len() > MAX_FAILURES {
-        lines.push(format!("+{} more failures", failures.len() - MAX_FAILURES));
+        blocks.push(ClassifiedBlock::new(DropClass::Failure, lines.join("\n")));
     }
 
-    Some(lines.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    Some(CompressionResult::with_class_drops(
+        capped.text,
+        capped.dropped_by_class,
+    ))
 }
 
 fn json_failures(value: &Value) -> Vec<Failure> {
@@ -215,11 +221,9 @@ fn first_message_lines(message: &str) -> Vec<String> {
         .collect()
 }
 
-fn compress_text(output: &str) -> String {
+fn compress_text(output: &str) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
-    let mut result = Vec::new();
-    let mut failures_seen = 0usize;
-    let mut omitted = 0usize;
+    let mut blocks = Vec::new();
     let mut index = 0usize;
 
     while index < lines.len() {
@@ -227,11 +231,7 @@ fn compress_text(output: &str) -> String {
         let trimmed = line.trim_start();
 
         if is_fail_line(trimmed) {
-            failures_seen += 1;
-            let keep = failures_seen <= MAX_FAILURES;
-            if !keep {
-                omitted += 1;
-            }
+            let mut block = Vec::new();
             while index < lines.len() {
                 let current = lines[index];
                 let current_trimmed = current.trim_start();
@@ -244,28 +244,26 @@ fn compress_text(output: &str) -> String {
                 {
                     break;
                 }
-                if keep && !is_ignored_noise(current_trimmed) {
-                    result.push(current.to_string());
+                if !is_ignored_noise(current_trimmed) {
+                    block.push(current.to_string());
                 }
                 index += 1;
             }
+            blocks.push(ClassifiedBlock::new(DropClass::Failure, block.join("\n")));
             continue;
         }
 
         if is_pass_line(trimmed) || is_summary_line(trimmed) {
-            result.push(line.to_string());
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         }
         index += 1;
     }
 
-    if omitted > 0 {
-        result.push(format!("+{omitted} more failures"));
+    if blocks.is_empty() {
+        return GenericCompressor::compress_output(output).into();
     }
-
-    if result.is_empty() {
-        return GenericCompressor::compress_output(output);
-    }
-    result.join("\n")
+    let capped = cap_classified_blocks(blocks);
+    CompressionResult::with_class_drops(capped.text, capped.dropped_by_class)
 }
 
 fn is_fail_line(trimmed: &str) -> bool {
@@ -315,31 +313,11 @@ fn number_field(value: &Value, key: &str) -> Option<usize> {
         .and_then(|number| usize::try_from(number).ok())
 }
 
-fn finish(input: &str) -> String {
-    let stripped = strip_ansi(input);
-    let deduped = dedup_consecutive(&stripped);
-    cap_lines(
-        &middle_truncate(&deduped, 32 * 1024, 16 * 1024, 16 * 1024),
-        MAX_LINES,
-    )
-}
-
-fn cap_lines(input: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.len() <= max_lines {
-        return input.trim_end().to_string();
-    }
-    let mut kept = lines
-        .iter()
-        .take(max_lines)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    kept.push_str(&format!(
-        "\n... truncated {} lines",
-        lines.len() - max_lines
-    ));
-    kept
+fn finish(input: CompressionResult) -> CompressionResult {
+    input.map_text(|text| {
+        let stripped = strip_ansi(text);
+        dedup_consecutive(&stripped).trim_end().to_string()
+    })
 }
 
 #[cfg(test)]
@@ -364,7 +342,7 @@ Tests:       4 passed, 4 total
 Time:        1.23 s
 "#;
 
-        let compressed = compress_test_runner("jest", output);
+        let compressed = compress_test_runner("jest", output).text;
 
         assert!(compressed.contains("PASS src/foo.test.ts"));
         assert!(compressed.contains("Tests:       4 passed, 4 total"));
@@ -386,7 +364,7 @@ Tests       1 failed | 1 passed (2)
 Duration    1.26s
 "#;
 
-        let compressed = compress_test_runner("vitest", output);
+        let compressed = compress_test_runner("vitest", output).text;
 
         assert!(compressed.contains("FAIL src/foo.test.ts"));
         assert!(compressed.contains("Expected: 1"));
@@ -398,7 +376,7 @@ Duration    1.26s
     fn compresses_vitest_json_reporter_output() {
         let output = r#"{"numTotalTests":14,"numPassedTests":12,"numFailedTests":2,"testResults":[{"name":"/repo/src/foo.test.ts","status":"failed","assertionResults":[{"fullName":"math adds","status":"failed","failureMessages":["Expected: 1\nReceived: 2\n    at src/foo.test.ts:4:10"]},{"fullName":"math subtracts","status":"failed","failureMessages":["AssertionError: expected 3 to be 2"]}]}]}"#;
 
-        let compressed = compress_test_runner("vitest --reporter=json", output);
+        let compressed = compress_test_runner("vitest --reporter=json", output).text;
 
         assert!(compressed.starts_with("vitest: 12 pass, 2 fail (out of 14)"));
         assert!(compressed.contains("FAIL foo.test.ts > math adds"));
@@ -409,7 +387,7 @@ Duration    1.26s
     fn compresses_jest_json_reporter_output() {
         let output = r#"{"numTotalTests":1,"numPassedTests":0,"numFailedTests":1,"testResults":[{"name":"/repo/src/app.test.ts","assertionResults":[{"title":"renders","fullName":"app renders","status":"failed","failureMessages":["Error: boom"]}]}]}"#;
 
-        let compressed = compress_test_runner("npx jest --json", output);
+        let compressed = compress_test_runner("npx jest --json", output).text;
 
         assert!(compressed.starts_with("jest: 0 pass, 1 fail (out of 1)"));
         assert!(compressed.contains("FAIL app.test.ts > app renders"));
@@ -418,21 +396,24 @@ Duration    1.26s
     #[test]
     fn caps_json_failures_and_malformed_json_falls_back() {
         let mut results = Vec::new();
-        for index in 0..6 {
+        for index in 0..=crate::compress::caps::CAP_ERRORS {
             results.push(format!(
                 r#"{{"fullName":"test {index}","status":"failed","failureMessages":["failure {index}"]}}"#
             ));
         }
+        let total = crate::compress::caps::CAP_ERRORS + 1;
         let output = format!(
-            r#"{{"numTotalTests":6,"numPassedTests":0,"numFailedTests":6,"testResults":[{{"name":"/repo/src/foo.test.ts","assertionResults":[{}]}}]}}"#,
+            r#"{{"numTotalTests":{total},"numPassedTests":0,"numFailedTests":{total},"testResults":[{{"name":"/repo/src/foo.test.ts","assertionResults":[{}]}}]}}"#,
             results.join(",")
         );
 
-        let compressed = compress_test_runner("vitest --json", &output);
+        let result = compress_test_runner("vitest --json", &output);
+        let compressed = result.text;
 
-        assert!(compressed.contains("+1 more failures"));
+        assert_eq!(result.dropped_by_class.get(&DropClass::Failure), Some(&1));
+        assert!(!compressed.contains("test 20"));
         assert_eq!(
-            compress_test_runner("vitest --json", "{not-json"),
+            compress_test_runner("vitest --json", "{not-json").text,
             "{not-json"
         );
     }

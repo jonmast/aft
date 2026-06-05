@@ -2,11 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
-
-const MAX_LINES: usize = 200;
-const MAX_ISSUES_PER_FILE: usize = 10;
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
+use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
+use crate::compress::{CompressionResult, Compressor};
 
 pub struct EslintCompressor;
 
@@ -24,7 +22,7 @@ impl Compressor for EslintCompressor {
         command_tokens(command).any(|token| token == "eslint")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
         compress_eslint(output)
     }
 
@@ -54,20 +52,20 @@ fn looks_like_eslint_json_output(output: &str) -> bool {
         })
 }
 
-fn compress_eslint(output: &str) -> String {
+fn compress_eslint(output: &str) -> CompressionResult {
     let trimmed = output.trim_start();
     if trimmed.starts_with("[{") {
         if let Some(compressed) = compress_json(trimmed) {
-            return finish(&compressed);
+            return finish(compressed);
         }
-        return GenericCompressor::compress_output(output);
+        return GenericCompressor::compress_output(output).into();
     }
 
     if let Some(compressed) = compress_text(output) {
-        return finish(&compressed);
+        return finish(compressed);
     }
 
-    GenericCompressor::compress_output(output)
+    GenericCompressor::compress_output(output).into()
 }
 
 fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
@@ -85,7 +83,7 @@ fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
         })
 }
 
-fn compress_json(input: &str) -> Option<String> {
+fn compress_json(input: &str) -> Option<CompressionResult> {
     let results: Value = serde_json::from_str(input).ok()?;
     let files = results.as_array()?;
     let mut grouped = BTreeMap::new();
@@ -122,17 +120,21 @@ fn compress_json(input: &str) -> Option<String> {
 
     let total = errors + warnings;
     if total == 0 {
-        return Some("eslint: no issues".to_string());
+        return Some(CompressionResult::new("eslint: no issues"));
     }
 
-    let mut lines = vec![format!(
+    let mut blocks = vec![ClassifiedBlock::unclassified(format!(
         "eslint: {total} issues ({errors} errors, {warnings} warnings)"
-    )];
-    append_grouped_issues(&mut lines, &grouped);
-    Some(lines.join("\n"))
+    ))];
+    append_grouped_issues(&mut blocks, &grouped);
+    let capped = cap_classified_blocks(blocks);
+    Some(CompressionResult::with_class_drops(
+        capped.text,
+        capped.dropped_by_class,
+    ))
 }
 
-fn compress_text(output: &str) -> Option<String> {
+fn compress_text(output: &str) -> Option<CompressionResult> {
     let mut grouped: BTreeMap<String, Vec<Issue>> = BTreeMap::new();
     let mut current_file: Option<String> = None;
     let mut summary = None;
@@ -165,18 +167,19 @@ fn compress_text(output: &str) -> Option<String> {
     }
 
     if parsed_issues == 0 {
-        return summary;
+        return summary.map(CompressionResult::new);
     }
 
-    let mut lines = Vec::new();
-    append_grouped_issues(&mut lines, &grouped);
+    let mut blocks = Vec::new();
+    append_grouped_issues(&mut blocks, &grouped);
     if let Some(summary) = summary {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push(summary);
+        blocks.push(ClassifiedBlock::unclassified(summary));
     }
-    Some(lines.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    Some(CompressionResult::with_class_drops(
+        capped.text,
+        capped.dropped_by_class,
+    ))
 }
 
 fn parse_colon_issue(line: &str) -> Option<(String, Issue)> {
@@ -246,22 +249,27 @@ fn looks_like_rule(token: &str) -> bool {
     token.contains('/') || token.contains('-') || token.starts_with('@')
 }
 
-fn append_grouped_issues(lines: &mut Vec<String>, grouped: &BTreeMap<String, Vec<Issue>>) {
+fn append_grouped_issues(
+    blocks: &mut Vec<ClassifiedBlock>,
+    grouped: &BTreeMap<String, Vec<Issue>>,
+) {
     for (file, issues) in grouped {
-        lines.push(file.clone());
-        for issue in issues.iter().take(MAX_ISSUES_PER_FILE) {
+        for issue in issues {
             let rule = issue.rule.as_deref().unwrap_or("unknown");
-            lines.push(format!(
-                "  {}:{} {} {} {}",
+            let text = format!(
+                "{file}\n  {}:{} {} {} {}",
                 issue.line, issue.column, issue.severity, rule, issue.message
-            ));
+            );
+            blocks.push(ClassifiedBlock::new(issue_class(issue), text));
         }
-        if issues.len() > MAX_ISSUES_PER_FILE {
-            lines.push(format!(
-                "  +{} more issues in this file",
-                issues.len() - MAX_ISSUES_PER_FILE
-            ));
-        }
+    }
+}
+
+fn issue_class(issue: &Issue) -> DropClass {
+    match issue.severity.as_str() {
+        "error" => DropClass::Error,
+        "warning" => DropClass::Warning,
+        _ => DropClass::Issue,
     }
 }
 
@@ -295,31 +303,11 @@ fn is_file_header(line: &str) -> bool {
         && (line.contains('/') || line.contains('\\') || line.contains('.'))
 }
 
-fn finish(input: &str) -> String {
-    let stripped = strip_ansi(input);
-    let deduped = dedup_consecutive(&stripped);
-    cap_lines(
-        &middle_truncate(&deduped, 24 * 1024, 12 * 1024, 12 * 1024),
-        MAX_LINES,
-    )
-}
-
-fn cap_lines(input: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.len() <= max_lines {
-        return input.trim_end().to_string();
-    }
-    let mut kept = lines
-        .iter()
-        .take(max_lines)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    kept.push_str(&format!(
-        "\n... truncated {} lines",
-        lines.len() - max_lines
-    ));
-    kept
+fn finish(input: CompressionResult) -> CompressionResult {
+    input.map_text(|text| {
+        let stripped = strip_ansi(text);
+        dedup_consecutive(&stripped).trim_end().to_string()
+    })
 }
 
 #[cfg(test)]
@@ -346,7 +334,7 @@ mod tests {
 ✖ 3 problems (2 errors, 1 warning)
 "#;
 
-        let compressed = compress_eslint(output);
+        let compressed = compress_eslint(output).text;
 
         assert!(compressed.contains("/repo/src/foo.js"));
         assert!(compressed.contains("1:10 error no-unused-vars 'foo' is defined but never used"));
@@ -357,7 +345,7 @@ mod tests {
     fn compresses_colon_text_shape() {
         let output = "src/foo.ts:4:12: error Unexpected any @typescript-eslint/no-explicit-any\n✖ 1 problem (1 error, 0 warnings)\n";
 
-        let compressed = compress_eslint(output);
+        let compressed = compress_eslint(output).text;
 
         assert!(compressed.contains("src/foo.ts"));
         assert!(compressed.contains("4:12 error @typescript-eslint/no-explicit-any Unexpected any"));
@@ -367,7 +355,7 @@ mod tests {
     fn compresses_json_formatter_output() {
         let output = r#"[{"filePath":"/repo/fullOfProblems.js","messages":[{"ruleId":"no-unused-vars","severity":2,"message":"'addOne' is defined but never used.","line":1,"column":10},{"ruleId":"semi","severity":1,"message":"Missing semicolon.","line":3,"column":20}],"errorCount":1,"warningCount":1}]"#;
 
-        let compressed = compress_eslint(output);
+        let compressed = compress_eslint(output).text;
 
         assert!(compressed.starts_with("eslint: 2 issues (1 errors, 1 warnings)"));
         assert!(
@@ -380,7 +368,7 @@ mod tests {
     fn malformed_json_falls_back_safely() {
         let output = "[{not-json";
 
-        let compressed = compress_eslint(output);
+        let compressed = compress_eslint(output).text;
 
         assert_eq!(compressed, output);
     }
@@ -388,16 +376,17 @@ mod tests {
     #[test]
     fn caps_large_text_output_per_file() {
         let mut output = String::from("src/foo.js\n");
-        for index in 1..=12 {
+        for index in 1..=25 {
             output.push_str(&format!(
                 "  {index}:1  error  Problem number {index}  no-alert\n"
             ));
         }
-        output.push_str("✖ 12 problems (12 errors, 0 warnings)\n");
+        output.push_str("✖ 25 problems (25 errors, 0 warnings)\n");
 
-        let compressed = compress_eslint(&output);
+        let result = compress_eslint(&output);
+        let compressed = result.text;
 
-        assert!(compressed.contains("+2 more issues in this file"));
-        assert!(!compressed.contains("Problem number 12  no-alert"));
+        assert_eq!(result.dropped_by_class.get(&DropClass::Error), Some(&5));
+        assert!(!compressed.contains("Problem number 25  no-alert"));
     }
 }

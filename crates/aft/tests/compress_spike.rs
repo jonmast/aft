@@ -46,7 +46,8 @@ fn compression_token_spike_emits_fixture_outputs() {
         let fixture_path = fixtures_dir.join(&entry.file);
         let original_text = fs::read_to_string(&fixture_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", fixture_path.display()));
-        let compressed_text = compress_with_registry(&entry.command, &original_text, &registry);
+        let compressed_text =
+            compress_with_registry(&entry.command, &original_text, &registry).text;
 
         outputs.push(SpikeOutputEntry {
             file: entry.file,

@@ -1,5 +1,5 @@
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{Compressor, Specificity};
+use crate::compress::{CompressionResult, Compressor, Specificity};
 
 pub struct NpmCompressor;
 
@@ -15,13 +15,13 @@ impl Compressor for NpmCompressor {
             .is_some_and(|head| head == "npm")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         match npm_subcommand(command).as_deref() {
-            Some("install" | "i" | "ci") => compress_install(output),
-            Some("run" | "test") => GenericCompressor::compress_output(output),
-            Some("audit") => compress_audit(output),
-            Some("publish") => compress_install(output),
-            _ => GenericCompressor::compress_output(output),
+            Some("install" | "i" | "ci") => compress_install(output).into(),
+            Some("run" | "test") => GenericCompressor::compress_output(output).into(),
+            Some("audit") => compress_audit(output).into(),
+            Some("publish") => compress_install(output).into(),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 }

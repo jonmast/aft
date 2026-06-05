@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi};
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 
 const MAX_LINES: usize = 300;
 
@@ -16,8 +16,8 @@ impl Compressor for MypyCompressor {
                 .any(|window| matches!(window, [python, flag, module] if (python == "python" || python == "python3") && flag == "-m" && module == "mypy"))
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_mypy(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_mypy(output).into()
     }
 
     fn matches_output(&self, output: &str) -> bool {

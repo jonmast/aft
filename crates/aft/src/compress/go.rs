@@ -1,5 +1,5 @@
 use crate::compress::generic::GenericCompressor;
-use crate::compress::Compressor;
+use crate::compress::{CompressionResult, Compressor};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -14,12 +14,12 @@ impl Compressor for GoCompressor {
             .is_some_and(|head| head == "go")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         match go_subcommand(command).as_deref() {
-            Some("test") => compress_test(output),
-            Some("build") => compress_build(output),
-            Some("vet") => compress_vet(output),
-            _ => GenericCompressor::compress_output(output),
+            Some("test") => compress_test(output).into(),
+            Some("build") => compress_build(output).into(),
+            Some("vet") => compress_vet(output).into(),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 
@@ -27,8 +27,8 @@ impl Compressor for GoCompressor {
         looks_like_go_test_output(output)
     }
 
-    fn compress_output_match(&self, output: &str) -> String {
-        compress_test(output)
+    fn compress_output_match(&self, output: &str) -> CompressionResult {
+        compress_test(output).into()
     }
 }
 
@@ -41,8 +41,8 @@ impl Compressor for GolangciLintCompressor {
             .any(|token| token == "golangci-lint")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
-        compress_golangci(output)
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
+        compress_golangci(output).into()
     }
 
     fn matches_output(&self, output: &str) -> bool {

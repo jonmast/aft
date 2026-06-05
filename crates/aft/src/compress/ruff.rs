@@ -2,11 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::compress::generic::{dedup_consecutive, middle_truncate, strip_ansi, GenericCompressor};
-use crate::compress::Compressor;
-
-const MAX_LINES: usize = 250;
-const MAX_LOCATIONS_PER_RULE: usize = 25;
+use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
+use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
+use crate::compress::{CompressionResult, Compressor};
 
 pub struct RuffCompressor;
 
@@ -15,7 +13,7 @@ impl Compressor for RuffCompressor {
         command_tokens(command).any(|token| token == "ruff")
     }
 
-    fn compress(&self, _command: &str, output: &str) -> String {
+    fn compress(&self, _command: &str, output: &str) -> CompressionResult {
         compress_ruff(output)
     }
 
@@ -63,32 +61,38 @@ fn looks_like_ruff_json_output(output: &str) -> bool {
         })
 }
 
-fn compress_ruff(output: &str) -> String {
+fn compress_ruff(output: &str) -> CompressionResult {
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "All checks passed!" {
-        return "ruff: clean".to_string();
+        return CompressionResult::new("ruff: clean");
     }
 
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         if let Some(compressed) = compress_json(trimmed) {
-            return finish(&compressed);
+            return finish(compressed);
         }
-        return GenericCompressor::compress_output(output);
+        return GenericCompressor::compress_output(output).into();
     }
 
-    let mut kept = Vec::new();
+    let mut blocks = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim();
-        if is_violation_line(trimmed) || is_summary_line(trimmed) || trimmed.starts_with("[*]") {
-            kept.push(line.to_string());
+        if is_violation_line(trimmed) {
+            blocks.push(ClassifiedBlock::new(DropClass::Error, line.to_string()));
+        } else if is_summary_line(trimmed) || trimmed.starts_with("[*]") {
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         }
     }
 
-    if kept.is_empty() {
-        return GenericCompressor::compress_output(output);
+    if blocks.is_empty() {
+        return GenericCompressor::compress_output(output).into();
     }
 
-    finish(&kept.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    finish(CompressionResult::with_class_drops(
+        capped.text,
+        capped.dropped_by_class,
+    ))
 }
 
 fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
@@ -111,13 +115,14 @@ fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
         })
 }
 
-fn compress_json(input: &str) -> Option<String> {
+fn compress_json(input: &str) -> Option<CompressionResult> {
     let diagnostics: Vec<Value> = serde_json::from_str(input).ok()?;
     if diagnostics.is_empty() {
-        return Some("ruff: clean".to_string());
+        return Some(CompressionResult::new("ruff: clean"));
     }
 
     let mut by_rule: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut blocks = Vec::new();
     for diagnostic in diagnostics {
         let code = string_field(&diagnostic, "code").unwrap_or("RUF");
         let filename = string_field(&diagnostic, "filename").unwrap_or("<unknown>");
@@ -125,39 +130,34 @@ fn compress_json(input: &str) -> Option<String> {
             .pointer("/location/row")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let location = format!("{filename}:{row}");
         by_rule
             .entry(code.to_string())
             .or_default()
-            .push(format!("{filename}:{row}"));
+            .push(location.clone());
+        blocks.push(ClassifiedBlock::new(
+            DropClass::Error,
+            format!("{code}: {location}"),
+        ));
     }
 
     let total = by_rule.values().map(Vec::len).sum::<usize>();
-    let mut lines = Vec::new();
-    for (rule, locations) in &by_rule {
-        let shown = locations
-            .iter()
-            .take(MAX_LOCATIONS_PER_RULE)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        if locations.len() > MAX_LOCATIONS_PER_RULE {
-            lines.push(format!(
-                "{rule}: {shown}, ... (+{} more)",
-                locations.len() - MAX_LOCATIONS_PER_RULE
-            ));
-        } else {
-            lines.push(format!("{rule}: {shown}"));
-        }
-    }
-    lines.push(format!(
+    blocks.push(ClassifiedBlock::unclassified(format!(
         "ruff: {total} violations across {} rules",
         by_rule.len()
-    ));
+    )));
     for (rule, locations) in by_rule {
-        lines.push(format!("{rule}: {}", locations.len()));
+        blocks.push(ClassifiedBlock::unclassified(format!(
+            "{rule}: {}",
+            locations.len()
+        )));
     }
 
-    Some(lines.join("\n"))
+    let capped = cap_classified_blocks(blocks);
+    Some(CompressionResult::with_class_drops(
+        capped.text,
+        capped.dropped_by_class,
+    ))
 }
 
 fn is_violation_line(trimmed: &str) -> bool {
@@ -199,31 +199,11 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-fn finish(input: &str) -> String {
-    let stripped = strip_ansi(input);
-    let deduped = dedup_consecutive(&stripped);
-    cap_lines(
-        &middle_truncate(&deduped, 32 * 1024, 16 * 1024, 16 * 1024),
-        MAX_LINES,
-    )
-}
-
-fn cap_lines(input: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.len() <= max_lines {
-        return input.trim_end().to_string();
-    }
-    let mut kept = lines
-        .iter()
-        .take(max_lines)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    kept.push_str(&format!(
-        "\n... truncated {} lines",
-        lines.len() - max_lines
-    ));
-    kept
+fn finish(input: CompressionResult) -> CompressionResult {
+    input.map_text(|text| {
+        let stripped = strip_ansi(text);
+        dedup_consecutive(&stripped).trim_end().to_string()
+    })
 }
 
 #[cfg(test)]
@@ -244,7 +224,7 @@ mod tests {
     #[test]
     fn compresses_real_clean_text_pass() {
         let output = "All checks passed!\n";
-        let compressed = compress_ruff(output);
+        let compressed = compress_ruff(output).text;
         assert_eq!(compressed, "ruff: clean");
         assert!(compressed.len() < output.len());
     }
@@ -252,7 +232,7 @@ mod tests {
     #[test]
     fn preserves_text_errors_verbatim() {
         let output = "src/a.py:10:5: E501 Line too long (88 > 79 characters)\nsrc/a.py:25:1: F401 `os` imported but unused\nsrc/b.py:3:8: E711 Comparison to None should be 'cond is None'\nFound 3 errors.\n[*] 1 fixable with the `--fix` option.\n";
-        let compressed = compress_ruff(output);
+        let compressed = compress_ruff(output).text;
         assert!(compressed.contains("src/a.py:10:5: E501 Line too long (88 > 79 characters)"));
         assert!(compressed.contains("src/a.py:25:1: F401 `os` imported but unused"));
         assert!(
@@ -264,8 +244,9 @@ mod tests {
     #[test]
     fn groups_json_output_by_rule() {
         let output = r#"[{"code":"E501","filename":"src/a.py","location":{"row":10,"column":5},"message":"Line too long"},{"code":"E501","filename":"src/b.py","location":{"row":5,"column":1},"message":"Line too long"},{"code":"F401","filename":"src/c.py","location":{"row":1,"column":8},"message":"unused"}]"#;
-        let compressed = compress_ruff(output);
-        assert!(compressed.contains("E501: src/a.py:10, src/b.py:5"));
+        let compressed = compress_ruff(output).text;
+        assert!(compressed.contains("E501: src/a.py:10"));
+        assert!(compressed.contains("E501: src/b.py:5"));
         assert!(compressed.contains("F401: src/c.py:1"));
         assert!(compressed.contains("ruff: 3 violations across 2 rules"));
         assert!(compressed.contains("E501: 2"));
@@ -281,9 +262,11 @@ mod tests {
             ));
         }
         let output = format!("[{}]", items.join(","));
-        let compressed = compress_ruff(&output);
+        let result = compress_ruff(&output);
+        let compressed = result.text;
         assert!(compressed.contains("ruff: 500 violations across 1 rules"));
         assert!(compressed.contains("E501: 500"));
+        assert_eq!(result.dropped_by_class.get(&DropClass::Error), Some(&480));
         assert!(compressed.len() < output.len() / 2);
     }
 }

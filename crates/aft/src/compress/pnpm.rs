@@ -1,5 +1,5 @@
 use crate::compress::generic::GenericCompressor;
-use crate::compress::{Compressor, Specificity};
+use crate::compress::{CompressionResult, Compressor, Specificity};
 
 pub struct PnpmCompressor;
 
@@ -15,11 +15,11 @@ impl Compressor for PnpmCompressor {
             .is_some_and(|head| head == "pnpm")
     }
 
-    fn compress(&self, command: &str, output: &str) -> String {
+    fn compress(&self, command: &str, output: &str) -> CompressionResult {
         match pnpm_subcommand(command).as_deref() {
-            Some("install" | "i" | "add" | "remove") => compress_package(output),
-            Some("run" | "test" | "build") => GenericCompressor::compress_output(output),
-            _ => GenericCompressor::compress_output(output),
+            Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
+            Some("run" | "test" | "build") => GenericCompressor::compress_output(output).into(),
+            _ => GenericCompressor::compress_output(output).into(),
         }
     }
 }
