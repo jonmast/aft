@@ -74,6 +74,9 @@ impl AftProcess {
         let mut command = Command::new(binary);
         command
             .env("AFT_CACHE_DIR", cache_dir.path())
+            // Integration tests often run from a linked git worktree, but their
+            // fixture projects need to exercise main-checkout demand builds.
+            .env("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if pipe_stderr || diag_enabled {

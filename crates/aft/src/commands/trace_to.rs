@@ -1,27 +1,12 @@
 use std::path::Path;
 
+use crate::commands::callgraph_store_adapter::{
+    store_error_response, trace_to_result, unavailable_response,
+};
 use crate::context::AppContext;
-use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to` request.
-///
-/// Traces backward from a symbol to all entry points (exported functions,
-/// main/init, test functions), returning complete paths rendered top-down.
-///
-/// Expects:
-/// - `file` (string, required) — path to the source file containing the target symbol
-/// - `symbol` (string, required) — name of the symbol to trace to entry points
-/// - `depth` (number, optional, default 10) — maximum backward traversal depth
-///
-/// Returns `TraceToResult` with fields: `target_symbol`, `target_file`,
-/// `paths` (array of top-down hops), `total_paths`, `entry_points_found`,
-/// `max_depth_reached`, `truncated_paths`.
-///
-/// Returns error if:
-/// - required params missing
-/// - call graph not initialized (configure not called)
-/// - symbol not found in the file
 pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -52,18 +37,6 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(10)
         .min(100) as usize;
 
-    let mut cg_ref = ctx.callgraph().borrow_mut();
-    let graph = match cg_ref.as_mut() {
-        Some(g) => g,
-        None => {
-            return Response::error(
-                &req.id,
-                "not_configured",
-                "trace_to: project not configured — send 'configure' first",
-            );
-        }
-    };
-
     let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
@@ -92,21 +65,17 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
-        Ok(symbol) => symbol,
-        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    let store = match ctx.ensure_callgraph_store_for_ops() {
+        Ok(Some(store)) => store,
+        Ok(None) => return unavailable_response(&req.id, "trace_to", ctx.is_worktree_bridge()),
+        Err(error) => return store_error_response(&req.id, "trace_to", error),
     };
 
-    let max_files = ctx.config().max_callgraph_files;
-
-    match graph.trace_to(&file_path, &symbol, depth, max_files) {
+    match trace_to_result(&store, &file_path, symbol, depth) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }
-        Err(err @ AftError::ProjectTooLarge { .. }) => {
-            Response::error(&req.id, "project_too_large", format!("{}", err))
-        }
-        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+        Err(error) => store_error_response(&req.id, "trace_to", error),
     }
 }

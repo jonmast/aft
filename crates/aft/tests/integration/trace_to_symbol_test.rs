@@ -368,7 +368,7 @@ fn trace_to_symbol_cycle_does_not_loop_and_finds_shortest_path() {
 }
 
 #[test]
-fn trace_to_symbol_project_too_large_fast_fails() {
+fn trace_to_symbol_ignores_legacy_project_size_cap() {
     let temp = tempdir().unwrap();
     let root = temp.path();
     let start = root.join("start.ts");
@@ -390,10 +390,11 @@ fn trace_to_symbol_project_too_large_fast_fails() {
     let resp = trace_to_symbol(&mut aft, &start, "run", "target", Some(&target), None);
 
     assert_eq!(
-        resp["success"], false,
-        "large project should fail: {resp:?}"
+        resp["success"], true,
+        "store-backed trace_to_symbol should ignore max_callgraph_files: {resp:?}"
     );
-    assert_eq!(resp["code"], "project_too_large");
+    assert_eq!(resp["complete"], true);
+    assert_eq!(path_symbols(&resp), vec!["run", "target"]);
 
     aft.shutdown();
 }

@@ -1118,7 +1118,7 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
         graph.invalidate_file(&root.join(".aftignore"));
     }
 
-    if config.callgraph_store && !ctx.is_worktree_bridge() {
+    if !ctx.is_worktree_bridge() {
         if let Some(store) = ctx.callgraph_store().borrow_mut().as_mut() {
             let current_files = aft::callgraph::walk_project_files(&root).collect::<Vec<_>>();
             match store.refresh_corpus(&current_files) {
@@ -1195,9 +1195,6 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
 
 fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::path::PathBuf>) {
     if ctx.is_worktree_bridge() {
-        return;
-    }
-    if !ctx.config().callgraph_store {
         return;
     }
     let source_paths = changed

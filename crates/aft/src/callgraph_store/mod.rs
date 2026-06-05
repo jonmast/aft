@@ -360,6 +360,7 @@ struct DbFileIndex {
     lang: Option<LangId>,
     exports: HashSet<String>,
     default_export: Option<String>,
+    export_aliases: HashMap<String, String>,
     node_by_scoped: HashMap<String, String>,
     node_by_bare: HashMap<String, String>,
     module_targets: HashMap<String, Option<String>>,
@@ -375,6 +376,7 @@ struct ReexportIndex {
 
 #[derive(Debug, Clone)]
 struct ProjectIndex<'a> {
+    project_root: PathBuf,
     files: HashMap<String, DbFileIndex>,
     caller_data: HashMap<String, &'a FileCallData>,
 }
@@ -835,12 +837,46 @@ impl CallGraphStore {
         edge_snapshot_with_conn(&conn)
     }
 
+    pub fn indexed_file_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
+        indexed_file_count(&conn)
+    }
+
     pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
         let rel_path = relative_path(&self.project_root, &abs_path);
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         resolve_node_for_rel(&conn, &rel_path, symbol)
+    }
+
+    /// Return all positional nodes matching a legacy symbol query in a file.
+    ///
+    /// Consumers that need legacy compatibility can collapse these by
+    /// `StoreNode::symbol` before deciding whether a query is ambiguous.
+    pub fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        let abs_path = normalize_file_path(&self.project_root, file_rel)?;
+        let rel_path = relative_path(&self.project_root, &abs_path);
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
+        nodes_for_file_matching_symbol(&conn, &rel_path, symbol)
+    }
+
+    /// Return all positional nodes matching a symbol query anywhere in the store.
+    pub fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
+        nodes_matching_symbol(&conn, symbol)
+    }
+
+    /// Return direct callers for an already-resolved `(file, scoped_symbol)` tuple.
+    pub fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        let abs_path = normalize_file_path(&self.project_root, file_rel)?;
+        let rel_path = relative_path(&self.project_root, &abs_path);
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
+        direct_callers_for_tuple(&conn, &rel_path, symbol)
     }
 
     pub fn callers_of(
@@ -1909,6 +1945,7 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let import_dependencies =
         import_dependencies(project_root, &abs_path, &data.import_block.imports);
     let reexports = collect_reexport_refs(project_root, &abs_path, &rel_path, &source);
+    let source_less_exports = collect_source_less_export_alias_refs(&rel_path, &source);
     let mut raw_refs = Vec::new();
     raw_refs.extend(build_call_refs(
         &rel_path,
@@ -1922,9 +1959,12 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &rel_path,
         &data.import_block.imports,
     )?);
+    let mut surface_parts = reexports.surface_parts;
+    surface_parts.extend(source_less_exports.surface_parts);
     raw_refs.extend(reexports.raw_refs);
+    raw_refs.extend(source_less_exports.raw_refs);
     let dispatch_hints = build_dispatch_hints(&rel_path, &data, &node_by_scoped);
-    let surface_fingerprint = surface_fingerprint(&mut nodes, &data, &reexports.surface_parts);
+    let surface_fingerprint = surface_fingerprint(&mut nodes, &data, &surface_parts);
 
     Ok(FileExtract {
         abs_path,
@@ -2236,6 +2276,85 @@ fn quoted_module_path(statement: &str) -> Option<String> {
     Some(statement[start..end].to_string())
 }
 
+#[derive(Debug, Clone)]
+struct SourceLessExportRefs {
+    raw_refs: Vec<RawRef>,
+    surface_parts: Vec<String>,
+}
+
+fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> SourceLessExportRefs {
+    let mut raw_refs = Vec::new();
+    let mut surface_parts = Vec::new();
+    let mut search_start = 0usize;
+    let mut ordinal = 0usize;
+    while let Some(export_offset) = source[search_start..].find("export") {
+        let start = search_start + export_offset;
+        let Some(statement_end_offset) = source[start..].find(';') else {
+            break;
+        };
+        let end = start + statement_end_offset + 1;
+        let statement = &source[start..end];
+        search_start = end;
+        if statement.contains(" from ") || !statement.contains('{') || !statement.contains('}') {
+            continue;
+        }
+        let aliases = parse_reexport_names(statement);
+        if aliases.is_empty() {
+            continue;
+        }
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32
+            + 1;
+        for (exported, source_symbol) in aliases {
+            ordinal += 1;
+            let ref_id = ref_id(&[
+                rel_path,
+                "export_alias",
+                &start.to_string(),
+                &end.to_string(),
+                &exported,
+                &source_symbol,
+                &ordinal.to_string(),
+            ]);
+            surface_parts.push(format!("export_alias\t{source_symbol}\t{exported}"));
+            let raw_payload = serde_json::to_string(&json!({
+                "kind": "export_alias",
+                "source": source_symbol,
+                "exported": exported,
+                "raw_text": statement,
+                "byte_range": {"start": start, "end": end}
+            }))
+            .unwrap_or_else(|_| "{}".to_string());
+            raw_refs.push(RawRef {
+                ref_id,
+                caller_node: None,
+                caller_symbol: None,
+                caller_file: rel_path.to_string(),
+                kind: "export_alias".to_string(),
+                short_name: None,
+                full_ref: Some(statement.to_string()),
+                module_path: None,
+                import_kind: Some("export_alias".to_string()),
+                local_name: Some(exported),
+                requested_name: Some(source_symbol),
+                namespace_alias: None,
+                wildcard: false,
+                line,
+                byte_start: start,
+                byte_end: end,
+                raw_payload,
+                dependencies: BTreeSet::new(),
+            });
+        }
+    }
+    SourceLessExportRefs {
+        raw_refs,
+        surface_parts,
+    }
+}
+
 fn build_dispatch_hints(
     rel_path: &str,
     data: &FileCallData,
@@ -2485,6 +2604,13 @@ fn resolve_exported_symbol(
         return None;
     }
     if requested != "default" {
+        if let Some(source_symbol) = index
+            .files
+            .get(file)
+            .and_then(|item| item.export_aliases.get(requested))
+        {
+            return Some((file.to_string(), source_symbol.clone()));
+        }
         if index
             .files
             .get(file)
@@ -2534,7 +2660,11 @@ fn resolve_rust_target(
 ) -> Option<(String, String, String)> {
     if full_ref.contains("::") {
         if let Some(target_file) = rust_target_for_qualified(index, caller_file, full_ref) {
-            return Some(("resolved".to_string(), target_file, short_name.to_string()));
+            return Some((
+                "resolved".to_string(),
+                target_file,
+                rust_target_symbol(full_ref, short_name),
+            ));
         }
     }
 
@@ -2559,8 +2689,22 @@ fn rust_target_for_qualified(
         return None;
     }
     segments.pop();
+    if !matches!(segments.first().copied(), Some("crate" | "self" | "super")) {
+        if let Some(target) = rust_workspace_file_for_segments(index, &segments) {
+            return Some(target);
+        }
+    }
     let module_segments = rust_resolve_segments(caller_file, &segments)?;
     rust_file_for_segments(index, caller_file, &module_segments)
+}
+
+fn rust_target_symbol(full_ref: &str, short_name: &str) -> String {
+    full_ref
+        .rsplit("::")
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(short_name)
+        .to_string()
 }
 
 fn rust_target_for_use(
@@ -2598,6 +2742,72 @@ fn rust_target_for_use(
     Some((file, segments.last().unwrap_or(&short_name).to_string()))
 }
 
+fn rust_workspace_file_for_segments(index: &ProjectIndex<'_>, segments: &[&str]) -> Option<String> {
+    let crate_name = segments.first().copied()?;
+    let src_prefix = rust_workspace_src_prefix(&index.project_root, crate_name)?;
+    let module_segments = segments[1..]
+        .iter()
+        .map(|segment| segment.to_string())
+        .collect::<Vec<_>>();
+    rust_file_for_src_prefix(index, &src_prefix, &module_segments)
+}
+
+fn rust_workspace_src_prefix(project_root: &Path, crate_name: &str) -> Option<String> {
+    let mut stack = vec![project_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if matches!(name, "target" | "node_modules" | ".git") {
+            continue;
+        }
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() && rust_manifest_defines_crate(&manifest, crate_name) {
+            let src = dir.join("src");
+            return Some(relative_path(project_root, &canonicalize_path(&src)));
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    None
+}
+
+fn rust_manifest_defines_crate(manifest: &Path, crate_name: &str) -> bool {
+    let Ok(source) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
+    let mut in_lib = false;
+    let mut package_name = None;
+    let mut lib_name = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_lib = trimmed == "[lib]";
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"');
+        if in_lib && key == "name" {
+            lib_name = Some(value.to_string());
+        } else if !in_lib && key == "name" && package_name.is_none() {
+            package_name = Some(value.to_string());
+        }
+    }
+    lib_name.as_deref() == Some(crate_name)
+        || package_name
+            .as_deref()
+            .map(|name| name.replace('-', "_") == crate_name)
+            .unwrap_or(false)
+}
+
 fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
     if segments.is_empty() {
         return Some(Vec::new());
@@ -2630,9 +2840,16 @@ fn rust_file_for_segments(
     caller_file: &str,
     segments: &[String],
 ) -> Option<String> {
-    let src_prefix = rust_src_prefix(caller_file);
+    rust_file_for_src_prefix(index, &rust_src_prefix(caller_file), segments)
+}
+
+fn rust_file_for_src_prefix(
+    index: &ProjectIndex<'_>,
+    src_prefix: &str,
+    segments: &[String],
+) -> Option<String> {
     let candidate = if segments.is_empty() {
-        [src_prefix.as_str(), "lib.rs"].join("/")
+        [src_prefix, "lib.rs"].join("/")
     } else {
         format!("{}/{}.rs", src_prefix, segments.join("/"))
     };
@@ -2705,7 +2922,11 @@ impl<'a> ProjectIndex<'a> {
             caller_data.insert(extract.rel_path.clone(), &extract.data);
             files.insert(extract.rel_path.clone(), index);
         }
-        Self { files, caller_data }
+        Self {
+            project_root: project_root.to_path_buf(),
+            files,
+            caller_data,
+        }
     }
 
     fn from_db_and_callers(
@@ -2713,7 +2934,7 @@ impl<'a> ProjectIndex<'a> {
         project_root: &Path,
         caller_extracts: &'a HashMap<String, FileExtract>,
     ) -> Result<Self> {
-        let mut files = load_db_file_indexes(tx)?;
+        let mut files = load_db_file_indexes(tx, project_root)?;
         let mut caller_data = HashMap::new();
         for (rel_path, extract) in caller_extracts {
             files.insert(
@@ -2722,7 +2943,11 @@ impl<'a> ProjectIndex<'a> {
             );
             caller_data.insert(rel_path.clone(), &extract.data);
         }
-        Ok(Self { files, caller_data })
+        Ok(Self {
+            project_root: project_root.to_path_buf(),
+            files,
+            caller_data,
+        })
     }
 
     fn lang_for(&self, rel_path: &str) -> Option<LangId> {
@@ -2762,6 +2987,16 @@ impl DbFileIndex {
                 .entry(node.name.clone())
                 .or_insert(node.id.clone());
         }
+        let mut export_aliases = HashMap::new();
+        for raw_ref in &extract.raw_refs {
+            if raw_ref.kind == "export_alias" {
+                if let (Some(exported), Some(source_symbol)) =
+                    (&raw_ref.local_name, &raw_ref.requested_name)
+                {
+                    export_aliases.insert(exported.clone(), source_symbol.clone());
+                }
+            }
+        }
         let mut module_targets = HashMap::new();
         for import in &extract.data.import_block.imports {
             module_targets.insert(
@@ -2787,6 +3022,7 @@ impl DbFileIndex {
             lang: Some(extract.lang),
             exports: extract.data.exported_symbols.iter().cloned().collect(),
             default_export: extract.data.default_export_symbol.clone(),
+            export_aliases,
             node_by_scoped,
             node_by_bare,
             module_targets,
@@ -2795,7 +3031,10 @@ impl DbFileIndex {
     }
 }
 
-fn load_db_file_indexes(tx: &Transaction<'_>) -> Result<HashMap<String, DbFileIndex>> {
+fn load_db_file_indexes(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+) -> Result<HashMap<String, DbFileIndex>> {
     let mut files = HashMap::new();
     let mut stmt = tx.prepare("SELECT path, lang FROM files")?;
     let rows = stmt.query_map([], |row| {
@@ -2809,6 +3048,7 @@ fn load_db_file_indexes(tx: &Transaction<'_>) -> Result<HashMap<String, DbFileIn
                 lang: lang_from_label(&lang),
                 exports: HashSet::new(),
                 default_export: None,
+                export_aliases: HashMap::new(),
                 node_by_scoped: HashMap::new(),
                 node_by_bare: HashMap::new(),
                 module_targets: HashMap::new(),
@@ -2838,6 +3078,7 @@ fn load_db_file_indexes(tx: &Transaction<'_>) -> Result<HashMap<String, DbFileIn
                 lang: None,
                 exports: HashSet::new(),
                 default_export: None,
+                export_aliases: HashMap::new(),
                 node_by_scoped: HashMap::new(),
                 node_by_bare: HashMap::new(),
                 module_targets: HashMap::new(),
@@ -2855,7 +3096,8 @@ fn load_db_file_indexes(tx: &Transaction<'_>) -> Result<HashMap<String, DbFileIn
     }
     let file_keys: HashSet<String> = files.keys().cloned().collect();
     let mut ref_stmt = tx.prepare(
-        "SELECT ref_id, caller_file, kind, module_path, full_ref, wildcard FROM refs WHERE kind IN ('import', 'reexport')",
+        "SELECT ref_id, caller_file, kind, module_path, full_ref, wildcard, local_name, requested_name
+         FROM refs WHERE kind IN ('import', 'reexport', 'export_alias')",
     )?;
     let ref_rows = ref_stmt.query_map([], |row| {
         Ok((
@@ -2865,15 +3107,37 @@ fn load_db_file_indexes(tx: &Transaction<'_>) -> Result<HashMap<String, DbFileIn
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, i64>(5)? != 0,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     for row in ref_rows {
-        let (ref_id, caller_file, kind, module_path, full_ref, wildcard) = row?;
+        let (
+            ref_id,
+            caller_file,
+            kind,
+            module_path,
+            full_ref,
+            wildcard,
+            local_name,
+            requested_name,
+        ) = row?;
+        if kind == "export_alias" {
+            if let (Some(exported), Some(source_symbol), Some(file)) =
+                (local_name, requested_name, files.get_mut(&caller_file))
+            {
+                file.export_aliases.insert(exported, source_symbol);
+            }
+            continue;
+        }
         let Some(module_path) = module_path else {
             continue;
         };
         let deps = dependencies_for_ref(tx, &ref_id)?;
-        let target_file = deps.iter().find(|dep| file_keys.contains(*dep)).cloned();
+        let target_file = deps
+            .iter()
+            .find(|dep| file_keys.contains(*dep))
+            .map(|dep| relative_path(project_root, &canonicalize_path(&project_root.join(dep))));
         if let Some(file) = files.get_mut(&caller_file) {
             file.module_targets
                 .entry(module_path.clone())
@@ -3209,10 +3473,14 @@ fn module_target_from_dependencies(
     project_root: &Path,
     dependencies: &BTreeSet<String>,
 ) -> Option<String> {
-    dependencies
-        .iter()
-        .find(|dep| project_root.join(dep).is_file())
-        .cloned()
+    dependencies.iter().find_map(|dep| {
+        let path = project_root.join(dep);
+        if path.is_file() {
+            Some(relative_path(project_root, &canonicalize_path(&path)))
+        } else {
+            None
+        }
+    })
 }
 
 fn reexport_index_from_raw(raw_ref: &RawRef, target_file: Option<String>) -> ReexportIndex {
