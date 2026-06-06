@@ -698,7 +698,7 @@ impl CallGraphStore {
         for resolved in &resolved_refs {
             insert_resolved_ref(&tx, resolved)?;
         }
-        let supplemental_edge_count = insert_method_dispatch_edges(&tx, None)?;
+        let supplemental_edge_count = insert_method_dispatch_edges(&tx, &self.project_root, None)?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
         phase!("sqlite_insert", t);
@@ -839,7 +839,7 @@ impl CallGraphStore {
         }
 
         delete_method_dispatch_edges_for_callers(&tx, &own_refresh)?;
-        insert_method_dispatch_edges(&tx, Some(&own_refresh))?;
+        insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
 
         tx.commit()?;
         Ok(IncrementalStats {
@@ -3440,6 +3440,7 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
 
 fn insert_method_dispatch_edges(
     tx: &Transaction<'_>,
+    project_root: &Path,
     caller_files: Option<&BTreeSet<String>>,
 ) -> Result<usize> {
     let references = load_name_match_refs(tx, caller_files)?;
@@ -3448,6 +3449,7 @@ fn insert_method_dispatch_edges(
     }
 
     let mut candidates_by_name: HashMap<(String, String), Vec<NameMatchCandidate>> = HashMap::new();
+    let mut source_cache: DispatchSourceCache = HashMap::new();
     let mut inserted = 0usize;
     for reference in references {
         let key = (reference.method_name.clone(), reference.lang.clone());
@@ -3460,7 +3462,9 @@ fn insert_method_dispatch_edges(
             }
         };
 
-        if let Some(receiver_type) = infer_receiver_type(&reference) {
+        if let Some(receiver_type) =
+            infer_receiver_type(project_root, &reference, &mut source_cache)
+        {
             let Some(candidate) =
                 select_type_match_candidate(&reference, candidates.as_slice(), &receiver_type)
             else {
@@ -3545,7 +3549,7 @@ fn load_name_match_refs(
                       AND r.status = 'unresolved'
                       AND r.caller_node IS NOT NULL
                       AND r.full_ref IS NOT NULL
-                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%')
+                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%' OR r.full_ref LIKE '%->%')
                       AND NOT EXISTS (
                           SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call'
                       )";
@@ -3682,20 +3686,13 @@ fn name_match_ref_from_parts(
 }
 
 fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, bool)> {
-    let dot = full_ref.rfind('.').map(|index| (index, 1usize));
-    let colon = full_ref.rfind("::").map(|index| (index, 2usize));
-    let (delimiter, delimiter_len) = match (dot, colon) {
-        (Some(dot), Some(colon)) => {
-            if dot.0 > colon.0 {
-                dot
-            } else {
-                colon
-            }
-        }
-        (Some(dot), None) => dot,
-        (None, Some(colon)) => colon,
-        (None, None) => return None,
-    };
+    let dot = full_ref.rfind('.').map(|index| (index, 1usize, false));
+    let colon = full_ref.rfind("::").map(|index| (index, 2usize, true));
+    let arrow = full_ref.rfind("->").map(|index| (index, 2usize, false));
+    let (delimiter, delimiter_len, colon_dispatch) = [dot, colon, arrow]
+        .into_iter()
+        .flatten()
+        .max_by_key(|(index, _, _)| *index)?;
     if delimiter == 0 {
         return None;
     }
@@ -3708,12 +3705,12 @@ fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, bool)> {
     if receiver.is_empty() || member.is_empty() {
         return None;
     }
-    Some((receiver.to_string(), member.to_string(), delimiter_len == 2))
+    Some((receiver.to_string(), member.to_string(), colon_dispatch))
 }
 
 fn last_name_segment(value: &str) -> &str {
     value
-        .rsplit(['.', ':', '/', '\\'])
+        .rsplit(['.', ':', '/', '\\', '-', '>'])
         .find(|segment| !segment.is_empty())
         .unwrap_or(value)
 }
@@ -3743,11 +3740,855 @@ fn load_name_match_candidates(
         .map_err(Into::into)
 }
 
-fn infer_receiver_type(reference: &NameMatchRef) -> Option<String> {
-    if reference.lang != "rust" {
+struct ParsedDispatchSource {
+    source: String,
+    tree: tree_sitter::Tree,
+}
+
+type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource>>;
+
+fn infer_receiver_type(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    source_cache: &mut DispatchSourceCache,
+) -> Option<String> {
+    match reference.lang.as_str() {
+        "rust" => infer_rust_receiver_type(reference),
+        "java" => {
+            infer_java_like_receiver_type(project_root, reference, LangId::Java, source_cache)
+        }
+        "kotlin" => {
+            infer_java_like_receiver_type(project_root, reference, LangId::Kotlin, source_cache)
+        }
+        "cpp" => infer_cpp_receiver_type(project_root, reference, source_cache),
+        _ => None,
+    }
+}
+
+fn parse_dispatch_source(
+    project_root: &Path,
+    caller_file: &str,
+    lang: LangId,
+) -> Option<ParsedDispatchSource> {
+    let source = std::fs::read_to_string(project_root.join(caller_file)).ok()?;
+    let grammar = crate::parser::grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(&source, None)?;
+    Some(ParsedDispatchSource { source, tree })
+}
+
+fn parsed_dispatch_source<'a>(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    lang: LangId,
+    source_cache: &'a mut DispatchSourceCache,
+) -> Option<&'a ParsedDispatchSource> {
+    let key = (reference.caller_file.clone(), reference.lang.clone());
+    source_cache
+        .entry(key)
+        .or_insert_with(|| parse_dispatch_source(project_root, &reference.caller_file, lang))
+        .as_ref()
+}
+
+fn infer_java_like_receiver_type(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    lang: LangId,
+    source_cache: &mut DispatchSourceCache,
+) -> Option<String> {
+    if reference.colon_dispatch || !receiver_is_bare_identifier(&reference.receiver) {
         return None;
     }
-    infer_rust_receiver_type(reference)
+
+    let parsed = parsed_dispatch_source(project_root, reference, lang, source_cache)?;
+    let root = parsed.tree.root_node();
+    let type_node = find_enclosing_java_like_type_node(root, &parsed.source, reference, lang);
+
+    let callable_scope = type_node
+        .and_then(|node| {
+            find_enclosing_java_like_callable_node(node, &parsed.source, reference, lang)
+        })
+        .or_else(|| find_enclosing_java_like_callable_node(root, &parsed.source, reference, lang));
+
+    if let Some(callable_scope) = callable_scope {
+        if let Some(receiver_type) = infer_java_like_local_receiver_type(
+            callable_scope,
+            &parsed.source,
+            &reference.receiver,
+            reference.line.max(1),
+            lang,
+        ) {
+            return Some(receiver_type);
+        }
+    }
+
+    type_node.and_then(|node| {
+        infer_java_like_field_receiver_type(node, &parsed.source, &reference.receiver, lang)
+    })
+}
+
+fn infer_cpp_receiver_type(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    source_cache: &mut DispatchSourceCache,
+) -> Option<String> {
+    if reference.colon_dispatch || !receiver_is_bare_identifier(&reference.receiver) {
+        return None;
+    }
+
+    let parsed = parsed_dispatch_source(project_root, reference, LangId::Cpp, source_cache)?;
+    let root = parsed.tree.root_node();
+    let scope = find_enclosing_cpp_callable_node(root, &parsed.source, reference).unwrap_or(root);
+    infer_cpp_receiver_type_from_scope(
+        scope,
+        &parsed.source,
+        &reference.receiver,
+        reference.line.max(1),
+    )
+}
+
+fn find_enclosing_java_like_type_node<'tree>(
+    root: tree_sitter::Node<'tree>,
+    source: &str,
+    reference: &NameMatchRef,
+    lang: LangId,
+) -> Option<tree_sitter::Node<'tree>> {
+    let expected_type = enclosing_type_from_scoped_name(&reference.caller_symbol)
+        .and_then(|name| simple_type_name(&name));
+    let line = reference.line.max(1);
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !node_contains_line(node, line) {
+            continue;
+        }
+        if is_java_like_type_kind(node.kind(), lang) {
+            let name = declaration_name(node, source);
+            if expected_type
+                .as_deref()
+                .is_none_or(|expected| name == Some(expected))
+            {
+                best = tighter_node(best, node);
+            }
+        }
+        push_named_children(node, &mut stack);
+    }
+    best
+}
+
+fn find_enclosing_java_like_callable_node<'tree>(
+    root: tree_sitter::Node<'tree>,
+    source: &str,
+    reference: &NameMatchRef,
+    lang: LangId,
+) -> Option<tree_sitter::Node<'tree>> {
+    let expected_name = reference.caller_symbol.rsplit("::").next();
+    let line = reference.line.max(1);
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !node_contains_line(node, line) {
+            continue;
+        }
+        if is_java_like_callable_kind(node.kind(), lang) {
+            let name = declaration_name(node, source);
+            if expected_name.is_none_or(|expected| name == Some(expected)) {
+                best = tighter_node(best, node);
+            }
+        }
+        push_named_children(node, &mut stack);
+    }
+    best
+}
+
+fn find_enclosing_cpp_callable_node<'tree>(
+    root: tree_sitter::Node<'tree>,
+    _source: &str,
+    reference: &NameMatchRef,
+) -> Option<tree_sitter::Node<'tree>> {
+    let line = reference.line.max(1);
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !node_contains_line(node, line) {
+            continue;
+        }
+        if node.kind() == "function_definition" {
+            best = tighter_node(best, node);
+        }
+        push_named_children(node, &mut stack);
+    }
+    best
+}
+
+fn tighter_node<'tree>(
+    current: Option<tree_sitter::Node<'tree>>,
+    candidate: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    match current {
+        Some(current)
+            if current.start_byte() > candidate.start_byte()
+                || (current.start_byte() == candidate.start_byte()
+                    && current.end_byte() <= candidate.end_byte()) =>
+        {
+            Some(current)
+        }
+        _ => Some(candidate),
+    }
+}
+
+fn node_contains_line(node: tree_sitter::Node<'_>, line: u32) -> bool {
+    let start = node.start_position().row as u32 + 1;
+    let end = node.end_position().row as u32 + 1;
+    start <= line && line <= end
+}
+
+fn push_named_children<'tree>(
+    node: tree_sitter::Node<'tree>,
+    stack: &mut Vec<tree_sitter::Node<'tree>>,
+) {
+    for index in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(index as u32) {
+            stack.push(child);
+        }
+    }
+}
+
+fn declaration_name<'source>(
+    node: tree_sitter::Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    node.child_by_field_name("name")
+        .map(|name| node_text(name, source))
+        .or_else(|| {
+            first_named_child_text(
+                node,
+                source,
+                &["identifier", "type_identifier", "simple_identifier"],
+            )
+        })
+}
+
+fn first_named_child_text<'source>(
+    node: tree_sitter::Node<'_>,
+    source: &'source str,
+    kinds: &[&str],
+) -> Option<&'source str> {
+    for index in 0..node.named_child_count() {
+        let child = node.named_child(index as u32)?;
+        if kinds.contains(&child.kind()) {
+            return Some(node_text(child, source));
+        }
+    }
+    None
+}
+
+fn node_text<'source>(node: tree_sitter::Node<'_>, source: &'source str) -> &'source str {
+    &source[node.byte_range()]
+}
+
+fn infer_java_like_field_receiver_type(
+    type_node: tree_sitter::Node<'_>,
+    source: &str,
+    receiver: &str,
+    lang: LangId,
+) -> Option<String> {
+    let mut stack = Vec::new();
+    push_named_children(type_node, &mut stack);
+    while let Some(node) = stack.pop() {
+        if is_java_like_field_kind(node.kind(), lang) {
+            if let Some(receiver_type) =
+                extract_java_like_declared_type(node_text(node, source), receiver, lang)
+            {
+                return Some(receiver_type);
+            }
+        }
+        if is_java_like_type_kind(node.kind(), lang)
+            || is_java_like_callable_kind(node.kind(), lang)
+        {
+            continue;
+        }
+        push_named_children(node, &mut stack);
+    }
+    None
+}
+
+fn infer_java_like_local_receiver_type(
+    callable_node: tree_sitter::Node<'_>,
+    source: &str,
+    receiver: &str,
+    call_line: u32,
+    lang: LangId,
+) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    let mut stack = Vec::new();
+    push_named_children(callable_node, &mut stack);
+    while let Some(node) = stack.pop() {
+        let start_line = node.start_position().row as u32 + 1;
+        if start_line > call_line {
+            continue;
+        }
+        if is_java_like_local_kind(node.kind(), lang) {
+            if let Some(receiver_type) =
+                extract_java_like_declared_type(node_text(node, source), receiver, lang)
+            {
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_line, _)| start_line >= *best_line)
+                {
+                    best = Some((start_line, receiver_type));
+                }
+            }
+        }
+        if is_java_like_type_kind(node.kind(), lang)
+            || is_java_like_callable_kind(node.kind(), lang)
+        {
+            continue;
+        }
+        push_named_children(node, &mut stack);
+    }
+    best.map(|(_, receiver_type)| receiver_type)
+}
+
+fn is_java_like_type_kind(kind: &str, lang: LangId) -> bool {
+    match lang {
+        LangId::Java => matches!(
+            kind,
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ),
+        LangId::Kotlin => matches!(kind, "class_declaration" | "object_declaration"),
+        _ => false,
+    }
+}
+
+fn is_java_like_callable_kind(kind: &str, lang: LangId) -> bool {
+    match lang {
+        LangId::Java => matches!(kind, "method_declaration" | "constructor_declaration"),
+        LangId::Kotlin => kind == "function_declaration",
+        _ => false,
+    }
+}
+
+fn is_java_like_field_kind(kind: &str, lang: LangId) -> bool {
+    match lang {
+        LangId::Java => kind == "field_declaration",
+        LangId::Kotlin => kind == "property_declaration",
+        _ => false,
+    }
+}
+
+fn is_java_like_local_kind(kind: &str, lang: LangId) -> bool {
+    match lang {
+        LangId::Java => kind == "local_variable_declaration",
+        LangId::Kotlin => kind == "property_declaration",
+        _ => false,
+    }
+}
+
+fn extract_java_like_declared_type(
+    declaration: &str,
+    receiver: &str,
+    lang: LangId,
+) -> Option<String> {
+    match lang {
+        LangId::Java => extract_java_declared_type(declaration, receiver),
+        LangId::Kotlin => extract_kotlin_declared_type(declaration, receiver),
+        _ => None,
+    }
+}
+
+fn extract_java_declared_type(declaration: &str, receiver: &str) -> Option<String> {
+    let receiver_start = find_identifier_occurrence(declaration, receiver)?;
+    let after = declaration[receiver_start + receiver.len()..].trim_start();
+    if after
+        .chars()
+        .next()
+        .is_some_and(|ch| !matches!(ch, ';' | '=' | ',' | ')' | '['))
+    {
+        return None;
+    }
+
+    let before = declaration[..receiver_start].trim_end();
+    if before.contains(',') {
+        return None;
+    }
+    normalize_receiver_type_name(strip_java_declaration_prefixes(before))
+}
+
+fn strip_java_declaration_prefixes(mut value: &str) -> &str {
+    loop {
+        value = value.trim_start();
+        if let Some(stripped) = strip_leading_java_annotation(value) {
+            value = stripped;
+            continue;
+        }
+        if let Some(stripped) = strip_leading_java_modifier(value) {
+            value = stripped;
+            continue;
+        }
+        return value.trim();
+    }
+}
+
+fn strip_leading_java_annotation(value: &str) -> Option<&str> {
+    let value = value.trim_start();
+    let mut chars = value.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '@' {
+        return None;
+    }
+    let mut end = first.len_utf8();
+    for (index, ch) in chars {
+        if !(is_code_ident_char(ch) || ch == '.') {
+            end = index;
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+    let rest = value[end..].trim_start();
+    if let Some(stripped) = rest.strip_prefix('(') {
+        let mut depth = 1usize;
+        for (index, ch) in stripped.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(stripped[index + ch.len_utf8()..].trim_start());
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Some("");
+    }
+    Some(rest)
+}
+
+fn strip_leading_java_modifier(value: &str) -> Option<&str> {
+    const MODIFIERS: &[&str] = &[
+        "public",
+        "protected",
+        "private",
+        "abstract",
+        "static",
+        "final",
+        "transient",
+        "volatile",
+        "synchronized",
+        "native",
+        "strictfp",
+    ];
+    MODIFIERS
+        .iter()
+        .find_map(|modifier| strip_leading_word(value, modifier))
+}
+
+fn extract_kotlin_declared_type(declaration: &str, receiver: &str) -> Option<String> {
+    let receiver_start = find_identifier_occurrence(declaration, receiver)?;
+    let before = &declaration[..receiver_start];
+    if find_identifier_occurrence(before, "val").is_none()
+        && find_identifier_occurrence(before, "var").is_none()
+    {
+        return None;
+    }
+
+    let after = declaration[receiver_start + receiver.len()..].trim_start();
+    if let Some(type_text) = after.strip_prefix(':') {
+        return normalize_receiver_type_name(read_type_prefix(type_text));
+    }
+    after
+        .strip_prefix('=')
+        .and_then(infer_kotlin_constructor_type)
+}
+
+fn infer_kotlin_constructor_type(rhs: &str) -> Option<String> {
+    let (head, rest) = read_invocation_head(rhs.trim_start(), JavaLikeInvocation::Kotlin)?;
+    if rest.trim_start().starts_with('(') {
+        normalize_receiver_type_name(head)
+    } else {
+        None
+    }
+}
+
+fn read_type_prefix(value: &str) -> &str {
+    let mut angle_depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '=' | ';' | '\n' | '\r' | '{' | ',' | ')' if angle_depth == 0 => {
+                return value[..index].trim();
+            }
+            _ => {}
+        }
+    }
+    value.trim()
+}
+
+fn infer_cpp_receiver_type_from_scope(
+    scope: tree_sitter::Node<'_>,
+    source: &str,
+    receiver: &str,
+    call_line: u32,
+) -> Option<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let scope_start = scope.start_position().row as usize;
+    let call_index = (call_line as usize)
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
+    for index in (scope_start..=call_index).rev() {
+        if let Some(receiver_type) = infer_cpp_receiver_type_from_line(lines[index], receiver) {
+            return Some(receiver_type);
+        }
+    }
+    None
+}
+
+fn infer_cpp_receiver_type_from_line(line: &str, receiver: &str) -> Option<String> {
+    for receiver_start in identifier_occurrences(line, receiver) {
+        let after = line[receiver_start + receiver.len()..].trim_start();
+        if after
+            .chars()
+            .next()
+            .is_some_and(|ch| !matches!(ch, ';' | '=' | ',' | ')' | '[' | '{' | '('))
+        {
+            continue;
+        }
+        let type_text = cpp_type_before_receiver(&line[..receiver_start])?;
+        let normalized = normalize_cpp_type_name(type_text)?;
+        if normalized == "auto" {
+            if let Some(rhs) = after.strip_prefix('=') {
+                return infer_cpp_auto_receiver_type(rhs);
+            }
+            continue;
+        }
+        return Some(normalized);
+    }
+    None
+}
+
+fn cpp_type_before_receiver(prefix: &str) -> Option<&str> {
+    let candidate = prefix
+        .rsplit([';', '{', '}', '('])
+        .next()
+        .unwrap_or(prefix)
+        .trim();
+    if candidate.is_empty() || candidate.ends_with(',') {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn normalize_cpp_type_name(type_text: &str) -> Option<String> {
+    let without_templates = strip_angle_groups(type_text);
+    let mut cleaned = String::with_capacity(without_templates.len());
+    for token in without_templates.split_whitespace() {
+        if matches!(
+            token,
+            "const" | "volatile" | "mutable" | "typename" | "class" | "struct"
+        ) {
+            continue;
+        }
+        if !cleaned.is_empty() {
+            cleaned.push(' ');
+        }
+        cleaned.push_str(token);
+    }
+    let token = cleaned
+        .split_whitespace()
+        .last()
+        .unwrap_or(cleaned.trim())
+        .trim_matches(|ch: char| !(is_code_ident_char(ch) || ch == ':' || ch == '.'))
+        .trim_matches(['*', '&']);
+    let simple = token.rsplit("::").next().unwrap_or(token).trim();
+    if simple.is_empty() || cpp_non_type_token(simple) {
+        None
+    } else {
+        Some(simple.to_string())
+    }
+}
+
+fn infer_cpp_auto_receiver_type(rhs: &str) -> Option<String> {
+    let rhs = rhs.trim_start();
+    if let Some(after_new) = rhs.strip_prefix("new ") {
+        return infer_cpp_constructor_type(after_new);
+    }
+    infer_cpp_make_template_type(rhs)
+        .or_else(|| infer_cpp_constructor_type(rhs))
+        .or_else(|| infer_cpp_factory_type(rhs))
+}
+
+fn infer_cpp_constructor_type(rhs: &str) -> Option<String> {
+    let (head, rest) = read_invocation_head(rhs.trim_start(), JavaLikeInvocation::Cpp)?;
+    let normalized = normalize_cpp_type_name(head)?;
+    if !normalized
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_uppercase())
+    {
+        return None;
+    }
+    if matches!(rest.trim_start().chars().next(), Some('(' | '{')) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn infer_cpp_make_template_type(rhs: &str) -> Option<String> {
+    let (head, rest) = read_invocation_head(rhs.trim_start(), JavaLikeInvocation::Cpp)?;
+    if !rest.trim_start().starts_with('(') {
+        return None;
+    }
+    let base = head.split('<').next().unwrap_or(head);
+    let base_simple = base.rsplit("::").next().unwrap_or(base);
+    if !matches!(base_simple, "make_unique" | "make_shared") {
+        return None;
+    }
+    first_angle_arg(head).and_then(normalize_cpp_type_name)
+}
+
+fn infer_cpp_factory_type(rhs: &str) -> Option<String> {
+    let (head, rest) = read_invocation_head(rhs.trim_start(), JavaLikeInvocation::Cpp)?;
+    if !rest.trim_start().starts_with('(') {
+        return None;
+    }
+    let simple = head
+        .split('<')
+        .next()
+        .unwrap_or(head)
+        .rsplit("::")
+        .next()
+        .unwrap_or(head);
+    for prefix in ["make", "create", "build"] {
+        if let Some(suffix) = simple.strip_prefix(prefix) {
+            if suffix
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_uppercase())
+            {
+                return normalize_cpp_type_name(suffix);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JavaLikeInvocation {
+    Kotlin,
+    Cpp,
+}
+
+fn read_invocation_head(value: &str, flavor: JavaLikeInvocation) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let allowed_separator = match flavor {
+            JavaLikeInvocation::Kotlin => ch == '.',
+            JavaLikeInvocation::Cpp => ch == ':' || ch == '.',
+        };
+        if is_code_ident_char(ch) || allowed_separator {
+            end = index + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut rest = &value[end..];
+    if let Some(stripped) = rest.trim_start().strip_prefix('<') {
+        let skipped = skip_balanced_angle(stripped)?;
+        let rest_start = rest.len() - rest.trim_start().len();
+        let angle_len = 1 + skipped;
+        end += rest_start + angle_len;
+        rest = &value[end..];
+    }
+    Some((value[..end].trim(), rest))
+}
+
+fn skip_balanced_angle(value_after_open: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (index, ch) in value_after_open.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn first_angle_arg(value: &str) -> Option<&str> {
+    let open = value.find('<')?;
+    let inner_len = skip_balanced_angle(&value[open + 1..])?;
+    let inner = &value[open + 1..open + inner_len];
+    split_top_level_commas(inner).into_iter().next()
+}
+
+fn normalize_receiver_type_name(type_text: &str) -> Option<String> {
+    let without_generics = strip_angle_groups(type_text);
+    let cleaned = without_generics
+        .replace("[]", " ")
+        .replace("...", " ")
+        .replace(['?', '&', '*'], " ");
+    let token = cleaned
+        .split_whitespace()
+        .last()
+        .unwrap_or(cleaned.trim())
+        .trim_matches(|ch: char| !(is_code_ident_char(ch) || ch == '.' || ch == ':'));
+    let token = token.rsplit("::").next().unwrap_or(token);
+    let simple = token.rsplit('.').next().unwrap_or(token).trim();
+    if simple.is_empty()
+        || java_like_primitive_type(simple)
+        || !simple
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_uppercase())
+    {
+        None
+    } else {
+        Some(simple.to_string())
+    }
+}
+
+fn simple_type_name(scoped_name: &str) -> Option<String> {
+    scoped_name
+        .rsplit("::")
+        .find(|segment| !segment.is_empty())
+        .and_then(normalize_receiver_type_name)
+}
+
+fn strip_angle_groups(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '<' => {
+                if depth == 0 {
+                    output.push(' ');
+                }
+                depth += 1;
+            }
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn java_like_primitive_type(value: &str) -> bool {
+    matches!(
+        value,
+        "boolean"
+            | "byte"
+            | "char"
+            | "double"
+            | "float"
+            | "int"
+            | "long"
+            | "short"
+            | "void"
+            | "Boolean"
+            | "Byte"
+            | "Char"
+            | "Double"
+            | "Float"
+            | "Int"
+            | "Long"
+            | "Short"
+            | "Unit"
+    )
+}
+
+fn cpp_non_type_token(value: &str) -> bool {
+    matches!(
+        value,
+        "return"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "do"
+            | "switch"
+            | "case"
+            | "default"
+            | "break"
+            | "continue"
+            | "goto"
+            | "throw"
+            | "new"
+            | "delete"
+            | "co_await"
+            | "co_yield"
+            | "co_return"
+            | "static_cast"
+            | "const_cast"
+            | "dynamic_cast"
+            | "reinterpret_cast"
+            | "sizeof"
+            | "alignof"
+            | "typeid"
+            | "and"
+            | "or"
+            | "not"
+            | "xor"
+    )
+}
+
+fn receiver_is_bare_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic()) && chars.all(is_code_ident_char)
+}
+
+fn find_identifier_occurrence(value: &str, needle: &str) -> Option<usize> {
+    identifier_occurrences(value, needle).into_iter().next()
+}
+
+fn identifier_occurrences(value: &str, needle: &str) -> Vec<usize> {
+    value
+        .match_indices(needle)
+        .filter_map(|(index, _)| identifier_boundary(value, index, needle.len()).then_some(index))
+        .collect()
+}
+
+fn identifier_boundary(value: &str, start: usize, len: usize) -> bool {
+    let before = value[..start].chars().next_back();
+    let after = value[start + len..].chars().next();
+    !before.is_some_and(is_code_ident_char) && !after.is_some_and(is_code_ident_char)
+}
+
+fn strip_leading_word<'a>(value: &'a str, word: &str) -> Option<&'a str> {
+    let stripped = value.strip_prefix(word)?;
+    if stripped.is_empty() || stripped.chars().next().is_some_and(char::is_whitespace) {
+        Some(stripped.trim_start())
+    } else {
+        None
+    }
+}
+
+fn is_code_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
 }
 
 fn infer_rust_receiver_type(reference: &NameMatchRef) -> Option<String> {
@@ -4806,4 +5647,260 @@ fn unix_seconds_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod method_dispatch_inference_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn java_field_receiver_type_selects_declared_class_method() {
+        let source = r#"class EntryPoint {
+    private UserService userService;
+
+    void handle() {
+        userService.find();
+    }
+}
+
+class UserService {
+    void find() {}
+}
+
+class AuditService {
+    void find() {}
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/EntryPoint.java", source);
+        let reference = reference(
+            "java",
+            "src/EntryPoint.java",
+            "EntryPoint::handle",
+            "userService",
+            "find",
+            line_of(source, "userService.find()"),
+        );
+        let mut cache = DispatchSourceCache::new();
+
+        let receiver_type =
+            infer_receiver_type(root, &reference, &mut cache).expect("receiver type");
+        assert_eq!(receiver_type, "UserService");
+
+        let candidates = vec![
+            method_candidate("audit", "AuditService::find"),
+            method_candidate("user", "UserService::find"),
+        ];
+        let selected = select_type_match_candidate(&reference, &candidates, &receiver_type)
+            .expect("type candidate");
+        assert_eq!(selected.scoped_name, "UserService::find");
+
+        let wrong_candidates = vec![method_candidate("audit", "AuditService::find")];
+        assert!(
+            select_type_match_candidate(&reference, &wrong_candidates, &receiver_type).is_none()
+        );
+    }
+
+    #[test]
+    fn kotlin_property_and_local_value_types_are_inferred() {
+        let source = r#"class Handler {
+    private val auditService: AuditService = AuditService()
+
+    fun handle() {
+        auditService.find()
+        val userService: UserService = UserService()
+        userService.find()
+        val billingService = BillingService()
+        billingService.find()
+    }
+}
+
+class UserService { fun find() {} }
+class AuditService { fun find() {} }
+class BillingService { fun find() {} }
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/Handler.kt", source);
+        let mut cache = DispatchSourceCache::new();
+
+        let audit_ref = reference(
+            "kotlin",
+            "src/Handler.kt",
+            "Handler::handle",
+            "auditService",
+            "find",
+            line_of(source, "auditService.find()"),
+        );
+        assert_eq!(
+            infer_receiver_type(root, &audit_ref, &mut cache).as_deref(),
+            Some("AuditService")
+        );
+
+        let user_ref = reference(
+            "kotlin",
+            "src/Handler.kt",
+            "Handler::handle",
+            "userService",
+            "find",
+            line_of(source, "userService.find()"),
+        );
+        assert_eq!(
+            infer_receiver_type(root, &user_ref, &mut cache).as_deref(),
+            Some("UserService")
+        );
+
+        let billing_ref = reference(
+            "kotlin",
+            "src/Handler.kt",
+            "Handler::handle",
+            "billingService",
+            "find",
+            line_of(source, "billingService.find()"),
+        );
+        assert_eq!(
+            infer_receiver_type(root, &billing_ref, &mut cache).as_deref(),
+            Some("BillingService")
+        );
+    }
+
+    #[test]
+    fn cpp_declarator_and_auto_factory_receiver_types_are_inferred() {
+        let source = r#"struct Foo { void run(); };
+struct PointerFoo { void run(); };
+struct FactoryFoo { void run(); };
+FactoryFoo makeFactoryFoo();
+
+void handle() {
+    Foo foo;
+    foo.run();
+    PointerFoo* pointerFoo = nullptr;
+    pointerFoo->run();
+    auto factoryFoo = makeFactoryFoo();
+    factoryFoo.run();
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/fixture.cpp", source);
+        let mut cache = DispatchSourceCache::new();
+
+        let foo_ref = reference(
+            "cpp",
+            "src/fixture.cpp",
+            "handle",
+            "foo",
+            "run",
+            line_of(source, "foo.run()"),
+        );
+        assert_eq!(
+            infer_receiver_type(root, &foo_ref, &mut cache).as_deref(),
+            Some("Foo")
+        );
+
+        let pointer_ref = reference(
+            "cpp",
+            "src/fixture.cpp",
+            "handle",
+            "pointerFoo",
+            "run",
+            line_of(source, "pointerFoo->run()"),
+        );
+        assert_eq!(
+            infer_receiver_type(root, &pointer_ref, &mut cache).as_deref(),
+            Some("PointerFoo")
+        );
+
+        let factory_ref = reference(
+            "cpp",
+            "src/fixture.cpp",
+            "handle",
+            "factoryFoo",
+            "run",
+            line_of(source, "factoryFoo.run()"),
+        );
+        assert_eq!(
+            infer_receiver_type(root, &factory_ref, &mut cache).as_deref(),
+            Some("FactoryFoo")
+        );
+    }
+
+    #[test]
+    fn unknown_java_receiver_still_uses_name_match_fallback() {
+        let source = r#"class EntryPoint {
+    void handle() {
+        service.runSpecial();
+    }
+}
+
+class OnlyService {
+    void runSpecial() {}
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/EntryPoint.java", source);
+        let reference = reference(
+            "java",
+            "src/EntryPoint.java",
+            "EntryPoint::handle",
+            "service",
+            "runSpecial",
+            line_of(source, "service.runSpecial()"),
+        );
+        let mut cache = DispatchSourceCache::new();
+
+        assert!(infer_receiver_type(root, &reference, &mut cache).is_none());
+        let candidates = vec![method_candidate("only", "OnlyService::runSpecial")];
+        let selected = select_name_match_candidate(&reference, &candidates).expect("name match");
+        assert_eq!(selected.scoped_name, "OnlyService::runSpecial");
+    }
+
+    fn reference(
+        lang: &str,
+        caller_file: &str,
+        caller_symbol: &str,
+        receiver: &str,
+        method_name: &str,
+        line: u32,
+    ) -> NameMatchRef {
+        NameMatchRef {
+            ref_id: format!("{caller_file}:{line}:{receiver}:{method_name}"),
+            caller_node: format!("{caller_symbol}:node"),
+            caller_file: caller_file.to_string(),
+            caller_symbol: caller_symbol.to_string(),
+            caller_signature: None,
+            receiver: receiver.to_string(),
+            method_name: method_name.to_string(),
+            colon_dispatch: false,
+            line,
+            lang: lang.to_string(),
+        }
+    }
+
+    fn method_candidate(node_id: &str, scoped_name: &str) -> NameMatchCandidate {
+        NameMatchCandidate {
+            node_id: node_id.to_string(),
+            file_path: "src/targets.fixture".to_string(),
+            scoped_name: scoped_name.to_string(),
+            kind: "method".to_string(),
+        }
+    }
+
+    fn write_fixture(root: &std::path::Path, rel_path: &str, source: &str) {
+        let path = root.join(rel_path);
+        fs::create_dir_all(path.parent().expect("fixture parent")).expect("create parent");
+        fs::write(path, source).expect("write fixture");
+    }
+
+    fn line_of(source: &str, needle: &str) -> u32 {
+        source
+            .lines()
+            .position(|line| line.contains(needle))
+            .map(|index| index as u32 + 1)
+            .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
+    }
 }
