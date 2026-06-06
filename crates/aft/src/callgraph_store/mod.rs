@@ -1878,6 +1878,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_node, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_node, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_target_file_symbol ON edges(target_file, target_symbol, kind);
+        CREATE INDEX IF NOT EXISTS idx_edges_ref_id ON edges(ref_id, kind);
 
         CREATE TABLE IF NOT EXISTS dispatch_hints (
             id           TEXT PRIMARY KEY,
