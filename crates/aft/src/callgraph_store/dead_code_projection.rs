@@ -126,7 +126,6 @@ fn outbound_calls_from_store(
         "SELECT r.ref_id,
                 r.caller_file,
                 n.scoped_name,
-                r.raw_payload,
                 r.short_name,
                 r.full_ref,
                 r.status,
@@ -144,13 +143,12 @@ fn outbound_calls_from_store(
             ref_id: row.get(0)?,
             caller_file: row.get(1)?,
             caller_symbol: row.get(2)?,
-            raw_payload: row.get(3)?,
-            short_name: row.get(4)?,
-            full_ref: row.get(5)?,
-            status: row.get(6)?,
-            target_file: row.get(7)?,
-            target_symbol: row.get(8)?,
-            line: row.get::<_, i64>(9)? as u32,
+            short_name: row.get(3)?,
+            full_ref: row.get(4)?,
+            status: row.get(5)?,
+            target_file: row.get(6)?,
+            target_symbol: row.get(7)?,
+            line: row.get::<_, i64>(8)? as u32,
         })
     })?;
 
@@ -207,21 +205,12 @@ fn entry_points_for_files(project_root: &Path, files: &[PathBuf]) -> BTreeSet<Pa
 }
 
 fn caller_symbol_from_row(row: &OutboundRow) -> Result<String> {
-    if let Some(symbol) = &row.caller_symbol {
-        return Ok(symbol.clone());
-    }
-
-    let payload = serde_json::from_str::<serde_json::Value>(&row.raw_payload)?;
-    payload
-        .get("caller_symbol")
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            CallGraphStoreError::Unavailable(format!(
-                "call ref {} is missing caller symbol",
-                row.ref_id
-            ))
-        })
+    row.caller_symbol.clone().ok_or_else(|| {
+        CallGraphStoreError::Unavailable(format!(
+            "call ref {} is missing caller symbol",
+            row.ref_id
+        ))
+    })
 }
 
 fn is_resolved_status(status: &str) -> bool {
@@ -269,7 +258,6 @@ struct OutboundRow {
     ref_id: String,
     caller_file: String,
     caller_symbol: Option<String>,
-    raw_payload: String,
     short_name: Option<String>,
     full_ref: Option<String>,
     status: String,

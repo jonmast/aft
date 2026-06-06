@@ -6,12 +6,11 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData};
 use crate::error::AftError;
-use crate::imports::{ImportForm, ImportKind, ImportStatement};
+use crate::imports::{ImportKind, ImportStatement};
 use crate::parser::LangId;
 use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
-use serde_json::json;
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -336,7 +335,6 @@ struct RawRef {
     line: u32,
     byte_start: usize,
     byte_end: usize,
-    raw_payload: String,
     dependencies: BTreeSet<String>,
 }
 
@@ -736,7 +734,11 @@ impl CallGraphStore {
                 if old_row.is_some() {
                     surface_changed.insert(rel_path.clone());
                     deleted.insert(rel_path.clone());
-                    selected_ref_ids.extend(ref_ids_depending_on(&tx, &rel_path)?);
+                    selected_ref_ids.extend(ref_ids_depending_on(
+                        &tx,
+                        &self.project_root,
+                        &rel_path,
+                    )?);
                     delete_file_rows(&tx, &rel_path)?;
                     mark_backend_state(&tx, &self.project_root, &rel_path, None, "stale")?;
                 }
@@ -762,7 +764,11 @@ impl CallGraphStore {
                     FreshnessVerdict::Deleted => {
                         surface_changed.insert(rel_path.clone());
                         deleted.insert(rel_path.clone());
-                        selected_ref_ids.extend(ref_ids_depending_on(&tx, &rel_path)?);
+                        selected_ref_ids.extend(ref_ids_depending_on(
+                            &tx,
+                            &self.project_root,
+                            &rel_path,
+                        )?);
                         delete_file_rows(&tx, &rel_path)?;
                         mark_backend_state(&tx, &self.project_root, &rel_path, None, "stale")?;
                         continue;
@@ -778,7 +784,7 @@ impl CallGraphStore {
                 .unwrap_or(true);
             if surface_is_changed {
                 surface_changed.insert(rel_path.clone());
-                selected_ref_ids.extend(ref_ids_depending_on(&tx, &rel_path)?);
+                selected_ref_ids.extend(ref_ids_depending_on(&tx, &self.project_root, &rel_path)?);
             }
             own_refresh.insert(rel_path.clone());
             delete_file_rows(&tx, &rel_path)?;
@@ -1849,20 +1855,19 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             target_node     TEXT,
             target_file     TEXT,
             target_symbol   TEXT,
-            provenance      TEXT NOT NULL,
-            raw_payload     TEXT NOT NULL
+            provenance      TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
         CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
         CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
         CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
 
-        CREATE TABLE IF NOT EXISTS ref_dependencies (
-            ref_id      TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS file_dependencies (
+            file_path   TEXT NOT NULL,
             dep_file    TEXT NOT NULL,
-            PRIMARY KEY(ref_id, dep_file)
+            PRIMARY KEY(file_path, dep_file)
         );
-        CREATE INDEX IF NOT EXISTS idx_ref_dependencies_dep_file ON ref_dependencies(dep_file);
+        CREATE INDEX IF NOT EXISTS idx_file_dependencies_dep_file ON file_dependencies(dep_file);
 
         CREATE TABLE IF NOT EXISTS edges (
             edge_id       TEXT PRIMARY KEY,
@@ -1972,16 +1977,15 @@ fn schema_fingerprint() -> String {
     // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
     // edge sources, broader call extraction) even if the table SHAPE is
     // unchanged, so existing on-disk stores rebuild and pick up the new edges.
-    // v5 -> v6: receiver-type method-dispatch edges (provenance=type_match) +
-    // stdlib denylisted name-match fallback.
-    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v6");
+    // v6 -> v7-lean: file-level dependency rows and structured refs without raw JSON payloads.
+    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v7-lean");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
 fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "DELETE FROM edges;
-         DELETE FROM ref_dependencies;
+         DELETE FROM file_dependencies;
          DELETE FROM refs;
          DELETE FROM dispatch_hints;
          DELETE FROM type_ref_names;
@@ -2060,13 +2064,13 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &data,
         &node_by_scoped,
         &import_dependencies,
-    )?);
+    ));
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
         &rel_path,
         &data.import_block.imports,
-    )?);
+    ));
     let mut surface_parts = reexports.surface_parts;
     surface_parts.extend(source_less_exports.surface_parts);
     raw_refs.extend(reexports.raw_refs);
@@ -2195,7 +2199,7 @@ fn build_call_refs(
     data: &FileCallData,
     node_by_scoped: &HashMap<String, String>,
     import_dependencies: &BTreeSet<String>,
-) -> Result<Vec<RawRef>> {
+) -> Vec<RawRef> {
     let mut refs = Vec::new();
     let mut ordinal = 0usize;
     let mut symbols: Vec<_> = data.calls_by_symbol.iter().collect();
@@ -2214,13 +2218,6 @@ fn build_call_refs(
                 &call_site.full_callee,
                 &ordinal.to_string(),
             ]);
-            let raw_payload = serde_json::to_string(&json!({
-                "kind": "call",
-                "caller_symbol": caller_symbol,
-                "short_name": call_site.callee_name,
-                "full_ref": call_site.full_callee,
-                "byte_range": {"start": call_site.byte_start, "end": call_site.byte_end}
-            }))?;
             refs.push(RawRef {
                 ref_id,
                 caller_node: caller_node.clone(),
@@ -2238,12 +2235,11 @@ fn build_call_refs(
                 line: call_site.line,
                 byte_start: call_site.byte_start,
                 byte_end: call_site.byte_end,
-                raw_payload,
                 dependencies: import_dependencies.clone(),
             });
         }
     }
-    Ok(refs)
+    refs
 }
 
 fn build_import_refs(
@@ -2251,10 +2247,9 @@ fn build_import_refs(
     abs_path: &Path,
     rel_path: &str,
     imports: &[ImportStatement],
-) -> Result<Vec<RawRef>> {
+) -> Vec<RawRef> {
     let mut refs = Vec::new();
     for (index, import) in imports.iter().enumerate() {
-        let payload = import_payload(import)?;
         let import_kind = import_kind_label(import.kind).to_string();
         let local_name = import_local_names(import).join(",");
         let requested_name = import_requested_names(import).join(",");
@@ -2283,11 +2278,10 @@ fn build_import_refs(
             line: byte_to_line(abs_path, import.byte_range.start).unwrap_or(1),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
-            raw_payload: payload,
             dependencies: module_dependencies(project_root, abs_path, &import.module_path),
         });
     }
-    Ok(refs)
+    refs
 }
 
 #[derive(Debug, Clone)]
@@ -2336,14 +2330,6 @@ fn collect_reexport_refs(
             &ordinal.to_string(),
         ]);
         surface_parts.push(format!("reexport\t{statement}"));
-        let raw_payload = serde_json::to_string(&json!({
-            "kind": "reexport",
-            "module_path": module_path,
-            "raw_text": statement,
-            "wildcard": wildcard,
-            "byte_range": {"start": start, "end": end}
-        }))
-        .unwrap_or_else(|_| "{}".to_string());
         raw_refs.push(RawRef {
             ref_id,
             caller_node: None,
@@ -2361,7 +2347,6 @@ fn collect_reexport_refs(
             line,
             byte_start: start,
             byte_end: end,
-            raw_payload,
             dependencies: module_dependencies(project_root, abs_path, &module_path),
         });
     }
@@ -2427,14 +2412,6 @@ fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> Source
                 &ordinal.to_string(),
             ]);
             surface_parts.push(format!("export_alias\t{source_symbol}\t{exported}"));
-            let raw_payload = serde_json::to_string(&json!({
-                "kind": "export_alias",
-                "source": source_symbol,
-                "exported": exported,
-                "raw_text": statement,
-                "byte_range": {"start": start, "end": end}
-            }))
-            .unwrap_or_else(|_| "{}".to_string());
             raw_refs.push(RawRef {
                 ref_id,
                 caller_node: None,
@@ -2452,7 +2429,6 @@ fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> Source
                 line,
                 byte_start: start,
                 byte_end: end,
-                raw_payload,
                 dependencies: BTreeSet::new(),
             });
         }
@@ -3264,7 +3240,7 @@ fn load_db_file_indexes(
         let Some(module_path) = module_path else {
             continue;
         };
-        let deps = dependencies_for_ref(tx, &ref_id)?;
+        let deps = dependencies_for_ref(tx, project_root, &ref_id)?;
         let target_file = deps
             .iter()
             .find(|dep| file_keys.contains(*dep))
@@ -3291,7 +3267,6 @@ fn load_db_file_indexes(
                     line: 0,
                     byte_start: 0,
                     byte_end: 0,
-                    raw_payload: String::new(),
                     dependencies: deps,
                 };
                 file.reexports
@@ -3350,6 +3325,12 @@ fn insert_file_extract(
             ],
         )?;
     }
+    let mut dependencies = BTreeSet::new();
+    for raw_ref in &extract.raw_refs {
+        dependencies.extend(raw_ref.dependencies.iter().cloned());
+    }
+    insert_file_dependencies(tx, &extract.rel_path, &dependencies)?;
+
     for hint in &extract.dispatch_hints {
         tx.execute(
             "INSERT OR REPLACE INTO dispatch_hints(
@@ -3377,15 +3358,30 @@ fn insert_file_extract(
     Ok(())
 }
 
+fn insert_file_dependencies(
+    tx: &Transaction<'_>,
+    file_path: &str,
+    dependencies: &BTreeSet<String>,
+) -> Result<()> {
+    for dep_file in dependencies {
+        tx.execute(
+            "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+            params![file_path, dep_file],
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<()> {
     let raw = &resolved.raw;
+    debug_assert!(resolved.dependencies.is_superset(&raw.dependencies));
     tx.execute(
         "INSERT OR REPLACE INTO refs(
             ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
             import_kind, local_name, requested_name, namespace_alias, wildcard, line,
             byte_start, byte_end, status, target_node, target_file, target_symbol,
-            provenance, raw_payload
-        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            provenance
+        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             raw.ref_id,
             raw.caller_node,
@@ -3407,15 +3403,8 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
             resolved.target_file,
             resolved.target_symbol,
             PROVENANCE_TREESITTER,
-            raw.raw_payload,
         ],
     )?;
-    for dep_file in &resolved.dependencies {
-        tx.execute(
-            "INSERT OR IGNORE INTO ref_dependencies(ref_id, dep_file) VALUES(?1, ?2)",
-            params![raw.ref_id, dep_file],
-        )?;
-    }
     if let Some(edge) = &resolved.edge {
         tx.execute(
             "INSERT OR REPLACE INTO edges(
@@ -5125,12 +5114,35 @@ fn update_file_fresh_metadata(
     Ok(())
 }
 
-fn ref_ids_depending_on(tx: &Transaction<'_>, rel_path: &str) -> Result<Vec<String>> {
-    let mut stmt = tx.prepare("SELECT ref_id FROM ref_dependencies WHERE dep_file = ?1")?;
-    let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
+fn ref_ids_depending_on(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file
+         FROM refs r
+         WHERE r.caller_file IN (
+             SELECT file_path FROM file_dependencies WHERE dep_file = ?1
+         )
+            OR r.target_file = ?1
+         ORDER BY r.ref_id",
+    )?;
+    let rows = stmt.query_map(params![rel_path], |row| {
+        Ok(RefDependencyRow {
+            ref_id: row.get(0)?,
+            kind: row.get(1)?,
+            caller_file: row.get(2)?,
+            module_path: row.get(3)?,
+            target_file: row.get(4)?,
+        })
+    })?;
     let mut ids = Vec::new();
     for row in rows {
-        ids.push(row?);
+        let row = row?;
+        if ref_dependency_row_depends_on(project_root, &row, rel_path) {
+            ids.push(row.ref_id);
+        }
     }
     Ok(ids)
 }
@@ -5153,6 +5165,10 @@ fn refs_by_caller_for_ref_ids(
 }
 
 fn delete_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM file_dependencies WHERE file_path = ?1",
+        params![rel_path],
+    )?;
     delete_refs_for_caller(tx, rel_path)?;
     tx.execute(
         "DELETE FROM dispatch_hints WHERE file = ?1",
@@ -5176,10 +5192,6 @@ fn delete_refs_for_caller(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
 fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()> {
     for ref_id in ref_ids {
         tx.execute("DELETE FROM edges WHERE ref_id = ?1", params![ref_id])?;
-        tx.execute(
-            "DELETE FROM ref_dependencies WHERE ref_id = ?1",
-            params![ref_id],
-        )?;
         tx.execute("DELETE FROM refs WHERE ref_id = ?1", params![ref_id])?;
     }
     Ok(())
@@ -5262,14 +5274,97 @@ fn parse_reexport_names(statement: &str) -> HashMap<String, String> {
     names
 }
 
-fn dependencies_for_ref(tx: &Transaction<'_>, ref_id: &str) -> Result<BTreeSet<String>> {
-    let mut stmt = tx.prepare("SELECT dep_file FROM ref_dependencies WHERE ref_id = ?1")?;
-    let rows = stmt.query_map(params![ref_id], |row| row.get::<_, String>(0))?;
+fn dependencies_for_ref(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    ref_id: &str,
+) -> Result<BTreeSet<String>> {
+    let row = tx.query_row(
+        "SELECT kind, caller_file, module_path, target_file FROM refs WHERE ref_id = ?1",
+        params![ref_id],
+        |row| {
+            Ok(RefDependencyRow {
+                ref_id: ref_id.to_string(),
+                kind: row.get(0)?,
+                caller_file: row.get(1)?,
+                module_path: row.get(2)?,
+                target_file: row.get(3)?,
+            })
+        },
+    )?;
+
+    match row.kind.as_str() {
+        "import" | "reexport" => {
+            let Some(module_path) = row.module_path.as_deref() else {
+                return Ok(BTreeSet::new());
+            };
+            let file_deps = file_dependencies_for_file(tx, &row.caller_file)?;
+            let module_deps =
+                module_dependencies_for_ref(project_root, &row.caller_file, module_path);
+            Ok(file_deps.intersection(&module_deps).cloned().collect())
+        }
+        "export_alias" => Ok(BTreeSet::new()),
+        "call" => {
+            let mut deps = file_dependencies_for_file(tx, &row.caller_file)?;
+            if let Some(target_file) = row.target_file {
+                deps.insert(target_file);
+            }
+            Ok(deps)
+        }
+        _ => file_dependencies_for_file(tx, &row.caller_file),
+    }
+}
+
+#[derive(Debug)]
+struct RefDependencyRow {
+    ref_id: String,
+    kind: String,
+    caller_file: String,
+    module_path: Option<String>,
+    target_file: Option<String>,
+}
+
+fn ref_dependency_row_depends_on(
+    project_root: &Path,
+    row: &RefDependencyRow,
+    rel_path: &str,
+) -> bool {
+    if row.target_file.as_deref() == Some(rel_path) {
+        return true;
+    }
+
+    match row.kind.as_str() {
+        "call" => true,
+        "import" | "reexport" => row
+            .module_path
+            .as_deref()
+            .map(|module_path| {
+                module_dependencies_for_ref(project_root, &row.caller_file, module_path)
+                    .contains(rel_path)
+            })
+            .unwrap_or(false),
+        "export_alias" => false,
+        _ => false,
+    }
+}
+
+fn file_dependencies_for_file(tx: &Transaction<'_>, file_path: &str) -> Result<BTreeSet<String>> {
+    let mut stmt = tx
+        .prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file")?;
+    let rows = stmt.query_map(params![file_path], |row| row.get::<_, String>(0))?;
     let mut deps = BTreeSet::new();
     for row in rows {
         deps.insert(row?);
     }
     Ok(deps)
+}
+
+fn module_dependencies_for_ref(
+    project_root: &Path,
+    caller_file: &str,
+    module_path: &str,
+) -> BTreeSet<String> {
+    module_dependencies(project_root, &project_root.join(caller_file), module_path)
 }
 
 fn import_dependencies(
@@ -5320,77 +5415,6 @@ fn relative_module_candidates(base: &Path) -> Vec<PathBuf> {
         candidates.push(base.join(format!("index.{ext}")));
     }
     candidates
-}
-
-fn import_payload(import: &ImportStatement) -> Result<String> {
-    Ok(serde_json::to_string(&json!({
-        "module_path": import.module_path,
-        "names": import.names,
-        "default_import": import.default_import,
-        "namespace_import": import.namespace_import,
-        "kind": import_kind_label(import.kind),
-        "group": import.group.label(),
-        "byte_range": {"start": import.byte_range.start, "end": import.byte_range.end},
-        "raw_text": import.raw_text,
-        "form": import_form_payload(&import.form),
-    }))?)
-}
-
-fn import_form_payload(form: &ImportForm) -> serde_json::Value {
-    match form {
-        ImportForm::Es {
-            default_import,
-            namespace_import,
-            named,
-            type_only,
-            side_effect,
-        } => json!({
-            "tag": "es",
-            "default_import": default_import,
-            "namespace_import": namespace_import,
-            "named": named,
-            "type_only": type_only,
-            "side_effect": side_effect,
-        }),
-        ImportForm::Python { from_import, named } => json!({
-            "tag": "python",
-            "from_import": from_import,
-            "named": named,
-        }),
-        ImportForm::RustUse { visibility, named } => json!({
-            "tag": "rust_use",
-            "visibility": visibility,
-            "named": named,
-        }),
-        ImportForm::Go { alias } => json!({
-            "tag": "go",
-            "alias": alias,
-        }),
-        ImportForm::Solidity {
-            named,
-            namespace,
-            alias,
-        } => json!({
-            "tag": "solidity",
-            "named": named,
-            "namespace": namespace,
-            "alias": alias,
-        }),
-        ImportForm::Structured {
-            named,
-            namespace,
-            alias,
-            modifiers,
-            import_kind,
-        } => json!({
-            "tag": "structured",
-            "named": named,
-            "namespace": namespace,
-            "alias": alias,
-            "modifiers": modifiers,
-            "import_kind": import_kind,
-        }),
-    }
 }
 
 fn import_local_names(import: &ImportStatement) -> Vec<String> {
