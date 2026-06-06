@@ -1,4 +1,5 @@
 use aft::compress::bun::BunCompressor;
+use aft::compress::caps::DropClass;
 use aft::compress::npm::NpmCompressor;
 use aft::compress::pnpm::PnpmCompressor;
 use aft::compress::pytest::PytestCompressor;
@@ -106,7 +107,10 @@ fn pnpm_install_limits_progress_and_keeps_auth_warning_error_summary() {
 #[test]
 fn pytest_drops_passes_keeps_failures_summary_and_warning_cap() {
     let mut output = String::from("============================= test session starts =============================\nplatform darwin -- Python 3.12.1, pytest-8.1.1\nrootdir: /repo\ncollected 45 items\n\ntests/test_ok.py ............................ PASSED\ntests/test_more.py sssxxx PASSED\ntests/test_bad.py::test_breaks FAILED\n\n=================================== FAILURES ===================================\n______________________________ test_breaks ______________________________\nE   AssertionError: boom\n\n=============================== warnings summary ===============================\n");
-    for index in 0..8 {
+    // Emit cap + 3 warnings so exactly 3 are dropped by the shared Warning cap.
+    let warn_cap = DropClass::Warning.default_cap();
+    let warn_total = warn_cap + 3;
+    for index in 0..warn_total {
         output.push_str(&format!(
             "tests/test_warn.py:{index}: DeprecationWarning: deprecated api {index}\n"
         ));
@@ -120,7 +124,13 @@ fn pytest_drops_passes_keeps_failures_summary_and_warning_cap() {
     assert!(!compressed.contains("tests/test_ok.py"));
     assert!(compressed.contains("tests/test_bad.py::test_breaks FAILED"));
     assert!(compressed.contains("AssertionError: boom"));
-    assert!(compressed.contains("... and 3 more warnings"));
+    // Warnings past the cap are dropped via class-drop metadata (surfaced to the
+    // agent through the recovery marker), not an in-body trailer.
+    assert_eq!(
+        compressed.dropped_by_class.get(&DropClass::Warning),
+        Some(&3),
+        "dropped-warnings count must be reported in metadata: {compressed:?}"
+    );
     assert!(compressed.contains("short test summary info"));
     assert!(compressed.contains("44 passed, 1 failed"));
 
@@ -314,24 +324,28 @@ fn bun_test_catastrophic_failure_count_is_capped() {
 
     let compressed = BunCompressor.compress("bun test", &output);
 
-    // First 25 failures must be preserved (MAX_FAILURES = 25).
-    for index in 0..25 {
+    // Failure blocks share the shared class cap (DropClass::Failure == CAP_ERRORS
+    // == 20). The first 20 failures are preserved in the body.
+    let cap = DropClass::Failure.default_cap();
+    for index in 0..cap {
         assert!(
             compressed.contains(&format!("failure_marker_{index}")),
             "missing kept failure {index}"
         );
     }
-    // Failures past 25 must be dropped from the body.
-    for index in 25..total {
+    // Failures past the cap must be dropped from the body.
+    for index in cap..total {
         assert!(
             !compressed.contains(&format!("failure_marker_{index}")),
             "did not drop failure {index}"
         );
     }
-    // Drop trailer must report the count of dropped failures.
-    assert!(
-        compressed.contains(&format!("+{} more failures", total - 25)),
-        "missing dropped-failures trailer in: {compressed}"
+    // Dropped failures are reported via class-drop metadata (surfaced to the
+    // agent through the recovery marker), not an in-body trailer.
+    assert_eq!(
+        compressed.dropped_by_class.get(&DropClass::Failure),
+        Some(&(total - cap)),
+        "dropped-failures count must be reported in metadata: {compressed:?}"
     );
     // Summary intact.
     assert!(compressed.contains(&format!("{total} fail")));
