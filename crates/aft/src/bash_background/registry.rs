@@ -2710,9 +2710,21 @@ fn render_compressed_with_recovery(
     mut compressed: CompressionResult,
     input_truncated: bool,
 ) -> TerminalOutputCache {
-    compressed.text = strip_plain_truncation_marker_lines(&compressed.text)
+    // Preserve a single canonical trailing newline. A bare `.trim_end()` strips
+    // the legitimate final newline that `echo` and most commands emit, so
+    // agent-facing output diverged from native bash ("hello" vs "hello\n") and
+    // broke the no-JSON-envelope contract. Collapse excess trailing blank lines
+    // to one, but keep that one when the content had a trailing newline. NOTE:
+    // the check must read the ORIGINAL text — strip_plain_truncation_marker_lines
+    // rebuilds via `.lines().join("\n")`, which itself drops the trailing newline.
+    let had_trailing_newline = compressed.text.ends_with('\n');
+    let mut text = strip_plain_truncation_marker_lines(&compressed.text)
         .trim_end()
         .to_string();
+    if had_trailing_newline && !text.is_empty() {
+        text.push('\n');
+    }
+    compressed.text = text;
 
     let output_path = buffer.output_path().map(|path| path.display().to_string());
     let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
