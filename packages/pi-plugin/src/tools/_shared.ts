@@ -201,7 +201,21 @@ export function resolveSessionId(extCtx: ExtensionContext): string | undefined {
 }
 
 /**
- * Call a bridge command and throw a plain Error on failure.
+ * Error thrown by callBridge on a `success: false` response. Carries the Rust
+ * error `code` so callers can distinguish soft negatives (e.g. symbol_not_found)
+ * from genuine errors without re-parsing the message.
+ */
+export class BridgeError extends Error {
+  readonly code: string;
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "BridgeError";
+    this.code = code;
+  }
+}
+
+/**
+ * Call a bridge command and throw a BridgeError on failure.
  * Every tool handler should guard with `if (response.success === false)`
  * before accessing success-only fields — this helper does it uniformly.
  *
@@ -232,7 +246,10 @@ export async function callBridge(
     Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
   );
   if (response.success === false) {
-    throw new Error(formatBridgeErrorMessage(command, response, merged));
+    throw new BridgeError(
+      formatBridgeErrorMessage(command, response, merged),
+      typeof response.code === "string" ? response.code : "",
+    );
   }
   ingestBgCompletions(sessionId, response.bg_completions);
   return response;

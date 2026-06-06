@@ -12,6 +12,15 @@ import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./p
 
 const z = tool.schema;
 
+// Read-only navigation outcomes that are legitimate negative/transient answers,
+// not failures: the symbol isn't defined here, or the store is still building.
+// These return as plain text (no red error) so the agent reads them as "no
+// result" the same way grep-with-no-matches does. Everything else
+// (invalid_request, path_outside_project_root, ambiguous_target, or any unknown
+// code) still throws so real errors stay visible. ("no path between symbols" is
+// already a success response with reason=no_path_found, never an error code.)
+const CALLGRAPH_SOFT_CODES = new Set(["symbol_not_found", "callgraph_building"]);
+
 /**
  * Tool definitions for call-graph navigation: call_tree, callers, trace_to, trace_to_symbol, impact, and trace_data.
  */
@@ -97,7 +106,17 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         if (toFile !== undefined) params.toFile = toFile;
         const response = await callBridge(ctx, context, args.op as string, params);
         if (response.success === false) {
-          throw new Error(formatBridgeErrorMessage(args.op as string, response, params));
+          const message = formatBridgeErrorMessage(args.op as string, response, params);
+          const code = typeof response.code === "string" ? response.code : "";
+          // Read-only navigation negatives ("symbol isn't here", "no path between
+          // them", "store still building") are legitimate answers, not failures —
+          // return them as plain text so the UI doesn't paint them red. Genuine
+          // errors (invalid_request, boundary violations, anything unknown) still
+          // throw so they surface as errors.
+          if (CALLGRAPH_SOFT_CODES.has(code)) {
+            return message;
+          }
+          throw new Error(message);
         }
         return JSON.stringify(response);
       },

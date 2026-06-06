@@ -190,13 +190,13 @@ describe("aft_callgraph adapter", () => {
   });
 
   test("generic bridge errors keep code, message, and structured extras visible", async () => {
-    // Rust's symbol_not_found also returns top-level extras (`file`, `symbol`)
-    // alongside `code`/`message`, not under `data`.
+    // A genuine error code (not a soft negative) still throws so it renders as
+    // an error, with code/message plus any top-level structured extras visible.
     const { api, tools } = makeMockApi();
     const { bridge } = makeMockBridge(() => ({
       success: false,
-      code: "symbol_not_found",
-      message: "symbol missing",
+      code: "internal",
+      message: "resolver crashed",
       file: "src/app.ts",
       symbol: "run",
     }));
@@ -210,8 +210,33 @@ describe("aft_callgraph adapter", () => {
       }),
     );
 
-    expect(message).toContain("callers: symbol_not_found — symbol missing");
+    expect(message).toContain("callers: internal — resolver crashed");
     expect(message).toContain('"file": "src/app.ts"');
     expect(message).toContain('"symbol": "run"');
+  });
+
+  test("read-only negatives (symbol_not_found, callgraph_building) return text, not an error", async () => {
+    // These are legitimate "no result" / "retry shortly" answers from a
+    // read-only query tool — they must NOT throw (which would render red in the
+    // host UI). The agent still gets the full honest message as the result.
+    for (const code of ["symbol_not_found", "callgraph_building"]) {
+      const { api, tools } = makeMockApi();
+      const { bridge } = makeMockBridge(() => ({
+        success: false,
+        code,
+        message: `${code} happened`,
+        file: "src/app.ts",
+        symbol: "run",
+      }));
+      registerNavigateTool(api, makePluginContext(bridge));
+
+      const result = (await executeTool(tools.get("aft_callgraph")!, {
+        op: "callers",
+        filePath: "src/app.ts",
+        symbol: "run",
+      })) as { content: Array<{ type: string; text: string }> };
+
+      expect(result.content[0]?.text).toContain(`callers: ${code} — ${code} happened`);
+    }
   });
 });

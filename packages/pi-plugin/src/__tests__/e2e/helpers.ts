@@ -178,7 +178,14 @@ export async function createHarness(
     preparedBinary.binaryPath,
     {
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
+      // AFT_CALLGRAPH_BUILD_WAIT_MS makes callgraph ops block until the
+      // background store build finishes (default 0 = non-blocking, returns
+      // callgraph_building). Tests need the store ready synchronously; fixtures
+      // are tiny so a few seconds is ample headroom.
+      childEnv: {
+        AFT_CACHE_DIR: join(tempDir, ".aft-cache"),
+        AFT_CALLGRAPH_BUILD_WAIT_MS: "15000",
+      },
     },
     // Forward the full config to configure so indexing/restrict/etc. match prod.
     { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },

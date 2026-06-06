@@ -8,6 +8,7 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import {
+  BridgeError,
   bridgeFor,
   callBridge,
   coerceOptionalInt,
@@ -30,6 +31,13 @@ import {
   renderToolCall,
   shortenPath,
 } from "./render-helpers.js";
+
+// Read-only navigation negatives that are legitimate answers, not failures:
+// the symbol isn't defined here, or the store is still building. Returned as
+// plain text (no red error), matching how grep-with-no-matches reads. Mirrors
+// the OpenCode plugin's set. ("no path between symbols" is already a success
+// response with reason=no_path_found, never an error code.)
+const CALLGRAPH_SOFT_CODES = new Set(["symbol_not_found", "callgraph_building"]);
 
 function navigateParamsSchema() {
   return Type.Object({
@@ -300,8 +308,20 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (!isEmptyParam(params.expression)) req.expression = params.expression;
       if (!isEmptyParam(params.toSymbol)) req.toSymbol = params.toSymbol;
       if (toFile !== undefined) req.toFile = toFile;
-      const response = await callBridge(bridge, params.op, req, extCtx);
-      return textResult(JSON.stringify(response, null, 2));
+      try {
+        const response = await callBridge(bridge, params.op, req, extCtx);
+        return textResult(JSON.stringify(response, null, 2));
+      } catch (error) {
+        // Read-only navigation negatives ("symbol isn't here", "no path between
+        // them", "store still building") are legitimate answers, not failures —
+        // return them as a plain (non-error) result so the UI doesn't render red.
+        // Genuine errors (invalid_request, boundary violations, unknown codes)
+        // keep throwing so they surface as errors.
+        if (error instanceof BridgeError && CALLGRAPH_SOFT_CODES.has(error.code)) {
+          return textResult(error.message);
+        }
+        throw error;
+      }
     },
     renderCall(args, theme, context) {
       return renderNavigateCall(args, theme, context);
