@@ -139,7 +139,15 @@ pub struct CallGraphStoreOptions {
 pub struct CallGraphStore {
     project_root: PathBuf,
     project_key: String,
+    /// The concrete on-disk DB file this store opened. With the generation
+    /// scheme this is `<dir>/<key>.g<...>.sqlite` (resolved via the pointer) or,
+    /// for a pre-generation store, the legacy `<dir>/<key>.sqlite`.
     sqlite_path: PathBuf,
+    /// The generation file NAME this store opened (e.g. `<key>.g<nanos>.<pid>.sqlite`),
+    /// or `None` when it opened the legacy single-file DB. Used to detect when
+    /// another process has published a newer generation so this process can
+    /// drop its connection and reopen (see `current_generation`).
+    generation: Option<String>,
     conn: Mutex<Connection>,
 }
 
@@ -456,16 +464,20 @@ impl CallGraphStore {
     pub fn open(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::project_cache_key(&project_root);
-        let sqlite_path = callgraph_dir.join(format!("{project_key}.sqlite"));
-        Self::open_at_path(project_root, project_key, sqlite_path, true)
+        // Resolve the current generation via the pointer (falling back to the
+        // legacy single-file DB). If nothing is published yet, open the legacy
+        // path so a brand-new store still gets a writable DB + schema.
+        let (sqlite_path, generation) = resolve_ready_target(&callgraph_dir, &project_key)
+            .unwrap_or_else(|| (legacy_sqlite_path(&callgraph_dir, &project_key), None));
+        Self::open_at_path(project_root, project_key, sqlite_path, generation, true)
     }
 
     pub fn open_readonly(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
         let project_key = crate::search_index::project_cache_key(&project_root);
-        let sqlite_path = callgraph_dir.join(format!("{project_key}.sqlite"));
-        if !sqlite_path.is_file() {
+        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        else {
             return Ok(None);
-        }
+        };
         let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_millis(5_000))?;
         if !database_ready(&conn).unwrap_or(false) {
@@ -475,6 +487,7 @@ impl CallGraphStore {
             project_root,
             project_key,
             sqlite_path,
+            generation,
             conn,
         )))
     }
@@ -486,17 +499,11 @@ impl CallGraphStore {
     ) -> Result<(Self, ColdBuildStats)> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::project_cache_key(&project_root);
-        let sqlite_path = callgraph_dir.join(format!("{project_key}.sqlite"));
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
-        let stats = Self::cold_build_swap_locked(
-            &callgraph_dir,
-            &project_root,
-            &project_key,
-            &sqlite_path,
-            files,
-        )?;
-        let store = Self::open(callgraph_dir, project_root)?;
+        let (stats, generation) =
+            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files)?;
+        let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
         Ok((store, stats))
     }
 
@@ -507,40 +514,41 @@ impl CallGraphStore {
     ) -> Result<(Self, Option<ColdBuildStats>)> {
         std::fs::create_dir_all(&callgraph_dir)?;
         let project_key = crate::search_index::project_cache_key(&project_root);
-        let sqlite_path = callgraph_dir.join(format!("{project_key}.sqlite"));
         let lock_path = callgraph_dir.join(format!("{project_key}.build.lock"));
         let _guard = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(30))?;
-        if sqlite_path.is_file() {
-            let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            conn.busy_timeout(Duration::from_millis(5_000))?;
-            if database_ready(&conn).unwrap_or(false) {
-                return Ok((Self::open(callgraph_dir, project_root)?, None));
-            }
+        // Another process may have published a ready generation while we waited
+        // for the lock — open it instead of rebuilding.
+        if !Self::needs_cold_build(&callgraph_dir, &project_root)? {
+            return Ok((Self::open(callgraph_dir, project_root)?, None));
         }
-        let stats = Self::cold_build_swap_locked(
-            &callgraph_dir,
-            &project_root,
-            &project_key,
-            &sqlite_path,
-            files,
-        )?;
-        Ok((Self::open(callgraph_dir, project_root)?, Some(stats)))
+        let (stats, generation) =
+            Self::cold_build_publish_locked(&callgraph_dir, &project_root, &project_key, files)?;
+        let store = Self::open_generation(&callgraph_dir, project_root, project_key, generation)?;
+        Ok((store, Some(stats)))
     }
 
-    fn cold_build_swap_locked(
+    /// Build a fresh DB and publish it as a new generation, then atomically flip
+    /// the `<key>.current` pointer to it. NEVER replaces an open DB file, so it
+    /// succeeds even when other processes hold an older generation open (the
+    /// multi-TUI Windows case). The builder owns the temp + generation files
+    /// exclusively (unique pid+nanos names), so it can rename/replace them
+    /// freely; only the tiny pointer is shared, and only Rust std touches it.
+    ///
+    /// Returns the published generation file name so callers open exactly the
+    /// generation they built (avoiding a race where a concurrent build's flip
+    /// would otherwise reopen a different generation).
+    fn cold_build_publish_locked(
         callgraph_dir: &Path,
         project_root: &Path,
         project_key: &str,
-        sqlite_path: &Path,
         files: &[PathBuf],
-    ) -> Result<ColdBuildStats> {
+    ) -> Result<(ColdBuildStats, String)> {
+        let generation = generation_file_name(project_key);
+        let gen_path = callgraph_dir.join(&generation);
         let temp_path = callgraph_dir.join(format!(
-            "{project_key}.sqlite.tmp.{}.{}",
+            "{generation}.tmp.{}.{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_nanos()
+            now_nanos()
         ));
         remove_sqlite_file_set(&temp_path);
 
@@ -549,6 +557,7 @@ impl CallGraphStore {
                 project_root.to_path_buf(),
                 project_key.to_string(),
                 temp_path.clone(),
+                None,
                 false,
             )?;
             let stats = temp_store.cold_build(files)?;
@@ -556,35 +565,44 @@ impl CallGraphStore {
             stats
         };
 
-        notify_cold_build_swap_observer(&temp_path, sqlite_path);
-        remove_sqlite_sidecars(sqlite_path);
-        if let Err(error) = std::fs::rename(&temp_path, sqlite_path) {
-            if sqlite_path.exists() {
-                std::fs::remove_file(sqlite_path)?;
-                std::fs::rename(&temp_path, sqlite_path)?;
-            } else {
-                return Err(error.into());
-            }
-        }
-        remove_sqlite_sidecars(sqlite_path);
-        Ok(stats)
+        // Move the finished build to its final generation path. This target is
+        // brand-new and owned by us, so the rename never hits an open file.
+        remove_sqlite_file_set(&gen_path);
+        std::fs::rename(&temp_path, &gen_path)?;
+        remove_sqlite_sidecars(&gen_path);
+
+        notify_cold_build_swap_observer(&temp_path, &gen_path);
+
+        // Atomically publish the new generation, then best-effort GC old ones.
+        publish_pointer(callgraph_dir, project_key, &generation)?;
+        gc_old_generations(callgraph_dir, project_key, &generation);
+        Ok((stats, generation))
+    }
+
+    /// Open a specific just-published generation (read-write, WAL) so a builder
+    /// returns a store pinned to exactly what it built.
+    fn open_generation(
+        callgraph_dir: &Path,
+        project_root: PathBuf,
+        project_key: String,
+        generation: String,
+    ) -> Result<Self> {
+        let gen_path = callgraph_dir.join(&generation);
+        Self::open_at_path(project_root, project_key, gen_path, Some(generation), true)
     }
 
     pub fn needs_cold_build(callgraph_dir: &Path, project_root: &Path) -> Result<bool> {
         let project_key = crate::search_index::project_cache_key(project_root);
-        let sqlite_path = callgraph_dir.join(format!("{project_key}.sqlite"));
-        if !sqlite_path.is_file() {
-            return Ok(true);
-        }
-        let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
-        Ok(!database_ready(&conn).unwrap_or(false))
+        // A cold build is needed unless a ready generation (or ready legacy DB)
+        // is currently published.
+        Ok(resolve_ready_target(callgraph_dir, &project_key).is_none())
     }
 
     fn open_at_path(
         project_root: PathBuf,
         project_key: String,
         sqlite_path: PathBuf,
+        generation: Option<String>,
         use_wal: bool,
     ) -> Result<Self> {
         if let Some(parent) = sqlite_path.parent() {
@@ -601,6 +619,7 @@ impl CallGraphStore {
             project_root,
             project_key,
             sqlite_path,
+            generation,
             conn,
         ))
     }
@@ -615,12 +634,14 @@ impl CallGraphStore {
         project_root: PathBuf,
         project_key: String,
         sqlite_path: PathBuf,
+        generation: Option<String>,
         conn: Connection,
     ) -> Self {
         Self {
             project_root,
             project_key,
             sqlite_path,
+            generation,
             conn: Mutex::new(conn),
         }
     }
@@ -635,6 +656,25 @@ impl CallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         &self.sqlite_path
+    }
+
+    /// True if this store still reflects the currently-published generation.
+    /// Cheap (one small pointer-file read). When false, another process (or a
+    /// local cold rebuild) has published a newer generation and the holder
+    /// should drop this store and reopen via the pointer to converge. A missing
+    /// pointer keeps the current store (legacy DB still valid, or transient).
+    pub fn is_current(&self) -> bool {
+        let Some(dir) = self.sqlite_path.parent() else {
+            return true;
+        };
+        match (read_pointer(dir, &self.project_key), &self.generation) {
+            (Some(published), Some(opened)) => &published == opened,
+            // A generation now supersedes the legacy single-file DB we opened.
+            (Some(_), None) => false,
+            // No pointer: keep serving (legacy DB, or an anomalous pointer
+            // removal where our open generation file is still valid).
+            (None, _) => true,
+        }
     }
 
     pub fn cold_build(&self, files: &[PathBuf]) -> Result<ColdBuildStats> {
@@ -1994,6 +2034,177 @@ fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
          DELETE FROM files;",
     )?;
     Ok(())
+}
+
+/// Nanosecond clock used to make temp/generation file names unique.
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos()
+}
+
+/// The pointer file `<dir>/<key>.current`. Its single line names the current
+/// generation DB file. ONLY Rust std ever opens this file (never SQLite), so it
+/// can always be atomically replaced via rename even on Windows — Rust opens
+/// files with `FILE_SHARE_DELETE`, unlike SQLite's Win32 VFS.
+fn pointer_path(callgraph_dir: &Path, project_key: &str) -> PathBuf {
+    callgraph_dir.join(format!("{project_key}.current"))
+}
+
+/// The legacy single-file DB path used before the generation scheme. Still read
+/// as a fallback so pre-upgrade on-disk stores keep working until the next cold
+/// build publishes a generation.
+fn legacy_sqlite_path(callgraph_dir: &Path, project_key: &str) -> PathBuf {
+    callgraph_dir.join(format!("{project_key}.sqlite"))
+}
+
+/// A fresh, unique generation file NAME: `<key>.g<nanos>.<pid>.sqlite`. Each
+/// cold build writes a brand-new generation file, so publishing NEVER replaces
+/// a file another process holds open (the root Windows fix).
+fn generation_file_name(project_key: &str) -> String {
+    format!(
+        "{project_key}.g{}.{}.sqlite",
+        now_nanos(),
+        std::process::id()
+    )
+}
+
+/// Read the pointer; returns the generation file name if present and non-empty.
+fn read_pointer(callgraph_dir: &Path, project_key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(pointer_path(callgraph_dir, project_key)).ok()?;
+    let name = text.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// True if the DB at `path` opens and reports ready (schema + fingerprint + the
+/// `ready` flag). Uses a throwaway read-only connection.
+fn db_path_ready(path: &Path) -> bool {
+    (|| -> Result<bool> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(5_000))?;
+        database_ready(&conn)
+    })()
+    .unwrap_or(false)
+}
+
+/// Resolve the DB file a reader/opener should use, returning `(path, generation)`
+/// where `generation` is `Some(name)` for a pointer-published generation or
+/// `None` for the legacy single-file DB. Returns `None` when nothing ready is
+/// published (caller treats that as "needs cold build").
+///
+/// Handles the GC race (the pointer names a generation that was just deleted) by
+/// re-reading the pointer and retrying a few times.
+fn resolve_ready_target(
+    callgraph_dir: &Path,
+    project_key: &str,
+) -> Option<(PathBuf, Option<String>)> {
+    for _ in 0..5 {
+        if let Some(generation) = read_pointer(callgraph_dir, project_key) {
+            let gen_path = callgraph_dir.join(&generation);
+            if gen_path.is_file() {
+                return db_path_ready(&gen_path).then_some((gen_path, Some(generation)));
+            }
+            // Pointer names a missing generation (a GC/publish race): re-read the
+            // pointer and retry rather than failing the reader.
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        // No pointer: fall back to the legacy single-file DB if it is ready.
+        let legacy = legacy_sqlite_path(callgraph_dir, project_key);
+        return (legacy.is_file() && db_path_ready(&legacy)).then_some((legacy, None));
+    }
+    None
+}
+
+/// Atomically publish `generation` as the current store by flipping the pointer
+/// file. Writes a temp file, fsyncs, then renames over the pointer — never
+/// replacing an open DB file, so it succeeds cross-platform.
+fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) -> Result<()> {
+    let pointer = pointer_path(callgraph_dir, project_key);
+    let tmp = callgraph_dir.join(format!(
+        "{project_key}.current.tmp.{}.{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(generation.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    if let Err(error) = std::fs::rename(&tmp, &pointer) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Best-effort GC of superseded generation files. Never touches the current
+/// generation; keeps the most-recent previous generation (so an in-flight
+/// reader that resolved just before a flip can still open it) and a 60s grace
+/// window for the rest. Deletion failures (e.g. a still-open generation on
+/// Windows) are ignored and retried on a later build.
+fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
+    let grace = Duration::from_secs(60);
+    let now = SystemTime::now();
+    let gen_prefix = format!("{project_key}.g");
+    let tmp_prefixes = [
+        format!("{project_key}.g"), // generation build temps (<key>.g...sqlite.tmp.*)
+        format!("{project_key}.current."), // pointer publish temps (<key>.current.tmp.*)
+        format!("{project_key}.sqlite.tmp."), // legacy-scheme build temps
+    ];
+    let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
+        return;
+    };
+    let mut gens: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| SystemTime::now());
+        let aged_out = now.duration_since(mtime).unwrap_or(Duration::ZERO) >= grace;
+
+        // Orphaned temp files from a crashed build/publish: remove once aged out.
+        if name.contains(".tmp.") {
+            if aged_out && tmp_prefixes.iter().any(|p| name.starts_with(p)) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        }
+
+        // Superseded legacy single-file DB: best-effort delete once a generation
+        // is published (ignored if another process still holds it open).
+        if *name == *format!("{project_key}.sqlite") {
+            remove_sqlite_file_set(&entry.path());
+            continue;
+        }
+
+        if name.starts_with(&gen_prefix) && name.ends_with(".sqlite") && name != current {
+            gens.push((entry.path(), mtime));
+        }
+    }
+    // Keep the newest superseded generation as a safety net for readers that
+    // resolved the pointer just before the flip; GC the rest after the grace
+    // window. Deletion of a still-open generation (Windows) fails silently and
+    // is retried on a later build.
+    gens.sort_by(|a, b| b.1.cmp(&a.1));
+    for (index, (path, mtime)) in gens.into_iter().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        if now.duration_since(mtime).unwrap_or(Duration::ZERO) < grace {
+            continue;
+        }
+        remove_sqlite_file_set(&path);
+    }
 }
 
 fn remove_sqlite_file_set(path: &Path) {

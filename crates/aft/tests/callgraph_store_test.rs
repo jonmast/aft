@@ -2,7 +2,7 @@ use aft::callgraph::{walk_project_files, CallGraph};
 use aft::callgraph_store::{live_callgraph_edge_snapshot, CallGraphStore, StoredEdge};
 use aft::commands::callgraph_store_adapter;
 use aft::config::Config;
-use aft::context::AppContext;
+use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use filetime::FileTime;
@@ -846,6 +846,148 @@ fn cold_build_with_lease_swaps_atomically_over_old_ready_db() {
     assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
     let tree = store.call_tree(Path::new("main.ts"), "entry", 1).unwrap();
     assert_eq!(tree.children[0].name, "newLeaf");
+}
+
+/// The core multi-process contract behind the generation scheme: a reader from
+/// one process holds gen N open while another process publishes gen N+1. The
+/// publish MUST succeed (the old rename-over-open-file failed on Windows with a
+/// sharing violation), the held reader keeps serving gen N, and a fresh open
+/// sees gen N+1. On Unix this also passed under the old rename code, so it is a
+/// contract/regression guard; the real Windows proof is the Parallels VM.
+#[test]
+fn publish_succeeds_while_old_generation_is_held_open() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+    );
+    let store_dir = root.join(".store-gen");
+
+    // Process A: build gen 1 and KEEP its read connection open for the whole test.
+    let (held_reader, _) = CallGraphStore::cold_build_with_lease(
+        store_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .unwrap();
+    let gen1_tree = held_reader
+        .call_tree(Path::new("main.ts"), "entry", 1)
+        .unwrap();
+    assert_eq!(gen1_tree.children[0].name, "oldLeaf");
+    assert!(held_reader.is_current());
+
+    // Process B: edit source and publish gen 2 while A's reader is still open.
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
+    );
+    let (fresh_reader, _) = CallGraphStore::cold_build_with_lease(
+        store_dir.clone(),
+        root.clone(),
+        &project_files(&root),
+    )
+    .expect("publishing a new generation must succeed while an old one is held open");
+
+    // The fresh reader sees gen 2; the held reader still serves gen 1 (its open
+    // connection points at the old generation file, unaffected by the pointer flip).
+    assert_eq!(
+        fresh_reader
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "newLeaf"
+    );
+    assert_eq!(
+        held_reader
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "oldLeaf"
+    );
+
+    // Generation awareness: the held reader is now superseded, the fresh one current.
+    assert!(!held_reader.is_current());
+    assert!(fresh_reader.is_current());
+
+    // A brand-new readonly open resolves the pointer to gen 2.
+    let reopened = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .expect("pointer resolves a ready generation");
+    assert_eq!(
+        reopened
+            .call_tree(Path::new("main.ts"), "entry", 1)
+            .unwrap()
+            .children[0]
+            .name,
+        "newLeaf"
+    );
+    assert!(reopened.is_current());
+}
+
+/// A resident store on a superseded generation is dropped and reopened on the
+/// current generation when the AppContext serves a store-backed op, so a process
+/// that did not run the rebuild still converges to the latest data.
+#[test]
+fn app_context_revalidates_to_newer_published_generation() {
+    let dir = tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+    );
+    let storage = root.join("storage");
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        },
+    );
+    ctx.set_harness(Harness::Opencode);
+    ctx.set_canonical_cache_root(root.clone());
+    ctx.set_cache_role(false, None);
+    let store_dir = ctx.callgraph_store_dir();
+
+    // Publish gen 1 out-of-band so the context opens it warm (no background build).
+    CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &project_files(&root))
+        .unwrap();
+
+    fn entry_leaf(access: CallgraphStoreAccess<'_>) -> String {
+        match access {
+            CallgraphStoreAccess::Ready(store) => store
+                .call_tree(Path::new("main.ts"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name
+                .clone(),
+            CallgraphStoreAccess::Building => panic!("expected Ready store, got Building"),
+            CallgraphStoreAccess::Unavailable => panic!("expected Ready store, got Unavailable"),
+            CallgraphStoreAccess::Error(error) => {
+                panic!("expected Ready store, got Error: {error}")
+            }
+        }
+    }
+
+    // First op resolves gen 1.
+    assert_eq!(entry_leaf(ctx.callgraph_store_for_ops()), "oldLeaf");
+
+    // Another process publishes gen 2.
+    write_file(
+        &root.join("main.ts"),
+        "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
+    );
+    CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &project_files(&root))
+        .unwrap();
+
+    // Next op on the SAME context revalidates (drops the stale resident store)
+    // and serves gen 2.
+    assert_eq!(entry_leaf(ctx.callgraph_store_for_ops()), "newLeaf");
 }
 
 #[test]

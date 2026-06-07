@@ -1320,7 +1320,33 @@ impl AppContext {
     ///
     /// A build already in flight (`callgraph_store_rx` set) also returns
     /// `Building` without starting a second build.
+    /// Drop the resident callgraph store when another process (or a local cold
+    /// rebuild) has published a newer generation, so the next access reopens via
+    /// the pointer. No-op when no store is resident, a build is in flight, or the
+    /// store is still current. Must run before serving ops AND before any
+    /// incremental write, so every process converges on the current generation
+    /// rather than writing to a stale one.
+    pub fn revalidate_callgraph_store_generation(&self) {
+        // Never disturb the store while a background build's result is pending
+        // install (the rx-install path replaces it wholesale).
+        if self.callgraph_store_rx.borrow().is_some() {
+            return;
+        }
+        let superseded = self
+            .callgraph_store
+            .borrow()
+            .as_ref()
+            .is_some_and(|store| !store.is_current());
+        if superseded {
+            *self.callgraph_store.borrow_mut() = None;
+        }
+    }
+
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess<'_> {
+        // Converge to a newer generation another process (or a local cold
+        // rebuild) may have published: if our resident store is superseded, drop
+        // it so the open path below reopens via the pointer. Cheap pointer read.
+        self.revalidate_callgraph_store_generation();
         if self.callgraph_store.borrow().is_some() {
             let borrow = self.callgraph_store.borrow_mut();
             return match RefMut::filter_map(borrow, Option::as_mut).ok() {

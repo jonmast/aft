@@ -2724,10 +2724,16 @@ impl CallGraph {
     /// Return a path relative to the project root, or the absolute path if
     /// it's outside the project.
     fn relative_path(&self, path: &Path) -> String {
+        // Emit forward slashes on every platform so the agent-facing `file`
+        // field is consistent across the whole call-graph surface (the
+        // persisted store's `relative_path` already normalizes to `/`, and
+        // Windows accepts `/` as a path input). Without this, legacy ops
+        // (trace_data, dead_code) emitted `src\foo.ts` on Windows while
+        // store-backed ops emitted `src/foo.ts`.
         path.strip_prefix(&self.project_root)
             .unwrap_or(path)
-            .display()
-            .to_string()
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     /// Canonicalize a path, falling back to the original if canonicalization fails.

@@ -1415,6 +1415,11 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
     if source_paths.is_empty() {
         return;
     }
+    // Converge to the current generation before writing: if another process
+    // published a newer one, drop our stale store so the changed paths get
+    // recorded as pending and replayed against the fresh store (rather than
+    // incrementally written into a superseded generation).
+    ctx.revalidate_callgraph_store_generation();
     let mut store_ref = ctx.callgraph_store().borrow_mut();
     let Some(store) = store_ref.as_mut() else {
         // Store not resident yet. If a cold build is in flight, record the
@@ -2236,13 +2241,14 @@ mod watcher_filter_tests {
 
     /// Wait budget for an async dispatch (semantic-refresh request / status
     /// frame) the worker produces on a freshly-spawned thread. The dispatch
-    /// thread does `spawn -> sleep(backoff) -> send`, so under CI load the spawn
-    /// + wakeup can briefly exceed a tight budget. The wait returns the instant
-    /// the value arrives, so this is zero-cost on the happy path. This is only
-    /// headroom for thread scheduling; the actual cross-test flake (the request
-    /// never arriving at all) was a process-global breaker-state race, fixed by
-    /// serializing breaker tests via `semantic_breaker_test_lock`. Negative
-    /// waits (asserting *absence*) must stay short and are NOT this const.
+    /// thread does `spawn -> sleep(backoff) -> send`, so under CI load the
+    /// spawn-plus-wakeup latency can briefly exceed a tight budget. The wait
+    /// returns the instant the value arrives, so this is zero-cost on the happy
+    /// path. This is only headroom for thread scheduling; the actual cross-test
+    /// flake (the request never arriving at all) was a process-global
+    /// breaker-state race, fixed by serializing breaker tests via
+    /// `semantic_breaker_test_lock`. Negative waits (asserting absence) must
+    /// stay short and are NOT this const.
     const RECV_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn make_ctx_with_root(root: &std::path::Path) -> AppContext {
