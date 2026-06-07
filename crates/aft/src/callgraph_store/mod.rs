@@ -14,7 +14,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -27,28 +27,27 @@ const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
-static COLD_BUILD_SWAP_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildSwapObserver>>>> =
-    OnceLock::new();
+// THREAD-LOCAL, not a process-global: the observer fires synchronously on the
+// thread running the cold build, and the only caller (a test) installs and
+// clears it on its own thread. A process-global `Mutex<Option<...>>` raced
+// across parallel tests — one test's installed observer fired during ANOTHER
+// test's `cold_build_with_lease`, asserting against the wrong build's edges
+// (flaked on Windows CI under parallel scheduling). Production never sets it.
+thread_local! {
+    static COLD_BUILD_SWAP_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildSwapObserver>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 mod dead_code_projection;
 pub use dead_code_projection::project_dead_code_snapshot;
 
 #[doc(hidden)]
 pub fn set_cold_build_swap_observer(observer: Option<Arc<ColdBuildSwapObserver>>) {
-    let slot = COLD_BUILD_SWAP_OBSERVER.get_or_init(|| Mutex::new(None));
-    *slot
-        .lock()
-        .expect("callgraph cold-build observer mutex poisoned") = observer;
+    COLD_BUILD_SWAP_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
 }
 
 fn notify_cold_build_swap_observer(temp_path: &Path, target_path: &Path) {
-    let Some(slot) = COLD_BUILD_SWAP_OBSERVER.get() else {
-        return;
-    };
-    let observer = slot
-        .lock()
-        .expect("callgraph cold-build observer mutex poisoned")
-        .clone();
+    let observer = COLD_BUILD_SWAP_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {
         observer(temp_path, target_path);
     }
