@@ -1,14 +1,13 @@
 import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { warn } from "../logger";
-import { rpcPortFileDir, rpcPortFilePath } from "./rpc-utils";
+import { isPidAlive, parseRpcPortRecord, rpcPortFileDir, rpcPortFilePath } from "./rpc-utils";
 
 const MAX_RETRIES = 10;
 const RETRY_DELAY_MS = 500;
 const REQUEST_TIMEOUT_MS = 5000;
 
 type PortInfoSource = "instance" | "legacy";
-type ParsedPortInfo = { port: number; token: string | null };
+type ParsedPortInfo = { port: number; token: string | null; pid?: number; started_at?: number };
 type PortInfo = ParsedPortInfo & { source: PortInfoSource; path?: string };
 
 export interface AftRpcCallOptions {
@@ -180,16 +179,31 @@ export class AftRpcClient {
       collected.push(info);
     };
 
-    // Per-instance directory (v0.28.2+): one file per plugin load.
+    // Per-instance directory (v0.28.2+): one file per plugin load. Each file now
+    // records the owning process pid; we skip (and reclaim) any whose process is
+    // dead so a poll doesn't wade through crash/restart leftovers, and we order
+    // newest-first so the freshest live server wins the port de-dupe (a stale
+    // file naming a reused port can no longer mask a fresh one with its old token).
     if (existsSync(this.portsDir)) {
       try {
-        const entries = readdirSync(this.portsDir).sort();
-        for (const entry of entries) {
+        const live: PortInfo[] = [];
+        for (const entry of readdirSync(this.portsDir)) {
           if (!entry.endsWith(".json")) continue;
           const filePath = join(this.portsDir, entry);
           const info = this.parsePortFile(filePath);
-          if (info) add({ ...info, source: "instance", path: filePath });
+          if (!info) continue;
+          // Only reclaim when we can PROVE the owner is dead (pid present and not
+          // alive). Files without a pid (older format) are kept and fall through
+          // to the health check, since we can't prove they're dead.
+          if (info.pid !== undefined && !isPidAlive(info.pid)) {
+            this.reclaimDeadPortFile(filePath);
+            continue;
+          }
+          live.push({ ...info, source: "instance", path: filePath });
         }
+        // Newest first: files with a started_at sort before those without.
+        live.sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0));
+        for (const info of live) add(info);
       } catch {
         // ignore read errors
       }
@@ -204,24 +218,19 @@ export class AftRpcClient {
     return collected;
   }
 
+  /** Delete a port file whose owning process is provably dead (best-effort). */
+  private reclaimDeadPortFile(filePath: string): void {
+    try {
+      unlinkSync(filePath);
+    } catch {
+      // best-effort; a concurrent writer may have already replaced it
+    }
+  }
+
   private parsePortFile(filePath: string): ParsedPortInfo | null {
     try {
-      const content = readFileSync(filePath, "utf-8").trim();
-      let port: number;
-      let token: string | null;
-      if (content.startsWith("{")) {
-        const parsed = JSON.parse(content) as { port?: unknown; token?: unknown };
-        port = typeof parsed.port === "number" ? parsed.port : Number.NaN;
-        token = typeof parsed.token === "string" ? parsed.token : null;
-      } else {
-        warn("RPC port file uses legacy integer format; unauthenticated RPC is deprecated");
-        port = Number.parseInt(content, 10);
-        token = null;
-      }
-      if (Number.isNaN(port) || port <= 0 || port > 65535) {
-        return null;
-      }
-      return { port, token };
+      const content = readFileSync(filePath, "utf-8");
+      return parseRpcPortRecord(content);
     } catch {
       return null;
     }

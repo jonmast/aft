@@ -41,3 +41,65 @@ export function rpcPortFileDir(storageDir: string, directory: string): string {
   const hash = projectHash(directory);
   return join(storageDir, "rpc", hash, "ports");
 }
+
+/**
+ * Contents of a per-instance RPC port file. `pid` + `started_at` let the client
+ * skip files whose owning process is dead (no health-check round-trip) and pick
+ * the freshest live server, instead of wading through every crash/restart
+ * leftover. Older files carry only `{ port, token }` (no pid); those are treated
+ * as "can't prove dead" and fall back to the health-check path.
+ */
+export interface RpcPortRecord {
+  port: number;
+  token: string | null;
+  /** PID of the plugin process that owns this server, if recorded. */
+  pid?: number;
+  /** `Date.now()` when this server started, for newest-first ordering. */
+  started_at?: number;
+}
+
+/** True if `pid` names a live process. `process.kill(pid, 0)` sends no signal. */
+export function isPidAlive(pid: number | undefined): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM = process exists but we can't signal it (still alive).
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Parse a port file's contents into a record. Accepts the current JSON shape
+ * (`{ port, token, pid?, started_at? }`) and the legacy bare-integer format
+ * (unauthenticated, pre-v0.28.2). Returns `null` for unusable contents.
+ */
+export function parseRpcPortRecord(content: string): RpcPortRecord | null {
+  const trimmed = content.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        port?: unknown;
+        token?: unknown;
+        pid?: unknown;
+        started_at?: unknown;
+      };
+      const port = typeof parsed.port === "number" ? parsed.port : Number.NaN;
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+      return {
+        port,
+        token: typeof parsed.token === "string" ? parsed.token : null,
+        pid:
+          typeof parsed.pid === "number" && Number.isInteger(parsed.pid) ? parsed.pid : undefined,
+        started_at: typeof parsed.started_at === "number" ? parsed.started_at : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+  const port = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return { port, token: null };
+}

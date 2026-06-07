@@ -15,7 +15,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AftRpcClient } from "../shared/rpc-client.js";
 import { AftRpcServer } from "../shared/rpc-server.js";
-import { rpcPortFileDir, rpcPortFilePath } from "../shared/rpc-utils.js";
+import {
+  isPidAlive,
+  parseRpcPortRecord,
+  rpcPortFileDir,
+  rpcPortFilePath,
+} from "../shared/rpc-utils.js";
 
 /** Resolve the (single) per-instance port file written by an AftRpcServer. */
 function resolveInstancePortFile(storageDir: string, directory: string): string {
@@ -313,5 +318,109 @@ describe("AFT RPC auth", () => {
       staleServer.stop();
       freshServer.stop();
     }
+  });
+
+  test("server records pid and started_at in the port file", async () => {
+    const fixture = makeFixture();
+    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    server.handle("echo", async () => ({ ok: true }));
+    try {
+      const before = Date.now();
+      await server.start();
+      const file = JSON.parse(
+        readFileSync(resolveInstancePortFile(fixture.storageDir, fixture.directory), "utf-8"),
+      ) as { pid: number; started_at: number };
+      expect(file.pid).toBe(process.pid);
+      expect(file.started_at).toBeGreaterThanOrEqual(before);
+      expect(file.started_at).toBeLessThanOrEqual(Date.now());
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("client skips and reclaims a port file whose pid is dead, without health-checking it", async () => {
+    const fixture = makeFixture();
+    const portsDir = rpcPortFileDir(fixture.storageDir, fixture.directory);
+    mkdirSync(portsDir, { recursive: true });
+
+    // A dead-pid file pointing at a port nobody is listening on. The client must
+    // delete it on read (not wait out a health-check). PID 1 is init/launchd —
+    // always alive — so use a very high pid that is almost certainly not a live
+    // process to represent a crashed plugin.
+    const deadPid = 2_000_000_000;
+    const deadFile = join(portsDir, "dead.json");
+    writeFileSync(
+      deadFile,
+      JSON.stringify({ port: 9, token: "dead-token", pid: deadPid, started_at: 1 }),
+      "utf-8",
+    );
+
+    // A live server for this project (records its own live pid).
+    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    server.handle("echo", async (params) => ({ ok: true, params }));
+    try {
+      await server.start();
+      const client = new AftRpcClient(fixture.storageDir, fixture.directory);
+      const result = await client.call<{ ok: boolean; params: Record<string, unknown> }>("echo", {
+        value: "live",
+      });
+      expect(result.ok).toBe(true);
+      expect(result.params.value).toBe("live");
+      // The dead-pid file is reclaimed on read.
+      expect(existsSync(deadFile)).toBe(false);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("client prefers the newest live server when two are running", async () => {
+    const fixture = makeFixture();
+    const older = new AftRpcServer(fixture.storageDir, fixture.directory);
+    older.handle("echo", async () => ({ which: "older" }));
+    const newer = new AftRpcServer(fixture.storageDir, fixture.directory);
+    newer.handle("echo", async () => ({ which: "newer" }));
+    try {
+      await older.start();
+      // Ensure a distinct, later started_at for the newer server.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await newer.start();
+
+      const client = new AftRpcClient(fixture.storageDir, fixture.directory);
+      const result = await client.call<{ which: string }>("echo", {});
+      // Both are live (same pid, this test process); newest-by-started_at wins.
+      expect(result.which).toBe("newer");
+    } finally {
+      older.stop();
+      newer.stop();
+    }
+  });
+});
+
+describe("rpc-utils pid/record parsing", () => {
+  test("parseRpcPortRecord reads pid + started_at and rejects junk", () => {
+    expect(
+      parseRpcPortRecord(JSON.stringify({ port: 5, token: "t", pid: 42, started_at: 99 })),
+    ).toEqual({ port: 5, token: "t", pid: 42, started_at: 99 });
+    // Legacy JSON without pid.
+    expect(parseRpcPortRecord(JSON.stringify({ port: 5, token: "t" }))).toEqual({
+      port: 5,
+      token: "t",
+      pid: undefined,
+      started_at: undefined,
+    });
+    // Legacy bare-integer (unauthenticated).
+    expect(parseRpcPortRecord("5432")).toEqual({ port: 5432, token: null });
+    expect(parseRpcPortRecord("")).toBeNull();
+    expect(parseRpcPortRecord("{not json")).toBeNull();
+    expect(parseRpcPortRecord(JSON.stringify({ port: 0 }))).toBeNull();
+    expect(parseRpcPortRecord(JSON.stringify({ port: 70000 }))).toBeNull();
+  });
+
+  test("isPidAlive: current process alive, bogus pids dead", () => {
+    expect(isPidAlive(process.pid)).toBe(true);
+    expect(isPidAlive(undefined)).toBe(false);
+    expect(isPidAlive(0)).toBe(false);
+    expect(isPidAlive(-1)).toBe(false);
+    expect(isPidAlive(2_000_000_000)).toBe(false);
   });
 });

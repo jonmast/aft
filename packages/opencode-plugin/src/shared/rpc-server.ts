@@ -53,10 +53,19 @@ export class AftRpcServer {
           const dir = dirname(this.portFilePath);
           mkdirSync(dir, { recursive: true, mode: 0o700 });
           const tmpPath = `${this.portFilePath}.tmp`;
-          writeFileSync(tmpPath, JSON.stringify({ port: this.port, token: this.token }), {
-            encoding: "utf-8",
-            mode: 0o600,
-          });
+          // Record pid + started_at so the client can skip files whose owning
+          // process is dead (without a health-check round-trip) and prefer the
+          // freshest live server, instead of accumulating crash/restart leftovers.
+          writeFileSync(
+            tmpPath,
+            JSON.stringify({
+              port: this.port,
+              token: this.token,
+              pid: process.pid,
+              started_at: Date.now(),
+            }),
+            { encoding: "utf-8", mode: 0o600 },
+          );
           renameSync(tmpPath, this.portFilePath);
           log(`RPC server listening on 127.0.0.1:${this.port}`);
         } catch (err) {
