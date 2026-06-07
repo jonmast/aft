@@ -355,14 +355,17 @@ where
 {
     // Generous budget: this e2e test depends on an OS file-watcher event being
     // delivered to a spawned aft process, then a refresh worker reacting. Under
-    // full-suite parallelism (dozens of concurrent aft processes saturating the
-    // CPU) that pipeline can be starved for several seconds. The loop returns
-    // immediately on match, so a high cap costs nothing on the happy path and
-    // only buys headroom under load. The barrier in the mock embedding server
-    // holds the refreshing window open once the refresh fires, so the only thing
-    // this budget needs to absorb is watcher/worker scheduling latency.
+    // full-suite parallelism (1150+ concurrent tests saturating every core) the
+    // bridge's watcher *thread* can be starved well past 40s before it gets
+    // scheduled to drain FSEvents — observed failing at 400 polls (40s) during
+    // an 86s release-gate run. The loop returns immediately on match (~2s on the
+    // happy path), so a high cap costs nothing when passing and only buys
+    // headroom under that pathological load. The barrier in the mock embedding
+    // server holds the refreshing window open once the refresh fires, so the
+    // only thing this budget needs to absorb is watcher/worker scheduling
+    // latency.
     let mut last_response = None;
-    for _ in 0..400 {
+    for _ in 0..800 {
         let response = status(aft);
         assert_eq!(
             response["success"], true,
@@ -398,7 +401,7 @@ where
     F: Fn(&Value) -> bool,
 {
     let mut last_response = None;
-    for i in 0..400 {
+    for i in 0..800 {
         let response = status(aft);
         assert_eq!(
             response["success"], true,
