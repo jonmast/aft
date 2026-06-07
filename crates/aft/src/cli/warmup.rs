@@ -1,5 +1,5 @@
 use aft::config::Config;
-use aft::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use aft::context::{AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
 use serde_json::json;
@@ -50,8 +50,25 @@ pub fn run(args: Vec<OsString>) -> Result<(), WarmupError> {
     }
 
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-    configure(&ctx, &root, &storage_dir, args.force)?;
-    wait_until_ready(&ctx, args.timeout_ms, args.quiet)
+    configure(&ctx, &root, &storage_dir, args.areas, args.force)?;
+
+    // The callgraph store has no configure flag; building is triggered by
+    // calling `callgraph_store_for_ops` once (warm-opens an existing store, or
+    // kicks a background cold build). `None` => poll for readiness; `Some(_)`
+    // => a terminal state captured at trigger (worktree/unavailable or error).
+    let callgraph_override = if args.areas.callgraph {
+        trigger_callgraph_warm(&ctx)
+    } else {
+        Some(SubsystemState::Disabled)
+    };
+
+    wait_until_ready(
+        &ctx,
+        args.areas,
+        callgraph_override,
+        args.timeout_ms,
+        args.quiet,
+    )
 }
 
 #[derive(Debug)]
@@ -88,12 +105,66 @@ impl fmt::Display for WarmupError {
 
 impl std::error::Error for WarmupError {}
 
+/// Which subsystems to warm. Default is all three; `--only` narrows the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarmupAreas {
+    search: bool,
+    semantic: bool,
+    callgraph: bool,
+}
+
+impl WarmupAreas {
+    /// Default: warm everything.
+    fn all() -> Self {
+        Self {
+            search: true,
+            semantic: true,
+            callgraph: true,
+        }
+    }
+
+    /// Parse a comma-separated `--only` list (e.g. `search,callgraph`).
+    fn parse_only(value: &str) -> Result<Self, WarmupError> {
+        let mut areas = Self {
+            search: false,
+            semantic: false,
+            callgraph: false,
+        };
+        let mut any = false;
+        for raw in value.split(',') {
+            let name = raw.trim();
+            if name.is_empty() {
+                continue;
+            }
+            match name {
+                "search" => areas.search = true,
+                "semantic" => areas.semantic = true,
+                "callgraph" => areas.callgraph = true,
+                other => {
+                    return Err(WarmupError::usage(format!(
+                        "--only: unknown area '{other}' (expected search, semantic, or callgraph)"
+                    )));
+                }
+            }
+            any = true;
+        }
+        if !any {
+            return Err(WarmupError::usage(
+                "--only requires at least one of: search, semantic, callgraph",
+            ));
+        }
+        Ok(areas)
+    }
+}
+
 #[derive(Debug)]
 struct WarmupArgs {
     root: Option<PathBuf>,
     timeout_ms: u64,
     quiet: bool,
     help: bool,
+    /// Subsystems to warm (default: all).
+    areas: WarmupAreas,
     /// Bypass the file-count caps (callgraph `max_callgraph_files`, semantic
     /// `semantic.max_files`) so a very large repo is fully indexed. Intended
     /// for benchmarking/measuring the worst case, not normal warmup.
@@ -107,6 +178,7 @@ impl WarmupArgs {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             quiet: false,
             help: false,
+            areas: WarmupAreas::all(),
             force: false,
         };
 
@@ -128,6 +200,10 @@ impl WarmupArgs {
                     if parsed.timeout_ms == 0 {
                         return Err(WarmupError::usage("--timeout must be greater than 0"));
                     }
+                }
+                "--only" => {
+                    let value = next_value(&mut iter, "--only")?;
+                    parsed.areas = WarmupAreas::parse_only(&value)?;
                 }
                 "--quiet" => parsed.quiet = true,
                 "--force" => parsed.force = true,
@@ -157,7 +233,12 @@ fn next_value(
 }
 
 fn print_usage() {
-    println!("aft warmup --root <absolute-path> [--timeout <ms>] [--quiet] [--force]");
+    println!(
+        "aft warmup --root <absolute-path> [--only <areas>] [--timeout <ms>] [--quiet] [--force]"
+    );
+    println!(
+        "  --only   comma-separated subset to warm: search, semantic, callgraph (default: all)"
+    );
     println!(
         "  --force  bypass file-count caps (callgraph + semantic) to fully index a large repo"
     );
@@ -178,13 +259,17 @@ fn configure(
     ctx: &AppContext,
     root: &std::path::Path,
     storage_dir: &std::path::Path,
+    areas: WarmupAreas,
     force: bool,
 ) -> Result<(), WarmupError> {
+    // The callgraph store has no configure flag of its own (it builds lazily on
+    // first op); it's triggered separately after configure. search/semantic are
+    // configure-gated, so warm only the requested ones.
     let mut params = json!({
         "project_root": root.display().to_string(),
         "harness": "opencode",
-        "search_index": true,
-        "semantic_search": true,
+        "search_index": areas.search,
+        "semantic_search": areas.semantic,
         "storage_dir": storage_dir.display().to_string(),
     });
     if force {
@@ -214,14 +299,23 @@ fn configure(
     }
 }
 
-fn wait_until_ready(ctx: &AppContext, timeout_ms: u64, quiet: bool) -> Result<(), WarmupError> {
+fn wait_until_ready(
+    ctx: &AppContext,
+    areas: WarmupAreas,
+    callgraph_override: Option<SubsystemState>,
+    timeout_ms: u64,
+    quiet: bool,
+) -> Result<(), WarmupError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut last_labels = WarmupLabels::default();
     loop {
         drain_search_index_events(ctx);
         drain_semantic_index_events(ctx);
+        if areas.callgraph {
+            drain_callgraph_store_events(ctx);
+        }
 
-        let snapshot = WarmupSnapshot::from_context(ctx);
+        let snapshot = WarmupSnapshot::from_context(ctx, &callgraph_override);
         if !quiet {
             let labels = snapshot.labels();
             labels.print_transitions(&mut last_labels);
@@ -271,17 +365,20 @@ struct WarmupSnapshot {
     search_index: SubsystemState,
     semantic_index: SubsystemState,
     symbol_cache: SubsystemState,
+    callgraph_store: SubsystemState,
 }
 
 impl WarmupSnapshot {
-    fn from_context(ctx: &AppContext) -> Self {
+    fn from_context(ctx: &AppContext, callgraph_override: &Option<SubsystemState>) -> Self {
         let search_index = search_index_state(ctx);
         let semantic_index = semantic_index_state(ctx);
         let symbol_cache = symbol_cache_state(&search_index);
+        let callgraph_store = callgraph_store_state(ctx, callgraph_override);
         Self {
             search_index,
             semantic_index,
             symbol_cache,
+            callgraph_store,
         }
     }
 
@@ -289,6 +386,7 @@ impl WarmupSnapshot {
         self.search_index.is_terminal()
             && self.semantic_index.is_terminal()
             && self.symbol_cache.is_terminal()
+            && self.callgraph_store.is_terminal()
     }
 
     fn labels(&self) -> WarmupLabels {
@@ -296,6 +394,7 @@ impl WarmupSnapshot {
             search_index: self.search_index.label(),
             semantic_index: self.semantic_index.label(),
             symbol_cache: self.symbol_cache.label(),
+            callgraph_store: self.callgraph_store.label(),
         }
     }
 
@@ -310,6 +409,9 @@ impl WarmupSnapshot {
         if let SubsystemState::Pending(detail) = &self.symbol_cache {
             pending.push(format!("symbol_cache={detail}"));
         }
+        if let SubsystemState::Pending(detail) = &self.callgraph_store {
+            pending.push(format!("callgraph_store={detail}"));
+        }
         if pending.is_empty() {
             "none".to_string()
         } else {
@@ -323,6 +425,7 @@ struct WarmupLabels {
     search_index: String,
     semantic_index: String,
     symbol_cache: String,
+    callgraph_store: String,
 }
 
 impl WarmupLabels {
@@ -341,6 +444,11 @@ impl WarmupLabels {
             "symbol_cache",
             &self.symbol_cache,
             &mut previous.symbol_cache,
+        );
+        print_transition(
+            "callgraph_store",
+            &self.callgraph_store,
+            &mut previous.callgraph_store,
         );
     }
 }
@@ -406,6 +514,87 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
             SubsystemState::Ready
         }
     }
+}
+
+/// Kick the callgraph-store build. `callgraph_store_for_ops` warm-opens an
+/// existing on-disk store synchronously, or starts a background cold build and
+/// returns `Building`. Returns `None` to mean "poll for readiness" (Ready or a
+/// cold build in flight), or `Some(state)` for a terminal outcome that won't
+/// change by polling (worktree/unconfigured = treated as ready/no-op, or a hard
+/// build error).
+fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
+    match ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(_) => Some(SubsystemState::Ready),
+        // Building (or just-started cold build) -> drive to completion via the
+        // wait loop draining `callgraph_store_rx`.
+        CallgraphStoreAccess::Building => None,
+        // Read-only worktree or not configured: nothing to build here.
+        CallgraphStoreAccess::Unavailable => Some(SubsystemState::Ready),
+        CallgraphStoreAccess::Error(error) => Some(SubsystemState::Failed(error.to_string())),
+    }
+}
+
+/// Install the finished callgraph store once the background cold build sends it
+/// over `callgraph_store_rx`. Mirrors `main::drain_callgraph_store_events` but
+/// without the status-emitter signal (warmup has no sidebar consumer).
+fn drain_callgraph_store_events(ctx: &AppContext) {
+    let (latest, disconnected) = {
+        let rx_ref = ctx.callgraph_store_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+        let mut latest = None;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(store) => latest = Some(store),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        (latest, disconnected)
+    };
+
+    let mut installed = false;
+    if let Some(store) = latest {
+        let pending = ctx.take_pending_callgraph_store_paths();
+        if !pending.is_empty() {
+            if let Err(error) = store.refresh_files(&pending) {
+                eprintln!("aft warmup: callgraph store post-build refresh failed: {error}");
+                let _ = store.mark_files_stale(&pending);
+            }
+        }
+        *ctx.callgraph_store().borrow_mut() = Some(store);
+        installed = true;
+    }
+
+    if disconnected || installed {
+        *ctx.callgraph_store_rx().borrow_mut() = None;
+        if disconnected && !installed {
+            let _ = ctx.take_pending_callgraph_store_paths();
+        }
+    }
+}
+
+fn callgraph_store_state(
+    ctx: &AppContext,
+    override_state: &Option<SubsystemState>,
+) -> SubsystemState {
+    if let Some(state) = override_state {
+        return state.clone();
+    }
+    if ctx.callgraph_store().borrow().is_some() {
+        return SubsystemState::Ready;
+    }
+    if ctx.callgraph_store_rx().borrow().is_some() {
+        return SubsystemState::Pending("building".to_string());
+    }
+    // No store, no in-flight build: the cold build finished without producing a
+    // store (failure already drained) — report ready so warmup doesn't hang.
+    SubsystemState::Ready
 }
 
 fn drain_search_index_events(ctx: &AppContext) {
@@ -491,4 +680,72 @@ fn format_response_error(command: &str, response: Response) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown error");
     format!("aft warmup {command} failed ({code}): {message}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn default_warms_all_areas() {
+        let parsed = WarmupArgs::parse(args(&["--root", "/tmp/x"])).unwrap();
+        assert_eq!(parsed.areas, WarmupAreas::all());
+        assert!(parsed.areas.search && parsed.areas.semantic && parsed.areas.callgraph);
+    }
+
+    #[test]
+    fn only_single_area() {
+        let parsed = WarmupArgs::parse(args(&["--root", "/tmp/x", "--only", "callgraph"])).unwrap();
+        assert!(!parsed.areas.search);
+        assert!(!parsed.areas.semantic);
+        assert!(parsed.areas.callgraph);
+    }
+
+    #[test]
+    fn only_multiple_areas_comma_separated() {
+        let parsed =
+            WarmupArgs::parse(args(&["--root", "/tmp/x", "--only", "search,semantic"])).unwrap();
+        assert!(parsed.areas.search);
+        assert!(parsed.areas.semantic);
+        assert!(!parsed.areas.callgraph);
+    }
+
+    #[test]
+    fn only_tolerates_whitespace_and_empty_segments() {
+        let parsed = WarmupArgs::parse(args(&[
+            "--root",
+            "/tmp/x",
+            "--only",
+            " search , , callgraph ",
+        ]))
+        .unwrap();
+        assert!(parsed.areas.search);
+        assert!(!parsed.areas.semantic);
+        assert!(parsed.areas.callgraph);
+    }
+
+    #[test]
+    fn only_rejects_unknown_area() {
+        let err = WarmupArgs::parse(args(&["--root", "/tmp/x", "--only", "lsp"])).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("unknown area 'lsp'"));
+    }
+
+    #[test]
+    fn only_rejects_empty_list() {
+        let err = WarmupArgs::parse(args(&["--root", "/tmp/x", "--only", " , "])).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn only_requires_a_value() {
+        let err = WarmupArgs::parse(args(&["--root", "/tmp/x", "--only"])).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--only requires a value"));
+    }
 }
