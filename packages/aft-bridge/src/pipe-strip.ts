@@ -75,14 +75,10 @@ export function maybeStripCompressorPipe(
 
   const filterStages = stages.slice(1).map((stage) => stage.trim());
   for (const stage of filterStages) {
-    // A redirection or backgrounding on a filter stage produces a real side
-    // effect (a written file) or changes execution semantics — dropping the
-    // stage would silently lose it. Bail. Covers `bun test | grep FAIL > out`,
-    // `... | tee` (tee isn't a noise filter anyway), and `... | grep FAIL &`.
-    // (Redirects like `2>&1` on the RUNNER stage are fine — they survive the
-    // strip — so this check is only applied to the dropped filter stages.)
-    if (hasFilterSideEffect(stage)) return { command, stripped: false };
-    if (!isPlainNoiseFilter(stage)) return { command, stripped: false };
+    // A dropped filter stage must be a pure stdin→stdout view. If it writes a
+    // file, reads a file (bypassing stdin), or backgrounds, dropping it would
+    // silently lose data or change intent — bail and run the command verbatim.
+    if (!filterStageIsSafeToDrop(stage)) return { command, stripped: false };
   }
 
   const filters = filterStages.join(" | ");
@@ -135,6 +131,15 @@ function splitTopLevelAndChain(command: string): string[] | null {
     }
     if (char === "|" && next === "|") return null;
     if (char === ";") return null;
+    // Top-level newline is a command separator: `bun test\necho x | grep x`
+    // means the pipe belongs to `echo`, not the runner. Bail.
+    if (char === "\n" || char === "\r") return null;
+    // Standalone background `&` (not `&&`, not a `>&`/`&>` fd dup) separates
+    // commands too: `bun test & echo x | grep x`. Bail.
+    if (char === "&") {
+      const prev = command[index - 1];
+      if (prev !== ">" && next !== ">") return null;
+    }
   }
 
   segments.push(command.slice(start));
@@ -257,10 +262,11 @@ function isCompressorHandledRunner(stage: string): boolean {
   if (first === "phpunit" || first === "pest") return true;
 
   // --- Apple / Swift ---
-  // Only the build/test invocations — NOT query commands like
-  // `xcodebuild -list` / `xcodebuild -showBuildSettings` whose piped output is
-  // the agent's actual intent.
-  if (first === "xcodebuild") return rest.includes("test") || rest.includes("build");
+  // Only real build/test ACTIONS — NOT query commands (`xcodebuild -list`,
+  // `-showBuildSettings`) and NOT a scheme/target merely NAMED "test"
+  // (`xcodebuild -showBuildSettings -scheme test`). Actions are bare positional
+  // tokens, distinct from the values that follow `-scheme`/`-target`/etc.
+  if (first === "xcodebuild") return xcodebuildHasBuildAction(rest);
   if (first === "swift") return second === "test" || second === "build";
 
   // --- Make (require an explicit test/lint target — bare `make` is a generic
@@ -320,6 +326,46 @@ function startsWithTest(token: string | undefined): boolean {
   return token?.startsWith("test") === true;
 }
 
+// xcodebuild options that take a value (the following token is NOT an action).
+const XCODEBUILD_VALUE_FLAGS = new Set([
+  "-scheme",
+  "-target",
+  "-project",
+  "-workspace",
+  "-configuration",
+  "-sdk",
+  "-destination",
+  "-arch",
+  "-derivedDataPath",
+  "-resultBundlePath",
+  "-xcconfig",
+  "-toolchain",
+]);
+const XCODEBUILD_BUILD_ACTIONS = new Set([
+  "build",
+  "test",
+  "build-for-testing",
+  "test-without-building",
+  "analyze",
+]);
+
+/**
+ * True only when an actual build/test ACTION appears as a bare positional,
+ * skipping the value token after a value-taking flag so a scheme/target named
+ * "test" isn't mistaken for the `test` action.
+ */
+function xcodebuildHasBuildAction(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("-")) {
+      if (XCODEBUILD_VALUE_FLAGS.has(arg)) i++; // skip its value
+      continue;
+    }
+    if (XCODEBUILD_BUILD_ACTIONS.has(arg)) return true;
+  }
+  return false;
+}
+
 /**
  * Does the command contain a shell construct that can embed its own pipe and so
  * break naive top-level pipe-splitting? Command substitution `$(...)`,
@@ -342,8 +388,17 @@ function containsUnsplittableConstruct(command: string): boolean {
       escaped = true;
       continue;
     }
-    if (quote) {
-      if (char === quote) quote = null;
+    if (quote === "'") {
+      // Single quotes are literal — nothing expands inside them.
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      // Double quotes still allow `$(...)` and backtick command substitution,
+      // so keep scanning for those even while inside double quotes.
+      if (char === '"') quote = null;
+      else if (char === "`") return true;
+      else if (char === "$" && command[i + 1] === "(") return true;
       continue;
     }
     if (char === "'" || char === '"') {
@@ -357,13 +412,103 @@ function containsUnsplittableConstruct(command: string): boolean {
   return false;
 }
 
+// Filters that, given ANY bare (non-flag) operand, read that operand as a FILE
+// instead of stdin — so a stage like `cat saved.log` or `head file` ignores the
+// piped output entirely. Dropping them would replace the runner's output with
+// the file's contents.
+const READS_FILE_OPERAND = new Set(["cat", "tac", "nl", "less", "more"]);
+
 /**
- * Does a (to-be-dropped) filter stage carry a real side effect — output
- * redirection (`>`, `>>`, `2>`, `<`) or backgrounding (`&`)? Such a stage
- * cannot be silently dropped. Quote-aware. Note: process substitution `>(`/`<(`
- * is already rejected upstream by {@link containsUnsplittableConstruct}.
+ * Is a (to-be-dropped) filter stage a pure stdin→stdout view that can be safely
+ * removed? It must be a recognized viewing/transform filter invoked with no file
+ * write, no file read that bypasses stdin, and no backgrounding. Conservative:
+ * anything ambiguous bails (we just don't optimize — never lose data).
  */
-function hasFilterSideEffect(stage: string): boolean {
+function filterStageIsSafeToDrop(stage: string): boolean {
+  const head = tokenizeStage(stage)[0];
+  if (!head) return false;
+  if (head === "wc") return false; // collapses to a scalar the agent asked for
+  if (!NOISE_FILTERS.has(head)) return false;
+
+  // Any unquoted redirect / process-sub / backgrounding metacharacter, OR a
+  // redirect hidden INSIDE quotes (awk `'{ print > "f" }'`, sed `'w file'`).
+  // We scan the raw stage for `>`/`<` ANYWHERE (quote-blind) because a redirect
+  // inside a filter's program is still a write; over-bailing on a literal `>`
+  // search pattern is safe (we just skip the optimization).
+  if (/[<>]/.test(stage)) return false;
+  if (hasUnquotedBackground(stage)) return false;
+
+  const args = tokenizeStage(stage).slice(1);
+  const hasFlag = (...names: string[]): boolean =>
+    args.some((a) => names.some((n) => a === n || a.startsWith(`${n}=`)));
+
+  // grep/rg: a count/list/quiet flag changes the output the agent wanted, AND a
+  // second bare operand means it reads a FILE not stdin (`grep PAT file`).
+  // (`-i` here is case-insensitive, NOT in-place — must not bail.)
+  if (head === "grep" || head === "rg") {
+    if (hasIntentChangingGrepFlag(args)) return false;
+    // pattern is one bare operand; more than one means a file argument.
+    if (countBareOperands(args) > 1) return false;
+    return true;
+  }
+
+  // head/tail: bare operands are files unless consumed by -n/-c. Any bare
+  // non-numeric operand is a filename → reads the file, bypassing stdin.
+  if (head === "head" || head === "tail") {
+    if (bareOperands(args).some((op) => !/^\d+$/.test(op))) return false;
+    return true;
+  }
+
+  // cat/tac/nl/less/more: any bare operand is a file to read instead of stdin.
+  if (READS_FILE_OPERAND.has(head)) {
+    if (countBareOperands(args) > 0) return false;
+    return true;
+  }
+
+  // sed: `-i`/`--in-place` writes the file in place; the first bare operand is
+  // the script, a SECOND is an input file. (Internal `w`/`>` caught by `[<>]`.)
+  if (head === "sed") {
+    if (hasFlag("-i", "--in-place")) return false;
+    if (countBareOperands(args) > 1) return false;
+    return true;
+  }
+  // awk: first bare operand is the program, a SECOND is an input file.
+  if (head === "awk") {
+    if (countBareOperands(args) > 1) return false;
+    return true;
+  }
+
+  // sort: `-o`/`--output` writes a file.
+  if (head === "sort" && hasFlag("-o", "--output")) return false;
+
+  // sort/uniq/cut/tr/column/fold: a bare path-like operand reads a file.
+  // (`-o` already caught.) tr's operands are sets, not files; cut/sort can take
+  // a trailing file. Conservatively bail on any operand that looks like a path.
+  if (bareOperands(args).some((op) => op.includes("/") || op.includes("."))) return false;
+  return true;
+}
+
+/** Bare (non-flag, non-flag-value) operands of a tokenized arg list. */
+function bareOperands(args: string[]): string[] {
+  const out: string[] = [];
+  let afterDoubleDash = false;
+  for (const arg of args) {
+    if (!afterDoubleDash && arg === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (!afterDoubleDash && arg.startsWith("-") && arg !== "-") continue;
+    out.push(arg);
+  }
+  return out;
+}
+
+function countBareOperands(args: string[]): number {
+  return bareOperands(args).length;
+}
+
+/** A standalone background `&` (not `&&`, not the `&` in a `>&`/`&>` fd dup). */
+function hasUnquotedBackground(stage: string): boolean {
   let quote: "'" | '"' | null = null;
   let escaped = false;
   for (let i = 0; i < stage.length; i++) {
@@ -384,20 +529,15 @@ function hasFilterSideEffect(stage: string): boolean {
       quote = char;
       continue;
     }
-    if (char === ">" || char === "<" || char === "&") return true;
+    if (char === "&") {
+      const prev = stage[i - 1];
+      const next = stage[i + 1];
+      // `&&` (handled elsewhere), `>&`/`&>`/`2>&1` fd dup → not a background.
+      if (prev === "&" || next === "&" || prev === ">" || next === ">") continue;
+      return true;
+    }
   }
   return false;
-}
-
-function isPlainNoiseFilter(stage: string): boolean {
-  const tokens = tokenizeStage(stage);
-  const head = tokens[0];
-  if (!head) return false;
-  if (head === "wc") return false;
-  if (!NOISE_FILTERS.has(head)) return false;
-  if ((head === "grep" || head === "rg") && hasIntentChangingGrepFlag(tokens.slice(1)))
-    return false;
-  return true;
 }
 
 function hasIntentChangingGrepFlag(args: string[]): boolean {

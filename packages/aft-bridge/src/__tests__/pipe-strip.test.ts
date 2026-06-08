@@ -18,6 +18,83 @@ describe("maybeStripCompressorPipe", () => {
     expect(result.note).toContain("| grep -A3 FAILED | head");
   });
 
+  // --- Data-loss guards: a dropped filter stage must be a pure stdin→stdout
+  //     view. If it writes a file, reads a file (bypassing stdin), or
+  //     backgrounds, dropping it would silently lose data — bail. ---
+  describe("filter side-effect / file-operand guards", () => {
+    const keepsVerbatim = (cmd: string) =>
+      expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+
+    test("awk with an internal redirect (quote-hidden write) is not stripped", () => {
+      keepsVerbatim("bun test | awk '{ print > \"out.txt\" }'");
+    });
+    test("sort -o (write flag) is not stripped", () => {
+      keepsVerbatim("bun test | sort -o results.txt");
+    });
+    test("sed -i (in-place write) is not stripped", () => {
+      keepsVerbatim("bun test | sed -i 's/x/y/'");
+    });
+    test("cat reading a file (ignores stdin) is not stripped", () => {
+      keepsVerbatim("bun test | cat saved.log");
+    });
+    test("head reading a file operand is not stripped", () => {
+      keepsVerbatim("bun test | head other.log");
+    });
+    test("grep reading a file operand (pattern + file) is not stripped", () => {
+      keepsVerbatim("bun test | grep fail other.log");
+    });
+    test("tee-style shell redirect on a filter stage is not stripped", () => {
+      keepsVerbatim("bun test | grep fail > out.txt");
+    });
+    test("backgrounding the filter stage is not stripped", () => {
+      keepsVerbatim("bun test | grep fail &");
+    });
+    test("plain head with a numeric -n operand still strips", () => {
+      const r = maybeStripCompressorPipe("bun test | head -n 5", true);
+      expect(r).toMatchObject({ command: "bun test", stripped: true });
+    });
+    test("plain transform chain with no operands still strips", () => {
+      const r = maybeStripCompressorPipe("bun test | grep fail | sed 's/x//' | head", true);
+      expect(r).toMatchObject({ command: "bun test", stripped: true });
+    });
+  });
+
+  // --- Separator guards: a top-level newline or background `&` means the pipe
+  //     belongs to a LATER command, not the runner. ---
+  describe("command-separator guards", () => {
+    test("newline separator: the pipe belongs to the second command", () => {
+      const cmd = "bun test\necho ok | grep ok";
+      expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+    });
+    test("background-& separator before another piped command", () => {
+      const cmd = "bun test & echo ok | grep ok";
+      expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+    });
+    test("runner-stage 2>&1 fd-dup still strips (not a background)", () => {
+      const r = maybeStripCompressorPipe("bun test 2>&1 | grep fail", true);
+      expect(r).toMatchObject({ command: "bun test 2>&1", stripped: true });
+    });
+  });
+
+  // --- xcodebuild: match a real build/test ACTION, not a scheme/target named
+  //     "test". ---
+  describe("xcodebuild action vs scheme name", () => {
+    test("a scheme literally named test does not trigger a strip", () => {
+      const cmd = "xcodebuild -showBuildSettings -scheme test | grep BUILD";
+      expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+    });
+    test("the real test action strips even with a scheme arg after it", () => {
+      const r = maybeStripCompressorPipe("xcodebuild test -scheme MyApp | grep -i fail", true);
+      expect(r).toMatchObject({ stripped: true });
+    });
+  });
+
+  // --- Double-quoted command substitution must not be split. ---
+  test("command substitution inside double quotes is not stripped", () => {
+    const cmd = 'bun test "$(date)" | grep fail';
+    expect(maybeStripCompressorPipe(cmd, true)).toEqual({ command: cmd, stripped: false });
+  });
+
   test("does not strip when compression is disabled", () => {
     expect(maybeStripCompressorPipe("bun test | grep fail", false)).toEqual({
       command: "bun test | grep fail",
