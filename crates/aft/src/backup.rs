@@ -2024,38 +2024,42 @@ impl BackupStore {
         };
         let path_hash = Self::path_hash(key);
         let file_path = key.display().to_string();
-        if let Err(error) =
-            crate::db::backups::delete_backups_for_path(&conn, &harness, session, &path_hash)
-        {
+
+        // Replace the path's stack ATOMICALLY: delete old rows + insert the full
+        // new stack inside one transaction. The previous version deleted, then
+        // inserted row-by-row outside any transaction and merely warned-and-
+        // continued on an insert error — so a crash or SQLITE_BUSY mid-loop left
+        // a PARTIAL stack in the DB, which restore/history then preferred over
+        // the (consistent) disk stack. On any error here the transaction rolls
+        // back, leaving the prior consistent stack untouched.
+        let write_result = (|| -> rusqlite::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            crate::db::backups::delete_backups_for_path(&tx, &harness, session, &path_hash)?;
+            for (index, entry) in stack.iter().enumerate() {
+                let backup_path = match entry.kind {
+                    BackupEntryKind::Content | BackupEntryKind::Symlink => {
+                        Some(dir.join(format!("{}.bak", index)).display().to_string())
+                    }
+                    BackupEntryKind::Tombstone => Some(dir.join("meta.json").display().to_string()),
+                };
+                let row = entry.to_backup_row(
+                    &harness,
+                    session,
+                    &project_key,
+                    &file_path,
+                    &path_hash,
+                    backup_path.as_deref(),
+                );
+                crate::db::backups::upsert_backup(&tx, &row)?;
+            }
+            tx.commit()
+        })();
+        if let Err(error) = write_result {
             crate::slog_warn!(
-                "delete old backup DB rows failed for {}: {}",
+                "dual-write backup stack to DB failed for {} (rolled back, prior stack kept): {}",
                 key.display(),
                 error
             );
-            return;
-        }
-        for (index, entry) in stack.iter().enumerate() {
-            let backup_path = match entry.kind {
-                BackupEntryKind::Content | BackupEntryKind::Symlink => {
-                    Some(dir.join(format!("{}.bak", index)).display().to_string())
-                }
-                BackupEntryKind::Tombstone => Some(dir.join("meta.json").display().to_string()),
-            };
-            let row = entry.to_backup_row(
-                &harness,
-                session,
-                &project_key,
-                &file_path,
-                &path_hash,
-                backup_path.as_deref(),
-            );
-            if let Err(error) = crate::db::backups::upsert_backup(&conn, &row) {
-                crate::slog_warn!(
-                    "dual-write backup to DB failed for {}: {}",
-                    entry.backup_id,
-                    error
-                );
-            }
         }
     }
 
