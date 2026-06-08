@@ -385,6 +385,14 @@ fn scenarios() -> Vec<Scenario> {
             input: "from . import local\nimport requests\nimport os\n\nx = 1\n",
             ops: &[Op::Organize],
         },
+        // Multi-module `import os, sys` must keep BOTH modules (the structured
+        // path used to drop `sys`). Raw-preserve keeps the line intact.
+        Scenario {
+            name: "py_organize_multi_module_no_data_loss",
+            ext: "py",
+            input: "import os, sys\nimport abc\n\nx = 1\n",
+            ops: &[Op::Organize],
+        },
         Scenario {
             name: "py_organize_preserves_inter_import_comment",
             ext: "py",

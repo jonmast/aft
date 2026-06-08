@@ -653,6 +653,13 @@ fn should_preserve_raw_on_organize(lang: LangId) -> bool {
             | LangId::C
             | LangId::Cpp
             | LangId::Vue
+            // Python: the structured parser captures only the FIRST module of a
+            // multi-module `import os, sys` statement, so the generic regenerate
+            // path dropped `sys` (silent data loss). Raw-preserve keeps each
+            // statement's source text verbatim — no merge of `from X import a` +
+            // `from X import b`, but zero corruption. Grouping/sort/dedup still
+            // apply per group.
+            | LangId::Python
     )
 }
 
