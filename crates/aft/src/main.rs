@@ -790,6 +790,17 @@ fn watcher_path_is_source(path: &std::path::Path) -> bool {
         .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
 }
 
+/// A file the callgraph STORE would have indexed at cold-build time. The store
+/// indexes every file `walk_project_files` yields (i.e. any detected language),
+/// not just the trigram `SOURCE_EXTENSIONS` set. Gating the store's watcher
+/// refresh on the narrower trigram set left edits to Java/C/C++/C#/Kotlin/Ruby/
+/// PHP/… (all of which the store extracts calls for) serving stale results until
+/// a full rebuild. Mirror cold-build exactly so refresh coverage == index
+/// coverage.
+fn watcher_path_is_callgraph_indexed(path: &std::path::Path) -> bool {
+    aft::parser::detect_language(path).is_some()
+}
+
 fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
     let configured_root = ctx.config().project_root.clone();
     ctx.canonical_cache_root_opt()
@@ -1408,7 +1419,7 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
     }
     let source_paths = changed
         .iter()
-        .filter(|path| watcher_path_is_source(path))
+        .filter(|path| watcher_path_is_callgraph_indexed(path))
         .cloned()
         .collect::<Vec<_>>();
     if source_paths.is_empty() {
@@ -2217,7 +2228,8 @@ mod watcher_filter_tests {
         reset_semantic_refresh_retry_state_for_test, schedule_semantic_refresh_retry,
         semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_event_invalidates,
-        write_push_frame_or_request_shutdown, BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
+        watcher_path_is_callgraph_indexed, write_push_frame_or_request_shutdown,
+        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
     };
     use aft::config::Config;
     use aft::context::{
@@ -2273,6 +2285,38 @@ mod watcher_filter_tests {
             kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
             paths: vec![path],
             attrs: Default::default(),
+        }
+    }
+
+    // The callgraph store indexes every detected language (not just the trigram
+    // SOURCE_EXTENSIONS set), so its watcher refresh must too — otherwise edits
+    // to Java/C/C++/C#/Kotlin/Ruby/… serve stale call results until full rebuild.
+    #[test]
+    fn callgraph_watcher_gate_covers_all_indexed_languages() {
+        use std::path::Path;
+        for ok in [
+            "Foo.java", "x.cpp", "y.c", "Svc.cs", "m.kt", "a.rb", "z.php", "s.scala", "C.sol",
+            "app.ts", "main.rs", "h.go", "p.py",
+        ] {
+            assert!(
+                watcher_path_is_callgraph_indexed(Path::new(ok)),
+                "{ok} should be callgraph-indexed"
+            );
+        }
+        // Genuinely-undetected extensions (detect_language → None). Note md/json/
+        // yaml ARE detected (the store walks them at cold-build), so matching
+        // cold-build means they refresh too — refresh coverage == index coverage.
+        for skip in [
+            "notes.txt",
+            "image.png",
+            "Cargo.lock",
+            "data.csv",
+            "config.toml",
+        ] {
+            assert!(
+                !watcher_path_is_callgraph_indexed(Path::new(skip)),
+                "{skip} should not be callgraph-indexed"
+            );
         }
     }
 
