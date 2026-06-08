@@ -349,7 +349,6 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let registry = registry();
-    let started = Instant::now();
     let task_id = registry
         .spawn_pty(
             "/bin/sh -c 'while [ ! -f wake-ready ]; do sleep 0.01; done; printf wake'",
@@ -366,6 +365,12 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
             80,
         )
         .unwrap();
+    // Start the budget AFTER spawn returns, not before. The watchdog's 500ms
+    // periodic-poll clock starts at task registration (during spawn_pty), so the
+    // wake-vs-poll race is measured from spawn-completion. Timing from before
+    // spawn folded PTY allocation + fork + `/bin/sh` startup into the budget —
+    // the heavy, CI-variable cost that flaked this assertion under load.
+    let started = Instant::now();
     fs::write(project.path().join("wake-ready"), b"ready").unwrap();
 
     // Do not poll status here: status() calls poll_task directly and can
