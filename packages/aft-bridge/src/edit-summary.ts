@@ -1,5 +1,5 @@
 // Shared, compact agent-facing summary for file-mutation tool results
-// (edit / write / apply_patch transaction). Both the OpenCode and Pi plugins
+// (edit / write / apply_patch). Both the OpenCode and Pi plugins
 // render the SAME agent-facing text from this helper so the two harnesses stay
 // in parity.
 //
@@ -15,8 +15,12 @@
 
 /** Shape of the Rust mutation response fields this helper reads. */
 export interface EditSummaryInput {
-  /** Files modified in a multi-file transaction (Rust `files_modified`). */
+  /** Files modified in a multi-file write (Rust `files_modified`). */
   files_modified?: number;
+  /** Total replacements across a glob edit (Rust `total_replacements`). */
+  total_replacements?: number;
+  /** Total files touched by a glob edit (Rust `total_files`). */
+  total_files?: number;
   /** Number of match replacements (find/replace, replaceAll). */
   replacements?: number;
   /** Number of edits applied in batch mode (Rust `edits_applied`). */
@@ -52,11 +56,20 @@ export function formatEditSummary(data: EditSummaryInput): string {
     return "Edit rolled back: the change produced invalid syntax, so the file was left unchanged.";
   }
 
-  // Multi-file transaction (operations array): report file count, not per-file
-  // diffs (those are in the UI metadata).
+  // Multi-file write: report file count, not per-file diffs (those are in the
+  // UI metadata).
   if (typeof data.files_modified === "number") {
     const n = data.files_modified;
     return `Applied edits to ${n} file${n === 1 ? "" : "s"}.`;
+  }
+
+  // Glob edit (filePath is a glob pattern): Rust reports per-file results plus
+  // `total_replacements`/`total_files` rather than a top-level diff. Without
+  // this the headline would fall through to a misleading `Edited (+0/-0).`.
+  if (typeof data.total_files === "number") {
+    const files = data.total_files;
+    const reps = data.total_replacements ?? 0;
+    return `Edited ${files} file${files === 1 ? "" : "s"} (${reps} replacement${reps === 1 ? "" : "s"}).`;
   }
 
   const additions = data.diff?.additions ?? 0;

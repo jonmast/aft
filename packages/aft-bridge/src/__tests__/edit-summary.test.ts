@@ -64,4 +64,15 @@ describe("formatEditSummary", () => {
   test("rollback takes precedence over files_modified", () => {
     expect(formatEditSummary({ rolled_back: true, files_modified: 2 })).toContain("rolled back");
   });
+
+  test("glob edit reports file + replacement counts (not a misleading +0/-0)", () => {
+    expect(formatEditSummary({ total_files: 3, total_replacements: 7 })).toBe(
+      "Edited 3 files (7 replacements).",
+    );
+    expect(formatEditSummary({ total_files: 1, total_replacements: 1 })).toBe(
+      "Edited 1 file (1 replacement).",
+    );
+    // missing total_replacements defaults to 0 without falling through to diff.
+    expect(formatEditSummary({ total_files: 2 })).toBe("Edited 2 files (0 replacements).");
+  });
 });

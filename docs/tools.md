@@ -184,7 +184,9 @@ edits or before tests/commits. Use `aft_safety checkpoint` / `undo` for recovery
 ### apply_patch
 
 Apply a multi-file patch using the `*** Begin Patch` format. Creates, updates, deletes, and
-renames files atomically — if any operation fails, all revert.
+renames files. Hunks commit per file: successful hunks are kept and failures are reported, so a
+partial patch leaves the applied changes in place (use `aft_safety` to revert if you want to
+abort). A move hunk never deletes the source unless the destination write succeeds.
 
 ```
 *** Begin Patch

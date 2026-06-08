@@ -256,24 +256,6 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
     expect(response.format_skipped_reason).toBe("formatter_not_installed");
   });
 
-  test("Pi multi-file edit transaction formats both files", async () => {
-    const h = await formatHarness(BIOME_TS_PRESET, [formattingBiomeShim()]);
-    await mkdir(h.path("src"), { recursive: true });
-    const response = await h.bridge.send("transaction", {
-      operations: [
-        { command: "write", file: h.path("src/a.ts"), content: TS_INPUT },
-        { command: "write", file: h.path("src/b.ts"), content: TS_INPUT },
-      ],
-    });
-
-    expect(response.success).toBe(true);
-    const files = response.results as Array<Record<string, unknown>>;
-    expect(files).toHaveLength(2);
-    expect(files.every((file) => file.formatted === true)).toBe(true);
-    expect(await readFile(h.path("src/a.ts"), "utf8")).toContain("export function foo");
-    expect(await readFile(h.path("src/b.ts"), "utf8")).toContain("export function foo");
-  });
-
   test("Pi glob edit_match formats every matched file", async () => {
     const h = await formatHarness(BIOME_TS_PRESET, [formattingBiomeShim()]);
     await mkdir(h.path("src"), { recursive: true });
