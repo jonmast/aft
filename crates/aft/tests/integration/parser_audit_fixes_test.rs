@@ -55,6 +55,28 @@ fn ts_js_anonymous_default_exports_surface_and_resolve_as_default() {
     }
 }
 
+/// Top-level const/let in a `.js` file must surface as a Variable symbol, the
+/// same as in `.ts`. The JS extractor previously dropped these (they fell into
+/// the catch-all match arm), so outline/dead_code/callgraph never saw
+/// `export const VERSION = ...` in plain JavaScript.
+#[test]
+fn js_top_level_const_let_surface_as_variables() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let src = "export const VERSION = \"1.0\";\nconst internal = 42;\nlet counter = 0;\n";
+    let js = write_file(tmp.path(), "vars.js", src);
+    let ts = write_file(tmp.path(), "vars.ts", src);
+
+    for file in [&js, &ts] {
+        let symbols = extract(file);
+        let version = symbol(&symbols, "VERSION");
+        assert_eq!(version.kind, SymbolKind::Variable, "in {file:?}");
+        assert!(version.exported, "VERSION should be exported in {file:?}");
+        assert_eq!(symbol(&symbols, "internal").kind, SymbolKind::Variable);
+        assert_eq!(symbol(&symbols, "counter").kind, SymbolKind::Variable);
+        assert!(!symbol(&symbols, "internal").exported);
+    }
+}
+
 #[test]
 fn common_module_and_stub_extensions_are_detected() {
     for (file, expected) in [

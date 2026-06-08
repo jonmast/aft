@@ -1890,6 +1890,8 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut method_def_node = None;
         let mut default_body_node = None;
         let mut default_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1907,6 +1909,8 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "method.def" => method_def_node = Some(cap.node),
                 "default.body" => default_body_node = Some(cap.node),
                 "default.def" => default_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
                 _ => {}
             }
         }
@@ -1964,6 +1968,32 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 exported: false,
                 parent: Some(class_name),
             });
+        }
+
+        // Top-level const/let/var declarations. JS_QUERY captures these the same
+        // way TS does, but the JS extractor previously dropped them (they fell
+        // into the `_ => {}` arm), so e.g. `export const VERSION = "1.0"` in a
+        // .js file produced no symbol for outline/dead_code/callgraph. Mirror the
+        // TS extractor: module-scope, non-function-valued, not already captured.
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            let is_top_level = def_node
+                .parent()
+                .map(|p| p.kind() == "program" || p.kind() == "export_statement")
+                .unwrap_or(false);
+            let is_function_like = lexical_declaration_has_function_value(&def_node);
+            let name = node_text(source, &name_node).to_string();
+            let already_captured = symbols.iter().any(|s| s.name == name);
+            if is_top_level && !is_function_like && !already_captured {
+                symbols.push(Symbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    range: node_range_with_decorators(&def_node, source, lang),
+                    signature: Some(extract_signature(source, &def_node)),
+                    scope_chain: vec![],
+                    exported: is_exported(&def_node, &export_ranges),
+                    parent: None,
+                });
+            }
         }
     }
 
