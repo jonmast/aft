@@ -69,28 +69,6 @@ See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`,
 
 ---
 
-## Before / after
-
-**Without AFT**, to change one function:
-
-```text
-read src/server.ts          → the whole file lands in context
-(reconstruct the edit from memory)
-edit by line 247            → breaks the moment the file shifted
-```
-
-**With AFT:**
-
-```text
-aft_outline src/server.ts   → every symbol, about one screen
-aft_zoom handleRequest      → just that function + who calls it
-edit symbol: handleRequest  → replaced by name, auto-formatted, backed up
-```
-
-Read one function, not the whole file. Edit by name, not by line number. Tens of tokens where the old loop spent hundreds, and the edit doesn't rot when the file moves.
-
----
-
 ## Part of CortexKit
 
 A brain isn't one organ. Neither is a capable coding agent.
@@ -182,8 +160,6 @@ Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`w
 
 Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 
-**YAML / Kubernetes / CRDs.** YAML files are semantically indexed. Each document carrying `apiVersion` + `kind` (the Kubernetes/CRD contract, so this generalizes to any custom resource) becomes one rich symbol named `<namespace>/<Kind>/<name>` (falling back to `metadata.generateName` when no name is set). The symbol's embed text is enriched with high-signal spec fields so intent queries match: container `image`/ports, resource `cpu`/`memory` limits and requests, `volumeMounts`, env var names, RBAC `verbs`/`resources`/`apiGroups`, and Argo Workflow `entrypoint`/`templates`/`command`/`schedule`. Multi-document (`---`) streams are handled per document; plain non-k8s YAML (docker-compose, CI configs, Helm `values.yaml`) falls back to top-level keys as symbols.
-
 ---
 
 ## Architecture
@@ -252,6 +228,20 @@ cargo test             # Rust tests
 bun run lint           # biome check
 bun run format         # biome format + cargo fmt
 ```
+
+**Build cache (recommended):** the workspace sets `incremental = false`
+(`.cargo/config.toml`) to avoid a large, fast-growing `target/debug/incremental`
+directory. Pair it with [sccache](https://github.com/mozilla/sccache) for a
+shared compiled-artifact cache — especially valuable if you build in multiple
+checkouts or git worktrees, since the cache is shared across all of them:
+
+```sh
+brew install sccache            # or: cargo install sccache
+export RUSTC_WRAPPER=sccache    # add to your shell rc
+```
+
+It's enabled via the env var (not a committed `[build] rustc-wrapper`) so it
+never leaks into the Docker-based cross-compile release builds.
 
 **Project layout:**
 
