@@ -348,6 +348,25 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Match not found in file");
   });
 
+  // Regression: Rust reverts a write that fails syntax validation and returns
+  // success:true with rolled_back:true. Reporting "File updated." then would be
+  // a lie — the file is unchanged. The agent must be told it rolled back.
+  test("write reports a rolled-back write honestly, not as success", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      expect(command).toBe("write");
+      return { success: true, rolled_back: true, created: false };
+    });
+
+    const result = text(
+      await tools.write.execute({ filePath: "target.ts", content: "const = ;\n" }, sdkCtx),
+    );
+    expect(result.toLowerCase()).toContain("rolled back");
+    expect(result).not.toContain("File updated");
+  });
+
   // Regression: hoisted apply_patch wraps each hunk's bridge call in try/catch,
   // but callBridge returns `success: false` responses WITHOUT throwing — so the
   // catch never ran, the hunk was falsely recorded as Created, and the error

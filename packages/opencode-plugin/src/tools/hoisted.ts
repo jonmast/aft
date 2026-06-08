@@ -600,6 +600,15 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         throw new Error((data.message as string) || "write failed");
       }
 
+      // Honesty: Rust reverts the write when the result fails syntax validation
+      // and returns `rolled_back: true` with success:true (the op completed, the
+      // file is unchanged). Saying "Created/File updated" here would be a lie —
+      // surface the rollback so the agent retries. Mirrors formatEditSummary,
+      // which OC's edit tool already uses.
+      if (data.rolled_back === true) {
+        return "Write rolled back: the content produced invalid syntax, so the file was left unchanged.";
+      }
+
       let output = data.created ? "Created new file." : "File updated.";
       if (data.formatted) output += " Auto-formatted.";
       // v0.27.1: Rust returns `no_op: true` when post-write content is
@@ -1170,6 +1179,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               if (writeResult.success === false) {
                 throw new Error((writeResult.message as string | undefined) ?? "write failed");
               }
+              // Rust reverts a write that fails syntax validation and returns
+              // rolled_back:true with success:true. The file did NOT change, so
+              // this hunk must count as a failure, not a green "Created".
+              if (writeResult.rolled_back === true) {
+                throw new Error("produced invalid syntax (rolled back)");
+              }
               const wrDiff = writeResult.diff as
                 | { before?: string; after?: string; additions?: number; deletions?: number }
                 | undefined;
@@ -1256,6 +1271,14 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               // leaves the source intact.
               if (writeResult.success === false) {
                 throw new Error((writeResult.message as string | undefined) ?? "write failed");
+              }
+              // Same hazard as success:false for move hunks: a destination write
+              // that fails syntax validation returns rolled_back:true (the file
+              // is unchanged). Treating it as success would mark the hunk applied
+              // and, for a move, proceed to DELETE THE SOURCE — losing the file.
+              // Throw → routes to the catch → `failures`, source intact.
+              if (writeResult.rolled_back === true) {
+                throw new Error("produced invalid syntax (rolled back)");
               }
 
               // Collect diagnostics from this file
