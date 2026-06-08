@@ -409,3 +409,50 @@ fn outline_files_mode_sorts_entries_by_path() {
 
     assert!(aft.shutdown().success());
 }
+
+// Multi-file array mode (`files: [..]`) must report complete:false when any
+// requested file was skipped (missing/unreadable), per the honest-reporting
+// convention — not a hardcoded complete:true.
+#[test]
+fn outline_multi_file_array_marks_incomplete_when_a_file_is_skipped() {
+    let dir = TempDir::new().unwrap();
+    let ok = write_file(dir.path(), "ok.ts", "export function ok() {}\n");
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let missing = dir.path().join("nope.ts");
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "outline-multi-skip",
+            "command": "outline",
+            "files": [ ok.to_string_lossy(), missing.to_string_lossy() ],
+        }),
+    );
+    assert_eq!(resp["success"], true, "outline should succeed: {resp:?}");
+    assert_eq!(
+        resp["complete"], false,
+        "a skipped file must make the result incomplete: {resp:?}"
+    );
+    assert!(
+        !resp["skipped_files"].as_array().unwrap().is_empty(),
+        "skipped_files must name the gap: {resp:?}"
+    );
+
+    // All-present requests still report complete:true.
+    let resp_ok = send(
+        &mut aft,
+        json!({
+            "id": "outline-multi-ok",
+            "command": "outline",
+            "files": [ ok.to_string_lossy() ],
+        }),
+    );
+    assert_eq!(
+        resp_ok["complete"], true,
+        "all-present must be complete: {resp_ok:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}

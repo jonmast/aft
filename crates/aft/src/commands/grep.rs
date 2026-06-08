@@ -174,15 +174,20 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
     // mirroring the aft_search precedent); non-ready states keep a label because
     // "building"/"fallback"/"disabled" is a real completeness signal the agent
     // needs (results may be partial).
+    // When the search stopped at the result cap, the count is a floor, not the
+    // true total — say so in the agent-facing text (the JSON already carries
+    // `truncated`). Otherwise the agent reads "Found N match" as exhaustive.
+    let cap_note = if result.truncated { " (capped)" } else { "" };
     let footer = match result.index_status {
         IndexStatus::Ready => format!(
-            "Found {} match across {} file",
-            result.total_matches, result.files_with_matches
+            "Found {} match across {} file{}",
+            result.total_matches, result.files_with_matches, cap_note
         ),
         other => format!(
-            "Found {} match across {} file [index: {}]",
+            "Found {} match across {} file{} [index: {}]",
             result.total_matches,
             result.files_with_matches,
+            cap_note,
             index_status_label(other)
         ),
     };

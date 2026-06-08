@@ -103,9 +103,15 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
             };
 
         let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, total_files_requested);
+        // Honest reporting: complete only when no requested file was skipped.
+        // skipped_files names the gaps (missing/unreadable/unparseable inputs).
         return Response::success(
             &req.id,
-            serde_json::json!({ "text": text, "complete": true, "skipped_files": skipped_files }),
+            serde_json::json!({
+                "text": text,
+                "complete": skipped_files.is_empty(),
+                "skipped_files": skipped_files,
+            }),
         );
     }
 
