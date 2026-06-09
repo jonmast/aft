@@ -335,6 +335,12 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
     } else {
         cwd.join(path)
     };
+    // Check before canonicalization: on Linux /dev/stderr etc. are symlinks
+    // (/proc/self/fd/2 -> /dev/pts/0) that no longer match the allowlist
+    // once resolved.
+    if is_device_file(&resolved) {
+        return PathArgTarget::None;
+    }
     PathArgTarget::Path(resolve_existing(&resolved))
 }
 
@@ -449,6 +455,23 @@ fn push_xargs_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, tok
     push_bash_ask(asks, seen, tokens[index..].join(" "), &tokens[index..]);
 }
 
+fn is_device_file(path: &Path) -> bool {
+    let Some(s) = path.to_str() else {
+        return false;
+    };
+    matches!(
+        s,
+        "/dev/null"
+            | "/dev/zero"
+            | "/dev/random"
+            | "/dev/urandom"
+            | "/dev/stdin"
+            | "/dev/stdout"
+            | "/dev/stderr"
+            | "/dev/tty"
+    ) || s.starts_with("/dev/fd/")
+}
+
 fn push_external_path(
     asks: &mut Vec<PermissionAsk>,
     seen: &mut HashSet<String>,
@@ -521,5 +544,75 @@ mod tests {
         let path = arg_path("./file.log", &scan_cwd).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
+    }
+
+    #[test]
+    fn device_paths_are_skipped_before_canonicalization() {
+        // On Linux /dev/stderr is a symlink chain ending at the TTY (or a
+        // pipe inode under CI), so the device check must run on the raw
+        // path — after canonicalize it no longer matches the allowlist.
+        for arg in ["/dev/stderr", "/dev/stdin", "/dev/stdout", "/dev/fd/2"] {
+            let target = path_arg_target(arg, Path::new("/tmp"));
+            assert!(
+                matches!(target, PathArgTarget::None),
+                "expected {arg} to be skipped as a device path"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_null_redirect_does_not_trigger_permission_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project_root.clone()),
+                bash_permissions: true,
+                ..crate::config::Config::default()
+            },
+        );
+
+        let asks = scan_with_cwd("echo test 2>/dev/null", &ctx, &project_root);
+
+        let external_asks: Vec<_> = asks
+            .iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .collect();
+        assert!(
+            external_asks.is_empty(),
+            "Expected no external directory asks for /dev/null redirect, got: {:?}",
+            external_asks
+        );
+    }
+
+    #[test]
+    fn dev_stderr_redirect_does_not_trigger_permission_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project_root.clone()),
+                bash_permissions: true,
+                ..crate::config::Config::default()
+            },
+        );
+
+        let asks = scan_with_cwd("some-command 2>/dev/stderr", &ctx, &project_root);
+
+        let external_asks: Vec<_> = asks
+            .iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .collect();
+        assert!(
+            external_asks.is_empty(),
+            "Expected no external directory asks for /dev/stderr redirect, got: {:?}",
+            external_asks
+        );
     }
 }
